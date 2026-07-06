@@ -435,6 +435,8 @@ private:
 
     int32_t callFunction(Function *f, const vector<int32_t> &args) {
         tick(8);
+        int32_t folded = 0;
+        if (tryEvalAffineTailCall(f, args, folded)) return folded;
         if (scopes.size() > 256) throw TooHard();
         scopes.push_back({});
         for (size_t i = 0; i < f->params.size(); ++i) {
@@ -443,6 +445,173 @@ private:
         Flow flow = execStmt(f->body.get());
         scopes.pop_back();
         return flow.kind == Flow::Kind::Return ? flow.value : 0;
+    }
+
+    bool returnedExpr(const Stmt *s, const Expr *&expr) const {
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::Return) {
+            expr = s->expr.get();
+            return true;
+        }
+        if (s->kind == Stmt::Kind::Block && s->stmts.size() == 1) {
+            return returnedExpr(s->stmts[0].get(), expr);
+        }
+        return false;
+    }
+
+    bool isSelfCall(const Expr *e, const Function *f) const {
+        return e && e->kind == Expr::Kind::Call && e->name == f->name && e->args.size() == f->params.size();
+    }
+
+    bool extractTailPattern(const Function *f, const Expr *&stopCond, const Expr *&baseExpr,
+                            const Expr *&callExpr, bool &stopWhenTrue) const {
+        const Stmt *body = f->body.get();
+        if (!body || body->kind != Stmt::Kind::Block) return false;
+        const auto &stmts = body->stmts;
+        if (stmts.size() == 1 && stmts[0]->kind == Stmt::Kind::If) {
+            const Stmt *ifs = stmts[0].get();
+            const Expr *thenExpr = nullptr;
+            const Expr *elseExpr = nullptr;
+            if (!returnedExpr(ifs->thenStmt.get(), thenExpr) || !returnedExpr(ifs->elseStmt.get(), elseExpr)) return false;
+            if (isSelfCall(elseExpr, f) && !isSelfCall(thenExpr, f)) {
+                stopCond = ifs->expr.get();
+                baseExpr = thenExpr;
+                callExpr = elseExpr;
+                stopWhenTrue = true;
+                return true;
+            }
+            if (isSelfCall(thenExpr, f) && !isSelfCall(elseExpr, f)) {
+                stopCond = ifs->expr.get();
+                baseExpr = elseExpr;
+                callExpr = thenExpr;
+                stopWhenTrue = false;
+                return true;
+            }
+        }
+        if (stmts.size() == 2 && stmts[0]->kind == Stmt::Kind::If) {
+            const Stmt *ifs = stmts[0].get();
+            if (ifs->elseStmt) return false;
+            const Expr *thenExpr = nullptr;
+            const Expr *nextExpr = nullptr;
+            if (!returnedExpr(ifs->thenStmt.get(), thenExpr) || !returnedExpr(stmts[1].get(), nextExpr)) return false;
+            if (isSelfCall(nextExpr, f) && !isSelfCall(thenExpr, f)) {
+                stopCond = ifs->expr.get();
+                baseExpr = thenExpr;
+                callExpr = nextExpr;
+                stopWhenTrue = true;
+                return true;
+            }
+            if (isSelfCall(thenExpr, f) && !isSelfCall(nextExpr, f)) {
+                stopCond = ifs->expr.get();
+                baseExpr = nextExpr;
+                callExpr = thenExpr;
+                stopWhenTrue = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool extractParamCondition(const Expr *e, const unordered_set<string> &params, string &induction,
+                               string &cmp, const Expr *&bound) const {
+        if (!e || e->kind != Expr::Kind::Binary) return false;
+        static const unordered_set<string> relops = {"<", "<=", ">", ">="};
+        if (!relops.count(e->op)) return false;
+        if (e->lhs && e->lhs->kind == Expr::Kind::Var && params.count(e->lhs->name)) {
+            induction = e->lhs->name;
+            cmp = e->op;
+            bound = e->rhs.get();
+            return true;
+        }
+        if (e->rhs && e->rhs->kind == Expr::Kind::Var && params.count(e->rhs->name)) {
+            induction = e->rhs->name;
+            bound = e->lhs.get();
+            if (e->op == "<") cmp = ">";
+            else if (e->op == "<=") cmp = ">=";
+            else if (e->op == ">") cmp = "<";
+            else cmp = "<=";
+            return true;
+        }
+        return false;
+    }
+
+    static bool invertCmp(string &cmp) {
+        if (cmp == "<") cmp = ">=";
+        else if (cmp == "<=") cmp = ">";
+        else if (cmp == ">") cmp = "<=";
+        else if (cmp == ">=") cmp = "<";
+        else return false;
+        return true;
+    }
+
+    bool tryEvalAffineTailCall(Function *f, const vector<int32_t> &args, int32_t &out) {
+        const Expr *stopCond = nullptr;
+        const Expr *baseExpr = nullptr;
+        const Expr *callExpr = nullptr;
+        bool stopWhenTrue = true;
+        if (!extractTailPattern(f, stopCond, baseExpr, callExpr, stopWhenTrue)) return false;
+
+        unordered_set<string> paramSet(f->params.begin(), f->params.end());
+        string induction;
+        string cmp;
+        const Expr *boundExpr = nullptr;
+        if (!extractParamCondition(stopCond, paramSet, induction, cmp, boundExpr)) return false;
+        if (stopWhenTrue && !invertCmp(cmp)) return false;
+
+        int k = static_cast<int>(f->params.size());
+        int d = k + 1;
+        unordered_map<string, int> idx;
+        for (int i = 0; i < k; ++i) idx[f->params[i]] = i;
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+
+        vector<vector<uint32_t>> mat = idmat;
+        for (int i = 0; i < k; ++i) {
+            vector<uint32_t> row;
+            if (!affineExpr(callExpr->args[i].get(), idx, idmat, row)) return false;
+            mat[i] = std::move(row);
+        }
+
+        int indIdx = idx[induction];
+        const auto &ir = mat[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return false;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return false;
+        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
+        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
+
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound)) return false;
+        for (int i = 0; i < k; ++i) {
+            if (bound[i] != 0) return false;
+        }
+
+        vector<uint32_t> v(d, 0);
+        for (int i = 0; i < k; ++i) v[i] = static_cast<uint32_t>(i < static_cast<int>(args.size()) ? args[i] : 0);
+        v[d - 1] = 1;
+        uint64_t boundAcc = 0;
+        for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(bound[i]) * v[i];
+        AffineLoop loop;
+        loop.step = step;
+        loop.cmp = std::move(cmp);
+        uint64_t niter = countIterations(loop, static_cast<int32_t>(v[indIdx]), static_cast<int32_t>(static_cast<uint32_t>(boundAcc)));
+        if (niter == 0) return false;
+
+        while (niter) {
+            tick(10);
+            if (niter & 1) v = matVec(mat, v);
+            niter >>= 1;
+            if (niter) mat = matMul(mat, mat);
+        }
+
+        scopes.push_back({});
+        for (int i = 0; i < k; ++i) scopes.back()[f->params[i]] = static_cast<int32_t>(v[i]);
+        out = baseExpr ? evalExpr(baseExpr) : 0;
+        scopes.pop_back();
+        return true;
     }
 
     Flow execStmt(const Stmt *s) {
