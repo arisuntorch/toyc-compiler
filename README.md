@@ -33,6 +33,9 @@ is currently ignored by this implementation.
 - Short-circuit code generation for `&&` and `||`.
 - Constant expression folding plus immediate-form code generation for common
   arithmetic, equality, and comparison expressions.
+- A function-level AST optimization pass with local alpha-renaming, constant
+  propagation, copy propagation, conservative dead-code elimination, and
+  constant `if` / `while(0)` simplification.
 - Register-based expression evaluation for call-free expressions, avoiding most
   temporary stack traffic in loop bodies.
 - Simple local variable allocation to `s1`-`s11`, reducing repeated stack loads

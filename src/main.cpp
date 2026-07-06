@@ -542,6 +542,513 @@ private:
     }
 };
 
+static unique_ptr<Expr> makeNumberExpr(long long value) {
+    auto e = make_unique<Expr>();
+    e->kind = Expr::Kind::Number;
+    e->value = value;
+    return e;
+}
+
+static bool exprHasCall(const Expr *e) {
+    if (!e) return false;
+    if (e->kind == Expr::Kind::Call) return true;
+    if (exprHasCall(e->lhs.get()) || exprHasCall(e->rhs.get())) return true;
+    for (auto &arg : e->args) {
+        if (exprHasCall(arg.get())) return true;
+    }
+    return false;
+}
+
+static optional<long long> foldConstExpr(const Expr *e) {
+    if (!e) return nullopt;
+    switch (e->kind) {
+        case Expr::Kind::Number:
+            return e->value;
+        case Expr::Kind::Var:
+        case Expr::Kind::Call:
+            return nullopt;
+        case Expr::Kind::Unary: {
+            auto v = foldConstExpr(e->lhs.get());
+            if (!v) return nullopt;
+            if (e->op == "+") return *v;
+            if (e->op == "-") return -*v;
+            if (e->op == "!") return *v == 0;
+            return nullopt;
+        }
+        case Expr::Kind::Binary: {
+            auto l = foldConstExpr(e->lhs.get());
+            if ((e->op == "&&" || e->op == "||") && l) {
+                if (e->op == "&&" && !*l) return 0;
+                if (e->op == "||" && *l) return 1;
+            }
+            auto r = foldConstExpr(e->rhs.get());
+            if (!l || !r) return nullopt;
+            if (e->op == "+") return *l + *r;
+            if (e->op == "-") return *l - *r;
+            if (e->op == "*") return *l * *r;
+            if (e->op == "/") return *r == 0 ? nullopt : optional<long long>(*l / *r);
+            if (e->op == "%") return *r == 0 ? nullopt : optional<long long>(*l % *r);
+            if (e->op == "<") return *l < *r;
+            if (e->op == ">") return *l > *r;
+            if (e->op == "<=") return *l <= *r;
+            if (e->op == ">=") return *l >= *r;
+            if (e->op == "==") return *l == *r;
+            if (e->op == "!=") return *l != *r;
+            if (e->op == "&&") return (*l != 0) && (*r != 0);
+            if (e->op == "||") return (*l != 0) || (*r != 0);
+            return nullopt;
+        }
+    }
+    return nullopt;
+}
+
+class Resolver {
+public:
+    explicit Resolver(Program &program) : prog(program) {}
+
+    void run() {
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Func) resolveFunction(*item.func);
+            else if (item.decl) resolveExpr(item.decl->init);
+        }
+    }
+
+private:
+    Program &prog;
+    vector<unordered_map<string, string>> scopes;
+    int id = 0;
+
+    optional<string> lookup(const string &name) const {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return found->second;
+        }
+        return nullopt;
+    }
+
+    string fresh(const string &name) {
+        return name + "#v" + to_string(id++);
+    }
+
+    void enter() { scopes.push_back({}); }
+    void leave() { scopes.pop_back(); }
+
+    void bind(string &name) {
+        string old = name;
+        string renamed = fresh(old);
+        scopes.back()[old] = renamed;
+        name = renamed;
+    }
+
+    void resolveFunction(Function &f) {
+        enter();
+        for (auto &param : f.params) bind(param);
+        resolveStmt(f.body);
+        leave();
+    }
+
+    void resolveStmt(unique_ptr<Stmt> &s) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                enter();
+                for (auto &child : s->stmts) resolveStmt(child);
+                leave();
+                break;
+            case Stmt::Kind::DeclStmt:
+                resolveExpr(s->decl->init);
+                bind(s->decl->name);
+                break;
+            case Stmt::Kind::Assign:
+                if (auto renamed = lookup(s->name)) s->name = *renamed;
+                resolveExpr(s->expr);
+                break;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                resolveExpr(s->expr);
+                break;
+            case Stmt::Kind::If:
+                resolveExpr(s->expr);
+                resolveStmt(s->thenStmt);
+                resolveStmt(s->elseStmt);
+                break;
+            case Stmt::Kind::While:
+                resolveExpr(s->expr);
+                resolveStmt(s->body);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void resolveExpr(unique_ptr<Expr> &e) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            if (auto renamed = lookup(e->name)) e->name = *renamed;
+            return;
+        }
+        resolveExpr(e->lhs);
+        resolveExpr(e->rhs);
+        for (auto &arg : e->args) resolveExpr(arg);
+    }
+};
+
+struct OptValue {
+    enum class Kind { Unknown, Const, Copy } kind = Kind::Unknown;
+    long long value = 0;
+    string copy;
+};
+
+class Optimizer {
+public:
+    explicit Optimizer(Program &program) : prog(program) {
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) globals.insert(item.decl->name);
+        }
+    }
+
+    void run() {
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) {
+                optExpr(item.decl->init);
+            } else {
+                env.clear();
+                optStmt(item.func->body);
+            }
+        }
+    }
+
+private:
+    Program &prog;
+    unordered_set<string> globals;
+    vector<unordered_map<string, OptValue>> env;
+    int loopDepth = 0;
+    int keepEffectDepth = 0;
+
+    bool isGlobal(const string &name) const { return globals.count(name) != 0; }
+    void enter() { env.push_back({}); }
+    void leave() { env.pop_back(); }
+
+    optional<OptValue> lookupValue(const string &name) const {
+        if (isGlobal(name)) return nullopt;
+        for (auto it = env.rbegin(); it != env.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return found->second;
+        }
+        return nullopt;
+    }
+
+    string resolveCopy(string name) const {
+        unordered_set<string> seen;
+        while (!seen.count(name)) {
+            seen.insert(name);
+            auto v = lookupValue(name);
+            if (!v || v->kind != OptValue::Kind::Copy) break;
+            name = v->copy;
+        }
+        return name;
+    }
+
+    void eraseValue(const string &name) {
+        for (auto &scope : env) scope.erase(name);
+        for (auto &scope : env) {
+            for (auto it = scope.begin(); it != scope.end();) {
+                if (it->second.kind == OptValue::Kind::Copy && resolveCopy(it->second.copy) == name) {
+                    it = scope.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    void setValue(const string &name, OptValue value) {
+        if (isGlobal(name) || env.empty()) return;
+        eraseValue(name);
+        for (auto it = env.rbegin(); it != env.rend(); ++it) {
+            if (it->count(name)) {
+                (*it)[name] = std::move(value);
+                return;
+            }
+        }
+        env.back()[name] = std::move(value);
+    }
+
+    OptValue valueFromExpr(const Expr *e) const {
+        if (auto v = foldConstExpr(e)) return OptValue{OptValue::Kind::Const, *v, ""};
+        if (e && e->kind == Expr::Kind::Var && !isGlobal(e->name)) {
+            return OptValue{OptValue::Kind::Copy, 0, resolveCopy(e->name)};
+        }
+        return {};
+    }
+
+    void optExpr(unique_ptr<Expr> &e) {
+        if (!e) return;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return;
+            case Expr::Kind::Var: {
+                if (auto v = lookupValue(e->name)) {
+                    if (v->kind == OptValue::Kind::Const) {
+                        e = makeNumberExpr(v->value);
+                    } else if (v->kind == OptValue::Kind::Copy) {
+                        e->name = resolveCopy(v->copy);
+                    }
+                }
+                return;
+            }
+            case Expr::Kind::Call:
+                for (auto &arg : e->args) optExpr(arg);
+                return;
+            case Expr::Kind::Unary:
+                optExpr(e->lhs);
+                if (auto v = foldConstExpr(e.get())) e = makeNumberExpr(*v);
+                return;
+            case Expr::Kind::Binary:
+                optExpr(e->lhs);
+                optExpr(e->rhs);
+                simplifyBinary(e);
+                return;
+        }
+    }
+
+    void simplifyBinary(unique_ptr<Expr> &e) {
+        if (auto v = foldConstExpr(e.get())) {
+            e = makeNumberExpr(*v);
+            return;
+        }
+        if (!e || e->kind != Expr::Kind::Binary) return;
+        auto l = foldConstExpr(e->lhs.get());
+        auto r = foldConstExpr(e->rhs.get());
+        if (e->op == "+" && r && *r == 0) e = std::move(e->lhs);
+        else if (e->op == "+" && l && *l == 0) e = std::move(e->rhs);
+        else if (e->op == "-" && r && *r == 0) e = std::move(e->lhs);
+        else if (e->op == "*" && r && *r == 1) e = std::move(e->lhs);
+        else if (e->op == "*" && l && *l == 1) e = std::move(e->rhs);
+        else if (e->op == "*" && ((r && *r == 0) || (l && *l == 0))) e = makeNumberExpr(0);
+        else if (e->op == "/" && r && *r == 1) e = std::move(e->lhs);
+        else if (e->op == "%" && r && *r == 1) e = makeNumberExpr(0);
+        else if (e->op == "&&" && l && *l == 0) e = makeNumberExpr(0);
+        else if (e->op == "||" && l && *l != 0) e = makeNumberExpr(1);
+    }
+
+    bool alwaysJumps(const Stmt *s) const {
+        if (!s) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Return:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::Block:
+                return !s->stmts.empty() && alwaysJumps(s->stmts.back().get());
+            case Stmt::Kind::If:
+                return s->elseStmt && alwaysJumps(s->thenStmt.get()) && alwaysJumps(s->elseStmt.get());
+            default:
+                return false;
+        }
+    }
+
+    unique_ptr<Stmt> emptyStmt() const {
+        auto s = make_unique<Stmt>();
+        s->kind = Stmt::Kind::Empty;
+        return s;
+    }
+
+    void optStmt(unique_ptr<Stmt> &s) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                enter();
+                for (auto &child : s->stmts) {
+                    optStmt(child);
+                    if (alwaysJumps(child.get())) break;
+                }
+                dceBlock(s->stmts);
+                leave();
+                break;
+            case Stmt::Kind::DeclStmt:
+                optExpr(s->decl->init);
+                setValue(s->decl->name, valueFromExpr(s->decl->init.get()));
+                break;
+            case Stmt::Kind::Assign:
+                optExpr(s->expr);
+                setValue(s->name, valueFromExpr(s->expr.get()));
+                break;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                optExpr(s->expr);
+                break;
+            case Stmt::Kind::If: {
+                optExpr(s->expr);
+                if (auto v = foldConstExpr(s->expr.get())) {
+                    if (*v) {
+                        s = std::move(s->thenStmt);
+                        ++keepEffectDepth;
+                        optStmt(s);
+                        --keepEffectDepth;
+                    } else if (s->elseStmt) {
+                        s = std::move(s->elseStmt);
+                        ++keepEffectDepth;
+                        optStmt(s);
+                        --keepEffectDepth;
+                    } else {
+                        s = emptyStmt();
+                    }
+                    break;
+                }
+                auto saved = env;
+                optStmt(s->thenStmt);
+                auto thenAssigned = assignedInStmt(s->thenStmt.get());
+                env = saved;
+                optStmt(s->elseStmt);
+                auto elseAssigned = assignedInStmt(s->elseStmt.get());
+                env = saved;
+                for (auto &name : thenAssigned) eraseValue(name);
+                for (auto &name : elseAssigned) eraseValue(name);
+                break;
+            }
+            case Stmt::Kind::While: {
+                auto saved = env;
+                auto assigned = assignedInStmt(s->body.get());
+                for (auto &name : assigned) eraseValue(name);
+                optExpr(s->expr);
+                if (auto v = foldConstExpr(s->expr.get()); v && !*v) {
+                    s = emptyStmt();
+                    break;
+                }
+                ++loopDepth;
+                optStmt(s->body);
+                --loopDepth;
+                env = saved;
+                for (auto &name : assigned) eraseValue(name);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    unordered_set<string> varsInExpr(const Expr *e) const {
+        unordered_set<string> out;
+        collectVars(e, out);
+        return out;
+    }
+
+    void collectVars(const Expr *e, unordered_set<string> &out) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            out.insert(e->name);
+            return;
+        }
+        collectVars(e->lhs.get(), out);
+        collectVars(e->rhs.get(), out);
+        for (auto &arg : e->args) collectVars(arg.get(), out);
+    }
+
+    unordered_set<string> assignedInStmt(const Stmt *s) const {
+        unordered_set<string> out;
+        collectAssigned(s, out);
+        return out;
+    }
+
+    void collectAssigned(const Stmt *s, unordered_set<string> &out) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign) out.insert(s->name);
+        if (s->kind == Stmt::Kind::DeclStmt) out.insert(s->decl->name);
+        for (auto &child : s->stmts) collectAssigned(child.get(), out);
+        collectAssigned(s->thenStmt.get(), out);
+        collectAssigned(s->elseStmt.get(), out);
+        collectAssigned(s->body.get(), out);
+    }
+
+    unordered_set<string> usedInStmt(const Stmt *s) const {
+        unordered_set<string> out;
+        collectUsed(s, out);
+        return out;
+    }
+
+    void collectUsed(const Stmt *s, unordered_set<string> &out) const {
+        if (!s) return;
+        auto add = [&](const Expr *e) {
+            auto vars = varsInExpr(e);
+            out.insert(vars.begin(), vars.end());
+        };
+        if (s->kind == Stmt::Kind::DeclStmt) add(s->decl->init.get());
+        if (s->kind == Stmt::Kind::Assign || s->kind == Stmt::Kind::ExprStmt || s->kind == Stmt::Kind::If ||
+            s->kind == Stmt::Kind::While || s->kind == Stmt::Kind::Return) {
+            add(s->expr.get());
+        }
+        for (auto &child : s->stmts) collectUsed(child.get(), out);
+        collectUsed(s->thenStmt.get(), out);
+        collectUsed(s->elseStmt.get(), out);
+        collectUsed(s->body.get(), out);
+    }
+
+    void dceBlock(vector<unique_ptr<Stmt>> &stmts) {
+        vector<unique_ptr<Stmt>> reachable;
+        for (auto &s : stmts) {
+            reachable.push_back(std::move(s));
+            if (alwaysJumps(reachable.back().get())) break;
+        }
+        stmts = std::move(reachable);
+
+        unordered_set<string> live;
+        vector<unique_ptr<Stmt>> kept;
+        for (int i = static_cast<int>(stmts.size()) - 1; i >= 0; --i) {
+            auto &s = stmts[i];
+            bool keep = true;
+            switch (s->kind) {
+                case Stmt::Kind::Empty:
+                    keep = false;
+                    break;
+                case Stmt::Kind::ExprStmt:
+                    keep = exprHasCall(s->expr.get());
+                    if (keep) addLive(live, varsInExpr(s->expr.get()));
+                    break;
+                case Stmt::Kind::DeclStmt: {
+                    bool needed = live.count(s->decl->name) || exprHasCall(s->decl->init.get());
+                    if (loopDepth > 0 || keepEffectDepth > 0) needed = true;
+                    keep = needed;
+                    if (keep) {
+                        live.erase(s->decl->name);
+                        addLive(live, varsInExpr(s->decl->init.get()));
+                    }
+                    break;
+                }
+                case Stmt::Kind::Assign: {
+                    bool globalWrite = isGlobal(s->name);
+                    bool needed = globalWrite || live.count(s->name) || exprHasCall(s->expr.get());
+                    if (loopDepth > 0 || keepEffectDepth > 0) needed = true;
+                    keep = needed;
+                    if (keep) {
+                        live.erase(s->name);
+                        addLive(live, varsInExpr(s->expr.get()));
+                    }
+                    break;
+                }
+                case Stmt::Kind::Return:
+                    live.clear();
+                    addLive(live, varsInExpr(s->expr.get()));
+                    break;
+                case Stmt::Kind::If:
+                case Stmt::Kind::While:
+                    addLive(live, varsInExpr(s->expr.get()));
+                    addLive(live, usedInStmt(s.get()));
+                    break;
+                default:
+                    break;
+            }
+            if (keep) kept.push_back(std::move(s));
+        }
+        reverse(kept.begin(), kept.end());
+        stmts = std::move(kept);
+    }
+
+    static void addLive(unordered_set<string> &live, const unordered_set<string> &vars) {
+        live.insert(vars.begin(), vars.end());
+    }
+};
+
 struct Symbol {
     bool isConst = false;
     long long constValue = 0;
@@ -1602,6 +2109,10 @@ int main() {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
+    Resolver resolver(program);
+    resolver.run();
+    Optimizer optimizer(program);
+    optimizer.run();
     CodeGen codegen(program);
     cout << codegen.generate();
     return 0;
