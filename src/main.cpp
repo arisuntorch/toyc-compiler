@@ -2961,6 +2961,21 @@ private:
 
     void genCall(const Expr *e) {
         int n = static_cast<int>(e->args.size());
+        bool directArgs = n <= 8;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) {
+                directArgs = false;
+                break;
+            }
+        }
+        if (directArgs) {
+            static const vector<string> temps = {"t0", "t1", "t2", "t3", "t4", "t5"};
+            for (int i = 0; i < n; ++i) {
+                genExprNoCall(e->args[i].get(), "a" + to_string(i), temps);
+            }
+            emit("call " + e->name);
+            return;
+        }
         for (int i = 0; i < n; ++i) {
             genExpr(e->args[i].get());
             pushA0();
