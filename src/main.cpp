@@ -2970,9 +2970,13 @@ private:
     }
 };
 
-int main() {
+int main(int argc, char **argv) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
+    bool optMode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (string(argv[i]) == "-opt") optMode = true;
+    }
 
     string input((istreambuf_iterator<char>(cin)), istreambuf_iterator<char>());
     Lexer lexer(input);
@@ -2981,7 +2985,7 @@ int main() {
     Program program = parser.parseProgram();
     SafeOptimizer optimizer(program);
     optimizer.run();
-    ConstEvaluator constEval(program);
+    ConstEvaluator constEval(program, optMode ? 2000000000LL : 300000000LL, optMode ? 9000 : 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
         return 0;
