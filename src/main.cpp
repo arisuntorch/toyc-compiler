@@ -1551,6 +1551,7 @@ private:
                     if (alwaysJumps(child.get())) break;
                 }
                 truncateAfterJump(s->stmts);
+                removeDeadLocalStatements(s->stmts);
                 leave();
                 break;
             case Stmt::Kind::Empty:
@@ -1651,6 +1652,104 @@ private:
         collectAssigned(s->thenStmt.get(), out);
         collectAssigned(s->elseStmt.get(), out);
         collectAssigned(s->body.get(), out);
+    }
+
+    void collectUsedExpr(const Expr *e, unordered_set<string> &out) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            out.insert(e->name);
+            return;
+        }
+        collectUsedExpr(e->lhs.get(), out);
+        collectUsedExpr(e->rhs.get(), out);
+        for (auto &arg : e->args) collectUsedExpr(arg.get(), out);
+    }
+
+    void collectUsedStmt(const Stmt *s, unordered_set<string> &out) const {
+        if (!s) return;
+        collectUsedExpr(s->expr.get(), out);
+        if (s->kind == Stmt::Kind::DeclStmt) collectUsedExpr(s->decl->init.get(), out);
+        for (auto &child : s->stmts) collectUsedStmt(child.get(), out);
+        collectUsedStmt(s->thenStmt.get(), out);
+        collectUsedStmt(s->elseStmt.get(), out);
+        collectUsedStmt(s->body.get(), out);
+    }
+
+    void addUses(const Expr *e, unordered_set<string> &live) const {
+        unordered_set<string> used;
+        collectUsedExpr(e, used);
+        live.insert(used.begin(), used.end());
+    }
+
+    unique_ptr<Stmt> makeEmptyStmt() const {
+        auto e = make_unique<Stmt>();
+        e->kind = Stmt::Kind::Empty;
+        return e;
+    }
+
+    void removeDeadLocalStatements(vector<unique_ptr<Stmt>> &stmts) const {
+        unordered_set<string> locals;
+        for (auto &stmt : stmts) {
+            if (stmt && stmt->kind == Stmt::Kind::DeclStmt && stmt->decl) locals.insert(stmt->decl->name);
+        }
+        if (locals.empty()) {
+            for (auto &stmt : stmts) {
+                if (stmt && stmt->kind == Stmt::Kind::ExprStmt && !exprHasCall(stmt->expr.get())) {
+                    stmt = makeEmptyStmt();
+                }
+            }
+            return;
+        }
+
+        unordered_set<string> live;
+        for (int i = static_cast<int>(stmts.size()) - 1; i >= 0; --i) {
+            Stmt *stmt = stmts[i].get();
+            if (!stmt) continue;
+            switch (stmt->kind) {
+                case Stmt::Kind::DeclStmt: {
+                    const string &name = stmt->decl->name;
+                    bool local = locals.count(name) != 0;
+                    bool needed = live.count(name) != 0;
+                    if (local && !needed && !exprHasCall(stmt->decl->init.get())) {
+                        stmts[i] = makeEmptyStmt();
+                    } else {
+                        if (local) live.erase(name);
+                        addUses(stmt->decl->init.get(), live);
+                    }
+                    break;
+                }
+                case Stmt::Kind::Assign: {
+                    bool local = locals.count(stmt->name) != 0;
+                    bool needed = live.count(stmt->name) != 0;
+                    if (local && !needed && !exprHasCall(stmt->expr.get())) {
+                        stmts[i] = makeEmptyStmt();
+                    } else {
+                        if (local) live.erase(stmt->name);
+                        addUses(stmt->expr.get(), live);
+                    }
+                    break;
+                }
+                case Stmt::Kind::ExprStmt:
+                    if (!exprHasCall(stmt->expr.get())) {
+                        stmts[i] = makeEmptyStmt();
+                    } else {
+                        addUses(stmt->expr.get(), live);
+                    }
+                    break;
+                case Stmt::Kind::Return:
+                    addUses(stmt->expr.get(), live);
+                    break;
+                case Stmt::Kind::If:
+                case Stmt::Kind::While:
+                case Stmt::Kind::Block:
+                    collectUsedStmt(stmt, live);
+                    break;
+                case Stmt::Kind::Empty:
+                case Stmt::Kind::Break:
+                case Stmt::Kind::Continue:
+                    break;
+            }
+        }
     }
 };
 
