@@ -1573,7 +1573,6 @@ private:
     string functionBodyLabel;
     vector<string> currentParams;
     vector<string> savedVarRegs;
-    vector<string> allocableVarRegs;
     int labelId = 0;
     int nextSlot = 0;
     int nextVarReg = 0;
@@ -1798,16 +1797,6 @@ private:
         return false;
     }
 
-    bool stmtHasCall(const Stmt *s) const {
-        if (!s) return false;
-        if (hasCall(s->expr.get())) return true;
-        if (s->decl && hasCall(s->decl->init.get())) return true;
-        for (auto &child : s->stmts) {
-            if (stmtHasCall(child.get())) return true;
-        }
-        return stmtHasCall(s->thenStmt.get()) || stmtHasCall(s->elseStmt.get()) || stmtHasCall(s->body.get());
-    }
-
     bool stmtAlwaysJumps(const Stmt *s) const {
         if (!s) return false;
         switch (s->kind) {
@@ -1860,8 +1849,8 @@ private:
     }
 
     string allocVarReg() {
-        if (nextVarReg >= static_cast<int>(allocableVarRegs.size())) return "";
-        return allocableVarRegs[nextVarReg++];
+        if (nextVarReg >= static_cast<int>(savedVarRegs.size())) return "";
+        return savedVarRegs[nextVarReg++];
     }
 
     void enterScope() { scopes.push_back({}); }
@@ -1869,16 +1858,8 @@ private:
 
     void genFunction(Function &f) {
         int slots = countSlots(f);
-        static const vector<string> allSavedRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
-        static const vector<string> callFreeExtraRegs = {"a1", "a2", "a3", "a4", "a5", "a6", "a7"};
-        savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + min<int>(allSavedRegs.size(), slots));
-        allocableVarRegs = savedVarRegs;
-        if (!stmtHasCall(f.body.get())) {
-            for (const string &reg : callFreeExtraRegs) {
-                if (static_cast<int>(allocableVarRegs.size()) >= slots) break;
-                allocableVarRegs.push_back(reg);
-            }
-        }
+        static const vector<string> allVarRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+        savedVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + min<int>(allVarRegs.size(), slots));
         frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
         nextSlot = 0;
         nextVarReg = 0;
