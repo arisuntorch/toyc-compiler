@@ -900,7 +900,371 @@ private:
         return 0;
     }
 
+    static uint64_t gcd64(uint64_t a, uint64_t b) {
+        while (b) {
+            uint64_t t = a % b;
+            a = b;
+            b = t;
+        }
+        return a;
+    }
+
+    static uint64_t lcmCapped(uint64_t a, uint64_t b, uint64_t cap) {
+        if (a == 0 || b == 0) return 0;
+        uint64_t g = gcd64(a, b);
+        if (a / g > cap / b) return cap + 1;
+        return a / g * b;
+    }
+
+    void collectExprVarNames(const Expr *e, unordered_set<string> &out) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            out.insert(e->name);
+            return;
+        }
+        collectExprVarNames(e->lhs.get(), out);
+        collectExprVarNames(e->rhs.get(), out);
+        for (auto &arg : e->args) collectExprVarNames(arg.get(), out);
+    }
+
+    void collectAssignedNames(const Stmt *s, unordered_set<string> &out) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign) out.insert(s->name);
+        for (auto &child : s->stmts) collectAssignedNames(child.get(), out);
+        collectAssignedNames(s->thenStmt.get(), out);
+        collectAssignedNames(s->elseStmt.get(), out);
+        collectAssignedNames(s->body.get(), out);
+    }
+
+    bool exprContainsCall(const Expr *e) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Call) return true;
+        if (exprContainsCall(e->lhs.get()) || exprContainsCall(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (exprContainsCall(arg.get())) return true;
+        }
+        return false;
+    }
+
+    optional<int32_t> evalStaticConst(const Expr *e) const {
+        if (!e) return nullopt;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var:
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto v = evalStaticConst(e->lhs.get());
+                if (!v) return nullopt;
+                if (e->op == "+") return *v;
+                if (e->op == "-") return sub32(0, *v);
+                if (e->op == "!") return !truthy(*v);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->op == "&&") {
+                    auto l = evalStaticConst(e->lhs.get());
+                    if (!l) return nullopt;
+                    if (!truthy(*l)) return 0;
+                    auto r = evalStaticConst(e->rhs.get());
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                if (e->op == "||") {
+                    auto l = evalStaticConst(e->lhs.get());
+                    if (!l) return nullopt;
+                    if (truthy(*l)) return 1;
+                    auto r = evalStaticConst(e->rhs.get());
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                auto l = evalStaticConst(e->lhs.get());
+                auto r = evalStaticConst(e->rhs.get());
+                if (!l || !r) return nullopt;
+                if (e->op == "+") return add32(*l, *r);
+                if (e->op == "-") return sub32(*l, *r);
+                if (e->op == "*") return mul32(*l, *r);
+                if (e->op == "/" && *r != 0) return div32(*l, *r);
+                if (e->op == "%" && *r != 0) return mod32(*l, *r);
+                if (e->op == "<") return *l < *r;
+                if (e->op == ">") return *l > *r;
+                if (e->op == "<=") return *l <= *r;
+                if (e->op == ">=") return *l >= *r;
+                if (e->op == "==") return *l == *r;
+                if (e->op == "!=") return *l != *r;
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
+    bool collectPeriodicModuli(const Expr *e, const string &induction, vector<int32_t> &mods) const {
+        if (!e) return true;
+        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Binary && e->op == "%") {
+            if (e->lhs && e->lhs->kind == Expr::Kind::Var && e->lhs->name == induction) {
+                if (auto m = evalStaticConst(e->rhs.get())) {
+                    int32_t mod = *m < 0 ? -*m : *m;
+                    if (mod > 1) mods.push_back(mod);
+                    return true;
+                }
+            }
+            return false;
+        }
+        return collectPeriodicModuli(e->lhs.get(), induction, mods) &&
+               collectPeriodicModuli(e->rhs.get(), induction, mods) &&
+               all_of(e->args.begin(), e->args.end(), [&](const unique_ptr<Expr> &arg) {
+                   return collectPeriodicModuli(arg.get(), induction, mods);
+               });
+    }
+
+    bool collectPeriodicInfo(const Stmt *s, const string &induction,
+                             const unordered_set<string> &assigned, vector<int32_t> &mods,
+                             bool &sawIf) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectPeriodicInfo(child.get(), induction, assigned, mods, sawIf)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Assign:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprContainsCall(s->expr.get());
+            case Stmt::Kind::If: {
+                sawIf = true;
+                unordered_set<string> vars;
+                collectExprVarNames(s->expr.get(), vars);
+                bool usesInduction = vars.count(induction) != 0;
+                for (const string &name : vars) {
+                    if (name != induction && assigned.count(name)) return false;
+                }
+                if (usesInduction) {
+                    size_t before = mods.size();
+                    if (!collectPeriodicModuli(s->expr.get(), induction, mods)) return false;
+                    if (mods.size() == before) return false;
+                }
+                return collectPeriodicInfo(s->thenStmt.get(), induction, assigned, mods, sawIf) &&
+                       collectPeriodicInfo(s->elseStmt.get(), induction, assigned, mods, sawIf);
+            }
+            default:
+                return false;
+        }
+    }
+
+    optional<int32_t> evalExprWithRows(const Expr *e, const unordered_map<string, int> &idx,
+                                       const vector<vector<uint32_t>> &cur,
+                                       const vector<uint32_t> &base) const {
+        if (!e) return nullopt;
+        auto rowValue = [&](const vector<uint32_t> &row) {
+            uint64_t acc = 0;
+            for (size_t i = 0; i < row.size(); ++i) acc += static_cast<uint64_t>(row[i]) * base[i];
+            return static_cast<int32_t>(static_cast<uint32_t>(acc));
+        };
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var: {
+                auto it = idx.find(e->name);
+                if (it != idx.end()) return rowValue(cur[it->second]);
+                return lookupVar(e->name);
+            }
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto v = evalExprWithRows(e->lhs.get(), idx, cur, base);
+                if (!v) return nullopt;
+                if (e->op == "+") return *v;
+                if (e->op == "-") return sub32(0, *v);
+                if (e->op == "!") return !truthy(*v);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->op == "&&") {
+                    auto l = evalExprWithRows(e->lhs.get(), idx, cur, base);
+                    if (!l) return nullopt;
+                    if (!truthy(*l)) return 0;
+                    auto r = evalExprWithRows(e->rhs.get(), idx, cur, base);
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                if (e->op == "||") {
+                    auto l = evalExprWithRows(e->lhs.get(), idx, cur, base);
+                    if (!l) return nullopt;
+                    if (truthy(*l)) return 1;
+                    auto r = evalExprWithRows(e->rhs.get(), idx, cur, base);
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                auto l = evalExprWithRows(e->lhs.get(), idx, cur, base);
+                auto r = evalExprWithRows(e->rhs.get(), idx, cur, base);
+                if (!l || !r) return nullopt;
+                if (e->op == "+") return add32(*l, *r);
+                if (e->op == "-") return sub32(*l, *r);
+                if (e->op == "*") return mul32(*l, *r);
+                if (e->op == "/") {
+                    if (*r == 0) return nullopt;
+                    return div32(*l, *r);
+                }
+                if (e->op == "%") {
+                    if (*r == 0) return nullopt;
+                    return mod32(*l, *r);
+                }
+                if (e->op == "<") return *l < *r;
+                if (e->op == ">") return *l > *r;
+                if (e->op == "<=") return *l <= *r;
+                if (e->op == ">=") return *l >= *r;
+                if (e->op == "==") return *l == *r;
+                if (e->op == "!=") return *l != *r;
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
+    bool buildPeriodicTransformStmt(const Stmt *s, const unordered_map<string, int> &idx,
+                                    const vector<uint32_t> &base,
+                                    vector<vector<uint32_t>> &cur) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!buildPeriodicTransformStmt(child.get(), idx, base, cur)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprContainsCall(s->expr.get());
+            case Stmt::Kind::Assign: {
+                auto it = idx.find(s->name);
+                if (it == idx.end()) return false;
+                vector<uint32_t> row;
+                if (!affineExpr(s->expr.get(), idx, cur, row)) return false;
+                cur[it->second] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::If: {
+                auto cond = evalExprWithRows(s->expr.get(), idx, cur, base);
+                if (!cond) return false;
+                return truthy(*cond)
+                    ? buildPeriodicTransformStmt(s->thenStmt.get(), idx, base, cur)
+                    : buildPeriodicTransformStmt(s->elseStmt.get(), idx, base, cur);
+            }
+            default:
+                return false;
+        }
+    }
+
+    bool tryRunPeriodicAffineLoop(const Stmt *s) {
+        string ind, cmp;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
+
+        unordered_set<string> assigned;
+        collectAssignedNames(s->body.get(), assigned);
+        if (!assigned.count(ind)) return false;
+        vector<int32_t> moduli;
+        bool sawIf = false;
+        if (!collectPeriodicInfo(s->body.get(), ind, assigned, moduli, sawIf) || !sawIf) return false;
+
+        vector<string> vars;
+        vars.push_back(ind);
+        for (const string &name : assigned) {
+            if (name != ind) vars.push_back(name);
+        }
+        unordered_map<string, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+
+        vector<uint32_t> state(d, 0);
+        for (int i = 0; i < k; ++i) {
+            auto value = lookupVar(vars[i]);
+            if (!value) return false;
+            state[i] = static_cast<uint32_t>(*value);
+        }
+        state[d - 1] = 1;
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<vector<uint32_t>> first = idmat;
+        if (!buildPeriodicTransformStmt(s->body.get(), idx, state, first)) return false;
+        int indIdx = idx[ind];
+        const auto &ir = first[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return false;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return false;
+        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
+        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
+
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound)) return false;
+        for (int i = 0; i < k; ++i) {
+            if (bound[i] != 0) return false;
+        }
+        uint64_t boundAcc = 0;
+        for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(bound[i]) * state[i];
+        AffineLoop loop;
+        loop.cmp = cmp;
+        loop.step = step;
+        uint64_t niter = countIterations(loop, static_cast<int32_t>(state[indIdx]),
+                                         static_cast<int32_t>(static_cast<uint32_t>(boundAcc)));
+        if (niter == 0) return true;
+        if (niter < 100000) return false;
+
+        uint64_t period = 1;
+        uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
+        for (int32_t mod : moduli) {
+            uint64_t m = static_cast<uint64_t>(mod);
+            uint64_t reduced = m / gcd64(m, absStep % m);
+            period = lcmCapped(period, reduced, 4096);
+            if (period > 4096) return false;
+        }
+        if (period == 0 || period > 4096) return false;
+
+        vector<vector<vector<uint32_t>>> iterMats;
+        iterMats.reserve(static_cast<size_t>(period));
+        vector<uint32_t> sample = state;
+        for (uint64_t i = 0; i < period; ++i) {
+            vector<vector<uint32_t>> mat = idmat;
+            if (!buildPeriodicTransformStmt(s->body.get(), idx, sample, mat)) return false;
+            const auto &row = mat[indIdx];
+            for (int j = 0; j < k; ++j) {
+                uint32_t want = j == indIdx ? 1u : 0u;
+                if (row[j] != want) return false;
+            }
+            if (static_cast<int32_t>(row[d - 1]) != step) return false;
+            iterMats.push_back(mat);
+            sample = matVec(mat, sample);
+        }
+
+        vector<vector<uint32_t>> periodMat = idmat;
+        for (auto &mat : iterMats) periodMat = matMul(mat, periodMat);
+
+        uint64_t whole = niter / period;
+        uint64_t rem = niter % period;
+        vector<vector<uint32_t>> power = periodMat;
+        while (whole) {
+            tick(20);
+            if (whole & 1) state = matVec(power, state);
+            whole >>= 1;
+            if (whole) power = matMul(power, power);
+        }
+        for (uint64_t i = 0; i < rem; ++i) state = matVec(iterMats[i], state);
+
+        for (int i = 0; i < k; ++i) setVar(vars[i], static_cast<int32_t>(state[i]));
+        return true;
+    }
+
     bool tryRunAffineLoop(const Stmt *s) {
+        if (tryRunPeriodicAffineLoop(s)) return true;
         AffineLoop loop;
         if (!buildAffineLoop(s, loop)) return false;
         tick(100);
