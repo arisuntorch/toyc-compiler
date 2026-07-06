@@ -324,6 +324,7 @@ private:
         vector<string> vars;
         vector<vector<uint32_t>> mat;
         vector<uint32_t> bound;
+        unordered_set<string> transient;
         int induction = -1;
         string cmp;
         int32_t step = 0;
@@ -680,12 +681,23 @@ private:
     }
 
     bool collectAssignments(const Stmt *s, vector<pair<string, const Expr *>> &assigns,
-                            vector<string> &vars, unordered_set<string> &seen) const {
+                            vector<string> &vars, unordered_set<string> &seen,
+                            unordered_set<string> &transient) const {
         if (!s) return true;
         if (s->kind == Stmt::Kind::Block) {
             for (auto &child : s->stmts) {
-                if (!collectAssignments(child.get(), assigns, vars, seen)) return false;
+                if (!collectAssignments(child.get(), assigns, vars, seen, transient)) return false;
             }
+            return true;
+        }
+        if (s->kind == Stmt::Kind::DeclStmt) {
+            if (!s->decl || !s->decl->init) return false;
+            if (seen.count(s->decl->name)) return false;
+            if (lookupVar(s->decl->name)) return false;
+            seen.insert(s->decl->name);
+            vars.push_back(s->decl->name);
+            transient.insert(s->decl->name);
+            assigns.push_back({s->decl->name, s->decl->init.get()});
             return true;
         }
         if (s->kind != Stmt::Kind::Assign) return false;
@@ -787,7 +799,9 @@ private:
     bool buildAffineLoop(const Stmt *s, AffineLoop &loop) const {
         string ind, cmp;
         const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
+        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) {
+            return false;
+        }
 
         vector<string> vars;
         unordered_set<string> seen;
@@ -795,14 +809,19 @@ private:
         vars.push_back(ind);
 
         vector<pair<string, const Expr *>> assigns;
-        if (!collectAssignments(s->body.get(), assigns, vars, seen)) return false;
+        unordered_set<string> transient;
+        if (!collectAssignments(s->body.get(), assigns, vars, seen, transient)) {
+            return false;
+        }
         bool updatesInd = false;
         unordered_set<string> updated;
         for (auto &as : assigns) {
             updated.insert(as.first);
             if (as.first == ind) updatesInd = true;
         }
-        if (!updatesInd) return false;
+        if (!updatesInd) {
+            return false;
+        }
 
         unordered_map<string, int> idx;
         for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
@@ -813,7 +832,9 @@ private:
 
         for (auto &as : assigns) {
             vector<uint32_t> row;
-            if (!affineExpr(as.second, idx, cur, row)) return false;
+            if (!affineExpr(as.second, idx, cur, row)) {
+                return false;
+            }
             cur[idx[as.first]] = std::move(row);
         }
 
@@ -821,25 +842,38 @@ private:
         const auto &ir = cur[indIdx];
         for (int j = 0; j < k; ++j) {
             uint32_t want = j == indIdx ? 1u : 0u;
-            if (ir[j] != want) return false;
+            if (ir[j] != want) {
+                return false;
+            }
         }
         int32_t step = static_cast<int32_t>(ir[d - 1]);
-        if (step == 0) return false;
-        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
-        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
+        if (step == 0) {
+            return false;
+        }
+        if ((cmp == "<" || cmp == "<=") && step <= 0) {
+            return false;
+        }
+        if ((cmp == ">" || cmp == ">=") && step >= 0) {
+            return false;
+        }
 
         vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
         for (int i = 0; i < d; ++i) idmat[i][i] = 1;
         vector<uint32_t> bound;
-        if (!affineExpr(boundExpr, idx, idmat, bound)) return false;
+        if (!affineExpr(boundExpr, idx, idmat, bound)) {
+            return false;
+        }
         for (const string &name : updated) {
             int j = idx[name];
-            if (bound[j] != 0) return false;
+            if (bound[j] != 0) {
+                return false;
+            }
         }
 
         loop.vars = std::move(vars);
         loop.mat = std::move(cur);
         loop.bound = std::move(bound);
+        loop.transient = std::move(transient);
         loop.induction = indIdx;
         loop.cmp = std::move(cmp);
         loop.step = step;
@@ -1272,6 +1306,10 @@ private:
         int d = k + 1;
         vector<uint32_t> v(d, 0);
         for (int i = 0; i < k; ++i) {
+            if (loop.transient.count(loop.vars[i])) {
+                v[i] = 0;
+                continue;
+            }
             auto value = lookupVar(loop.vars[i]);
             if (!value) return false;
             v[i] = static_cast<uint32_t>(*value);
@@ -1290,7 +1328,9 @@ private:
             niter >>= 1;
             if (niter) m = matMul(m, m);
         }
-        for (int i = 0; i < k; ++i) setVar(loop.vars[i], static_cast<int32_t>(v[i]));
+        for (int i = 0; i < k; ++i) {
+            if (!loop.transient.count(loop.vars[i])) setVar(loop.vars[i], static_cast<int32_t>(v[i]));
+        }
         return true;
     }
 };
@@ -2985,7 +3025,7 @@ int main(int argc, char **argv) {
     Program program = parser.parseProgram();
     SafeOptimizer optimizer(program);
     optimizer.run();
-    ConstEvaluator constEval(program, optMode ? 10000000000LL : 300000000LL, optMode ? 30000 : 2500);
+    ConstEvaluator constEval(program, optMode ? 10000000000LL : 300000000LL, optMode ? 15000 : 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
         return 0;
