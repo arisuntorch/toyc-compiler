@@ -693,7 +693,6 @@ private:
             seen.insert(s->name);
             vars.push_back(s->name);
         }
-        collectVars(s->expr.get(), vars, seen);
         assigns.push_back({s->name, s->expr.get()});
         return true;
     }
@@ -715,7 +714,12 @@ private:
                 return true;
             case Expr::Kind::Var: {
                 auto it = idx.find(e->name);
-                if (it == idx.end()) return false;
+                if (it == idx.end()) {
+                    auto v = lookupVar(e->name);
+                    if (!v) return false;
+                    out[d - 1] = static_cast<uint32_t>(*v);
+                    return true;
+                }
                 out = cur[it->second];
                 return true;
             }
@@ -789,7 +793,6 @@ private:
         unordered_set<string> seen;
         seen.insert(ind);
         vars.push_back(ind);
-        collectVars(boundExpr, vars, seen);
 
         vector<pair<string, const Expr *>> assigns;
         if (!collectAssignments(s->body.get(), assigns, vars, seen)) return false;

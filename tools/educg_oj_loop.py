@@ -35,6 +35,20 @@ TERMINAL_ERROR_KEYWORDS = (
     "could not read Username",
     "编译器异常",
 )
+RETRYABLE_TERMINAL_KEYWORDS = (
+    "Git Clone 时发生错误",
+    "Failed to connect to github.com",
+    "连接超时",
+    "Empty reply from server",
+    "RPC 失败",
+    "port 443",
+)
+NON_RETRYABLE_TERMINAL_KEYWORDS = (
+    "鉴权失败",
+    "could not read Username",
+    "Authentication failed",
+    "Repository not found",
+)
 
 
 class TextOnlyParser(HTMLParser):
@@ -315,6 +329,15 @@ def format_summary(parsed: dict) -> str:
     return parsed.get("message") or "OJ is still running"
 
 
+def should_retry_terminal_error(parsed: dict) -> bool:
+    if not parsed.get("terminal_error"):
+        return False
+    message = parsed.get("message") or ""
+    if any(keyword in message for keyword in NON_RETRYABLE_TERMINAL_KEYWORDS):
+        return False
+    return any(keyword in message for keyword in RETRYABLE_TERMINAL_KEYWORDS)
+
+
 def write_record(path: Path, run_no: int, parsed: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -347,6 +370,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--until-total", type=float, default=None, help="stop once total score reaches this")
     parser.add_argument("--no-submit", action="store_true", help="only read the current result")
     parser.add_argument(
+        "--clone-retries",
+        type=int,
+        default=3,
+        help="retry count for transient Git clone/network errors",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=int,
+        default=90,
+        help="seconds to wait before retrying a transient terminal error",
+    )
+    parser.add_argument(
         "--out",
         default="tmp/educg_oj_results.jsonl",
         help="JSONL result log path",
@@ -365,31 +400,57 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_submit and args.interval < 60 and args.runs > 1:
         print("--interval must be >= 60 seconds for repeated submissions", file=sys.stderr)
         return 2
+    if args.clone_retries < 0:
+        print("--clone-retries must be >= 0", file=sys.stderr)
+        return 2
+    if args.retry_delay < 60 and args.clone_retries > 0:
+        print("--retry-delay must be >= 60 seconds when retries are enabled", file=sys.stderr)
+        return 2
 
     client = EduCGClient(args.session, args.lang, args.http_timeout)
     out_path = Path(args.out)
 
     for run_no in range(1, args.runs + 1):
-        print(f"run {run_no}/{args.runs}", flush=True)
-        if args.no_submit:
-            json_url, referer = fetch_current_json_url(client, args.url)
-        else:
-            json_url, referer = submit_once(
+        attempt = 0
+        while True:
+            attempt += 1
+            if args.no_submit or args.clone_retries == 0:
+                print(f"run {run_no}/{args.runs}", flush=True)
+            else:
+                print(f"run {run_no}/{args.runs}, attempt {attempt}/{args.clone_retries + 1}", flush=True)
+
+            if args.no_submit:
+                json_url, referer = fetch_current_json_url(client, args.url)
+            else:
+                json_url, referer = submit_once(
+                    client,
+                    args.url,
+                    args.repo_url,
+                    args.branch,
+                    args.wtime,
+                )
+            parsed = poll_result(
                 client,
-                args.url,
-                args.repo_url,
-                args.branch,
-                args.wtime,
+                json_url,
+                referer=referer,
+                poll_interval=args.poll_interval,
+                max_wait=args.max_wait,
             )
-        parsed = poll_result(
-            client,
-            json_url,
-            referer=referer,
-            poll_interval=args.poll_interval,
-            max_wait=args.max_wait,
-        )
-        write_record(out_path, run_no, parsed)
-        print(f"saved {out_path}", flush=True)
+            write_record(out_path, run_no, parsed)
+            print(f"saved {out_path}", flush=True)
+
+            if (
+                not args.no_submit
+                and should_retry_terminal_error(parsed)
+                and attempt <= args.clone_retries
+            ):
+                print(
+                    f"retryable terminal error; sleep {args.retry_delay}s before retry",
+                    flush=True,
+                )
+                time.sleep(args.retry_delay)
+                continue
+            break
 
         total_score = parsed.get("total_score")
         if args.until_total is not None and total_score is not None and total_score >= args.until_total:
