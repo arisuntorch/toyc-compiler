@@ -2361,6 +2361,29 @@ private:
             genCall(e);
             return;
         }
+        bool argsHaveCall = false;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) {
+                argsHaveCall = true;
+                break;
+            }
+        }
+        static const vector<string> tailTemps = {"t0", "t1", "t2", "t3", "t4", "t5"};
+        if (!argsHaveCall && n <= static_cast<int>(tailTemps.size())) {
+            for (int i = 0; i < n; ++i) {
+                vector<string> regs;
+                for (int j = 0; j < static_cast<int>(tailTemps.size()); ++j) {
+                    if (j == i || j < i) continue;
+                    regs.push_back(tailTemps[j]);
+                }
+                genExprNoCall(e->args[i].get(), tailTemps[i], regs);
+            }
+            for (int i = 0; i < n; ++i) {
+                storeParamFrom(currentParams[i], tailTemps[i]);
+            }
+            emit("j " + functionBodyLabel);
+            return;
+        }
         for (int i = 0; i < n; ++i) {
             genExpr(e->args[i].get());
             pushA0();
