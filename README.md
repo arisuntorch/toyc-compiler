@@ -31,8 +31,12 @@ is currently ignored by this implementation.
 - Arithmetic, relational, equality, logical, unary, parenthesized, variable, and
   function-call expressions.
 - Short-circuit code generation for `&&` and `||`.
-- Constant expression folding plus simple immediate-form code generation for
-  common add, subtract, equality, and comparison expressions.
+- Constant expression folding plus immediate-form code generation for common
+  arithmetic, equality, and comparison expressions.
+- Register-based expression evaluation for call-free expressions, avoiding most
+  temporary stack traffic in loop bodies.
+- Direct conditional branches for `if` and `while` comparisons.
+- Tail-recursive self calls are rewritten into parameter updates plus a jump.
 
 ## Notes
 

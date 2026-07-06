@@ -578,6 +578,9 @@ private:
     vector<string> breakLabels;
     vector<string> continueLabels;
     string returnLabel;
+    string currentFunctionName;
+    string functionBodyLabel;
+    vector<string> currentParams;
     int labelId = 0;
     int nextSlot = 0;
     int frameSize = 0;
@@ -624,8 +627,12 @@ private:
     }
 
     void pushA0() {
+        pushReg("a0");
+    }
+
+    void pushReg(const string &reg) {
         adjustSp(-16);
-        storeMem("a0", "sp", 12);
+        storeMem(reg, "sp", 12);
     }
 
     void popTo(const string &reg) {
@@ -786,6 +793,32 @@ private:
         return nullopt;
     }
 
+    bool hasCall(const Expr *e) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Call) return true;
+        if (hasCall(e->lhs.get()) || hasCall(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) return true;
+        }
+        return false;
+    }
+
+    bool stmtAlwaysJumps(const Stmt *s) const {
+        if (!s) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Return:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::Block:
+                return !s->stmts.empty() && stmtAlwaysJumps(s->stmts.back().get());
+            case Stmt::Kind::If:
+                return s->elseStmt && stmtAlwaysJumps(s->thenStmt.get()) && stmtAlwaysJumps(s->elseStmt.get());
+            default:
+                return false;
+        }
+    }
+
     int countSlots(const Function &f) {
         int n = static_cast<int>(f.params.size());
         n += countSlots(f.body.get());
@@ -831,7 +864,10 @@ private:
         scopes.clear();
         breakLabels.clear();
         continueLabels.clear();
+        currentFunctionName = f.name;
+        currentParams = f.params;
         returnLabel = newLabel("return_" + f.name);
+        functionBodyLabel = newLabel("body_" + f.name);
 
         out << ".globl " << f.name << "\n";
         emitLabel(f.name);
@@ -856,6 +892,7 @@ private:
             }
         }
 
+        emitLabel(functionBodyLabel);
         genStmt(f.body.get());
         emit("li a0, 0");
         emitLabel(returnLabel);
@@ -871,7 +908,10 @@ private:
         switch (s->kind) {
             case Stmt::Kind::Block:
                 enterScope();
-                for (auto &child : s->stmts) genStmt(child.get());
+                for (auto &child : s->stmts) {
+                    genStmt(child.get());
+                    if (stmtAlwaysJumps(child.get())) break;
+                }
                 leaveScope();
                 break;
             case Stmt::Kind::Empty:
@@ -899,9 +939,13 @@ private:
                 if (!continueLabels.empty()) emit("j " + continueLabels.back());
                 break;
             case Stmt::Kind::Return:
-                if (s->expr) genExpr(s->expr.get());
-                else emit("li a0, 0");
-                emit("j " + returnLabel);
+                if (s->expr && s->expr->kind == Expr::Kind::Call && s->expr->name == currentFunctionName) {
+                    genTailSelfCall(s->expr.get());
+                } else {
+                    if (s->expr) genExpr(s->expr.get());
+                    else emit("li a0, 0");
+                    emit("j " + returnLabel);
+                }
                 break;
         }
     }
@@ -919,10 +963,14 @@ private:
     }
 
     void genIf(const Stmt *s) {
+        if (auto v = tryConst(s->expr.get())) {
+            if (*v) genStmt(s->thenStmt.get());
+            else if (s->elseStmt) genStmt(s->elseStmt.get());
+            return;
+        }
         string elseLabel = newLabel("else");
         string endLabel = newLabel("endif");
-        genExpr(s->expr.get());
-        emit("beqz a0, " + elseLabel);
+        genCondFalse(s->expr.get(), elseLabel);
         genStmt(s->thenStmt.get());
         emit("j " + endLabel);
         emitLabel(elseLabel);
@@ -931,11 +979,11 @@ private:
     }
 
     void genWhile(const Stmt *s) {
+        if (auto v = tryConst(s->expr.get()); v && !*v) return;
         string beginLabel = newLabel("while_begin");
         string endLabel = newLabel("while_end");
         emitLabel(beginLabel);
-        genExpr(s->expr.get());
-        emit("beqz a0, " + endLabel);
+        genCondFalse(s->expr.get(), endLabel);
         breakLabels.push_back(endLabel);
         continueLabels.push_back(beginLabel);
         genStmt(s->body.get());
@@ -948,6 +996,10 @@ private:
     void genExpr(const Expr *e) {
         if (auto v = tryConst(e)) {
             emit("li a0, " + to_string(*v));
+            return;
+        }
+        if (!hasCall(e)) {
+            genExprNoCall(e, "a0", {"t0", "t1", "t2", "t3", "t4", "t5"});
             return;
         }
         switch (e->kind) {
@@ -973,6 +1025,330 @@ private:
         genExpr(e->lhs.get());
         if (e->op == "-") emit("sub a0, x0, a0");
         else if (e->op == "!") emit("sltiu a0, a0, 1");
+    }
+
+    void loadVarTo(const string &name, const string &dst) {
+        auto sym = lookup(name);
+        if (!sym) {
+            emit("li " + dst + ", 0");
+            return;
+        }
+        if (sym->isConst) {
+            emit("li " + dst + ", " + to_string(sym->constValue));
+        } else if (sym->isGlobal) {
+            emit("la t6, " + sym->label);
+            loadMem(dst, "t6", 0);
+        } else {
+            loadMem(dst, "s0", sym->offset);
+        }
+    }
+
+    void storeVarFrom(const string &name, const string &src) {
+        auto sym = lookup(name);
+        if (!sym || sym->isConst) return;
+        if (sym->isGlobal) {
+            emit("la t6, " + sym->label);
+            storeMem(src, "t6", 0);
+        } else {
+            storeMem(src, "s0", sym->offset);
+        }
+    }
+
+    void storeParamFrom(const string &name, const string &src) {
+        if (scopes.empty()) return;
+        auto it = scopes.front().find(name);
+        if (it == scopes.front().end()) return;
+        const Symbol &sym = it->second;
+        if (!sym.isConst && !sym.isGlobal) storeMem(src, "s0", sym.offset);
+    }
+
+    static bool isPowerOfTwo(long long v) {
+        return v > 0 && (v & (v - 1)) == 0;
+    }
+
+    static int log2Int(long long v) {
+        int n = 0;
+        while (v > 1) {
+            v >>= 1;
+            ++n;
+        }
+        return n;
+    }
+
+    void emitBinaryReg(const string &op, const string &dst, const string &lhs, const string &rhs) {
+        if (op == "+") emit("add " + dst + ", " + lhs + ", " + rhs);
+        else if (op == "-") emit("sub " + dst + ", " + lhs + ", " + rhs);
+        else if (op == "*") emit("mul " + dst + ", " + lhs + ", " + rhs);
+        else if (op == "/") emit("div " + dst + ", " + lhs + ", " + rhs);
+        else if (op == "%") emit("rem " + dst + ", " + lhs + ", " + rhs);
+        else if (op == "<") emit("slt " + dst + ", " + lhs + ", " + rhs);
+        else if (op == ">") emit("slt " + dst + ", " + rhs + ", " + lhs);
+        else if (op == "<=") {
+            emit("slt " + dst + ", " + rhs + ", " + lhs);
+            emit("xori " + dst + ", " + dst + ", 1");
+        } else if (op == ">=") {
+            emit("slt " + dst + ", " + lhs + ", " + rhs);
+            emit("xori " + dst + ", " + dst + ", 1");
+        } else if (op == "==") {
+            emit("sub " + dst + ", " + lhs + ", " + rhs);
+            emit("sltiu " + dst + ", " + dst + ", 1");
+        } else if (op == "!=") {
+            emit("sub " + dst + ", " + lhs + ", " + rhs);
+            emit("sltu " + dst + ", x0, " + dst);
+        }
+    }
+
+    void genExprNoCall(const Expr *e, const string &dst, vector<string> regs) {
+        if (auto v = tryConst(e)) {
+            emit("li " + dst + ", " + to_string(*v));
+            return;
+        }
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                emit("li " + dst + ", " + to_string(e->value));
+                return;
+            case Expr::Kind::Var:
+                loadVarTo(e->name, dst);
+                return;
+            case Expr::Kind::Call:
+                genExpr(e);
+                if (dst != "a0") emit("mv " + dst + ", a0");
+                return;
+            case Expr::Kind::Unary:
+                genExprNoCall(e->lhs.get(), dst, regs);
+                if (e->op == "-") emit("sub " + dst + ", x0, " + dst);
+                else if (e->op == "!") emit("sltiu " + dst + ", " + dst + ", 1");
+                return;
+            case Expr::Kind::Binary:
+                break;
+        }
+
+        if (e->op == "&&") {
+            string falseLabel = newLabel("land_false");
+            string endLabel = newLabel("land_end");
+            genCondFalse(e->lhs.get(), falseLabel);
+            genCondFalse(e->rhs.get(), falseLabel);
+            emit("li " + dst + ", 1");
+            emit("j " + endLabel);
+            emitLabel(falseLabel);
+            emit("li " + dst + ", 0");
+            emitLabel(endLabel);
+            return;
+        }
+        if (e->op == "||") {
+            string trueLabel = newLabel("lor_true");
+            string endLabel = newLabel("lor_end");
+            genCondTrue(e->lhs.get(), trueLabel);
+            genCondTrue(e->rhs.get(), trueLabel);
+            emit("li " + dst + ", 0");
+            emit("j " + endLabel);
+            emitLabel(trueLabel);
+            emit("li " + dst + ", 1");
+            emitLabel(endLabel);
+            return;
+        }
+
+        if (auto rhs = tryConst(e->rhs.get())) {
+            if (e->op == "+" && *rhs == 0) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                return;
+            }
+            if (e->op == "-" && *rhs == 0) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                return;
+            }
+            if ((e->op == "+" || e->op == "-") && fits12(e->op == "+" ? *rhs : -*rhs)) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("addi " + dst + ", " + dst + ", " + to_string(e->op == "+" ? *rhs : -*rhs));
+                return;
+            }
+            if (e->op == "<" && fits12(*rhs)) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("slti " + dst + ", " + dst + ", " + to_string(*rhs));
+                return;
+            }
+            if (e->op == ">=" && fits12(*rhs)) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("slti " + dst + ", " + dst + ", " + to_string(*rhs));
+                emit("xori " + dst + ", " + dst + ", 1");
+                return;
+            }
+            if (e->op == "==" && *rhs == 0) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("sltiu " + dst + ", " + dst + ", 1");
+                return;
+            }
+            if (e->op == "!=" && *rhs == 0) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("sltu " + dst + ", x0, " + dst);
+                return;
+            }
+            if ((e->op == "==" || e->op == "!=") && fits12(-*rhs)) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("addi " + dst + ", " + dst + ", " + to_string(-*rhs));
+                if (e->op == "==") emit("sltiu " + dst + ", " + dst + ", 1");
+                else emit("sltu " + dst + ", x0, " + dst);
+                return;
+            }
+            if (e->op == "*" && *rhs == 0) {
+                emit("li " + dst + ", 0");
+                return;
+            }
+            if (e->op == "*" && *rhs == 1) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                return;
+            }
+            if (e->op == "*" && isPowerOfTwo(*rhs)) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(*rhs)));
+                return;
+            }
+            if (e->op == "/" && *rhs == 1) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                return;
+            }
+            if (e->op == "%" && *rhs == 1) {
+                emit("li " + dst + ", 0");
+                return;
+            }
+        }
+        if (auto lhs = tryConst(e->lhs.get())) {
+            if (e->op == "+" && *lhs == 0) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                return;
+            }
+            if (e->op == "+" && fits12(*lhs)) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                emit("addi " + dst + ", " + dst + ", " + to_string(*lhs));
+                return;
+            }
+            if (e->op == "-" && *lhs == 0) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                emit("sub " + dst + ", x0, " + dst);
+                return;
+            }
+            if (e->op == "*" && *lhs == 0) {
+                emit("li " + dst + ", 0");
+                return;
+            }
+            if (e->op == "*" && *lhs == 1) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                return;
+            }
+            if (e->op == "*" && isPowerOfTwo(*lhs)) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(*lhs)));
+                return;
+            }
+        }
+
+        if (regs.empty()) {
+            genExprNoCall(e->lhs.get(), dst, regs);
+            pushReg(dst);
+            genExprNoCall(e->rhs.get(), dst, {});
+            popTo("t6");
+            emitBinaryReg(e->op, dst, "t6", dst);
+            return;
+        }
+
+        string lhsReg = regs.front();
+        regs.erase(regs.begin());
+        genExprNoCall(e->lhs.get(), lhsReg, regs);
+        genExprNoCall(e->rhs.get(), dst, regs);
+        emitBinaryReg(e->op, dst, lhsReg, dst);
+    }
+
+    void genCondFalse(const Expr *e, const string &falseLabel) {
+        if (auto v = tryConst(e)) {
+            if (!*v) emit("j " + falseLabel);
+            return;
+        }
+        if (e->kind == Expr::Kind::Unary && e->op == "!") {
+            genCondTrue(e->lhs.get(), falseLabel);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary && e->op == "&&") {
+            genCondFalse(e->lhs.get(), falseLabel);
+            genCondFalse(e->rhs.get(), falseLabel);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary && e->op == "||") {
+            string trueLabel = newLabel("cond_true");
+            genCondTrue(e->lhs.get(), trueLabel);
+            genCondFalse(e->rhs.get(), falseLabel);
+            emitLabel(trueLabel);
+            return;
+        }
+        static const unordered_set<string> relops = {"<", ">", "<=", ">=", "==", "!="};
+        if (e->kind == Expr::Kind::Binary && relops.count(e->op) && !hasCall(e)) {
+            genExprNoCall(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
+            genExprNoCall(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
+            if (e->op == "<") emit("bge a0, t0, " + falseLabel);
+            else if (e->op == ">") emit("bge t0, a0, " + falseLabel);
+            else if (e->op == "<=") emit("blt t0, a0, " + falseLabel);
+            else if (e->op == ">=") emit("blt a0, t0, " + falseLabel);
+            else if (e->op == "==") emit("bne a0, t0, " + falseLabel);
+            else if (e->op == "!=") emit("beq a0, t0, " + falseLabel);
+            return;
+        }
+        genExpr(e);
+        emit("beqz a0, " + falseLabel);
+    }
+
+    void genCondTrue(const Expr *e, const string &trueLabel) {
+        if (auto v = tryConst(e)) {
+            if (*v) emit("j " + trueLabel);
+            return;
+        }
+        if (e->kind == Expr::Kind::Unary && e->op == "!") {
+            genCondFalse(e->lhs.get(), trueLabel);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary && e->op == "&&") {
+            string falseLabel = newLabel("cond_false");
+            genCondFalse(e->lhs.get(), falseLabel);
+            genCondTrue(e->rhs.get(), trueLabel);
+            emitLabel(falseLabel);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary && e->op == "||") {
+            genCondTrue(e->lhs.get(), trueLabel);
+            genCondTrue(e->rhs.get(), trueLabel);
+            return;
+        }
+        static const unordered_set<string> relops = {"<", ">", "<=", ">=", "==", "!="};
+        if (e->kind == Expr::Kind::Binary && relops.count(e->op) && !hasCall(e)) {
+            genExprNoCall(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
+            genExprNoCall(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
+            if (e->op == "<") emit("blt a0, t0, " + trueLabel);
+            else if (e->op == ">") emit("blt t0, a0, " + trueLabel);
+            else if (e->op == "<=") emit("bge t0, a0, " + trueLabel);
+            else if (e->op == ">=") emit("bge a0, t0, " + trueLabel);
+            else if (e->op == "==") emit("beq a0, t0, " + trueLabel);
+            else if (e->op == "!=") emit("bne a0, t0, " + trueLabel);
+            return;
+        }
+        genExpr(e);
+        emit("bnez a0, " + trueLabel);
+    }
+
+    void genTailSelfCall(const Expr *e) {
+        int n = static_cast<int>(e->args.size());
+        if (n != static_cast<int>(currentParams.size())) {
+            genCall(e);
+            return;
+        }
+        for (int i = 0; i < n; ++i) {
+            genExpr(e->args[i].get());
+            pushA0();
+        }
+        for (int i = 0; i < n; ++i) {
+            int tempOffset = 16 * (n - 1 - i) + 12;
+            loadMem("a0", "sp", tempOffset);
+            storeParamFrom(currentParams[i], "a0");
+        }
+        adjustSp(16 * n);
+        emit("j " + functionBodyLabel);
     }
 
     void genBinary(const Expr *e) {
