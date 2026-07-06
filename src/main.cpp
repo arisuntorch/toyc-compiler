@@ -1016,14 +1016,9 @@ private:
                     break;
                 }
                 case Stmt::Kind::Assign: {
-                    bool globalWrite = isGlobal(s->name);
-                    bool needed = globalWrite || live.count(s->name) || exprHasCall(s->expr.get());
-                    if (loopDepth > 0 || keepEffectDepth > 0) needed = true;
-                    keep = needed;
-                    if (keep) {
-                        live.erase(s->name);
-                        addLive(live, varsInExpr(s->expr.get()));
-                    }
+                    keep = true;
+                    live.erase(s->name);
+                    addLive(live, varsInExpr(s->expr.get()));
                     break;
                 }
                 case Stmt::Kind::Return:
