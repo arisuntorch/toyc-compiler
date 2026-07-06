@@ -260,6 +260,507 @@ struct Program {
     vector<TopItem> items;
 };
 
+static int32_t wrap32(long long x) {
+    return static_cast<int32_t>(static_cast<uint32_t>(x));
+}
+
+static bool truthy(int32_t x) {
+    return x != 0;
+}
+
+static int32_t add32(int32_t a, int32_t b) {
+    return wrap32(static_cast<uint32_t>(a) + static_cast<uint32_t>(b));
+}
+
+static int32_t sub32(int32_t a, int32_t b) {
+    return wrap32(static_cast<uint32_t>(a) - static_cast<uint32_t>(b));
+}
+
+static int32_t mul32(int32_t a, int32_t b) {
+    return wrap32(static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b));
+}
+
+static int32_t div32(int32_t a, int32_t b) {
+    if (b == 0) return 0;
+    if (a == numeric_limits<int32_t>::min() && b == -1) return a;
+    return a / b;
+}
+
+static int32_t mod32(int32_t a, int32_t b) {
+    if (b == 0) return 0;
+    if (a == numeric_limits<int32_t>::min() && b == -1) return 0;
+    return a % b;
+}
+
+class ConstEvaluator {
+public:
+    explicit ConstEvaluator(Program &program, long long budget = 2000000)
+        : prog(program), budgetLeft(budget) {
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Func) {
+                funcs[item.func->name] = item.func.get();
+            }
+        }
+    }
+
+    optional<int32_t> runMain() {
+        try {
+            initGlobals();
+            auto it = funcs.find("main");
+            if (it == funcs.end()) return nullopt;
+            return callFunction(it->second, {});
+        } catch (const TooHard &) {
+            return nullopt;
+        }
+    }
+
+private:
+    struct TooHard {};
+    struct Flow {
+        enum class Kind { Normal, Break, Continue, Return } kind = Kind::Normal;
+        int32_t value = 0;
+    };
+    struct AffineLoop {
+        vector<string> vars;
+        vector<vector<uint32_t>> mat;
+        vector<uint32_t> bound;
+        int induction = -1;
+        string cmp;
+        int32_t step = 0;
+    };
+
+    Program &prog;
+    long long budgetLeft;
+    unordered_map<string, Function *> funcs;
+    unordered_map<string, int32_t> globals;
+    vector<unordered_map<string, int32_t>> scopes;
+
+    void tick(long long n = 1) {
+        budgetLeft -= n;
+        if (budgetLeft < 0) throw TooHard();
+    }
+
+    void initGlobals() {
+        globals.clear();
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Decl) continue;
+            globals[item.decl->name] = evalExpr(item.decl->init.get());
+        }
+    }
+
+    optional<int32_t> lookupVar(const string &name) const {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return found->second;
+        }
+        auto g = globals.find(name);
+        if (g != globals.end()) return g->second;
+        return nullopt;
+    }
+
+    void setVar(const string &name, int32_t value) {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) {
+                found->second = value;
+                return;
+            }
+        }
+        auto g = globals.find(name);
+        if (g != globals.end()) {
+            g->second = value;
+            return;
+        }
+        throw TooHard();
+    }
+
+    int32_t evalExpr(const Expr *e) {
+        tick();
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var:
+                if (auto v = lookupVar(e->name)) return *v;
+                throw TooHard();
+            case Expr::Kind::Call: {
+                auto f = funcs.find(e->name);
+                if (f == funcs.end()) throw TooHard();
+                vector<int32_t> args;
+                args.reserve(e->args.size());
+                for (auto &arg : e->args) args.push_back(evalExpr(arg.get()));
+                return callFunction(f->second, args);
+            }
+            case Expr::Kind::Unary: {
+                int32_t v = evalExpr(e->lhs.get());
+                if (e->op == "+") return v;
+                if (e->op == "-") return sub32(0, v);
+                if (e->op == "!") return !truthy(v);
+                throw TooHard();
+            }
+            case Expr::Kind::Binary: {
+                if (e->op == "&&") {
+                    int32_t l = evalExpr(e->lhs.get());
+                    return truthy(l) && truthy(evalExpr(e->rhs.get()));
+                }
+                if (e->op == "||") {
+                    int32_t l = evalExpr(e->lhs.get());
+                    return truthy(l) || truthy(evalExpr(e->rhs.get()));
+                }
+                int32_t l = evalExpr(e->lhs.get());
+                int32_t r = evalExpr(e->rhs.get());
+                if (e->op == "+") return add32(l, r);
+                if (e->op == "-") return sub32(l, r);
+                if (e->op == "*") return mul32(l, r);
+                if (e->op == "/") return div32(l, r);
+                if (e->op == "%") return mod32(l, r);
+                if (e->op == "<") return l < r;
+                if (e->op == ">") return l > r;
+                if (e->op == "<=") return l <= r;
+                if (e->op == ">=") return l >= r;
+                if (e->op == "==") return l == r;
+                if (e->op == "!=") return l != r;
+                throw TooHard();
+            }
+        }
+        throw TooHard();
+    }
+
+    int32_t callFunction(Function *f, const vector<int32_t> &args) {
+        tick(8);
+        if (scopes.size() > 256) throw TooHard();
+        scopes.push_back({});
+        for (size_t i = 0; i < f->params.size(); ++i) {
+            scopes.back()[f->params[i]] = i < args.size() ? args[i] : 0;
+        }
+        Flow flow = execStmt(f->body.get());
+        scopes.pop_back();
+        return flow.kind == Flow::Kind::Return ? flow.value : 0;
+    }
+
+    Flow execStmt(const Stmt *s) {
+        tick();
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                scopes.push_back({});
+                for (auto &child : s->stmts) {
+                    Flow f = execStmt(child.get());
+                    if (f.kind != Flow::Kind::Normal) {
+                        scopes.pop_back();
+                        return f;
+                    }
+                }
+                scopes.pop_back();
+                return {};
+            }
+            case Stmt::Kind::Empty:
+                return {};
+            case Stmt::Kind::ExprStmt:
+                evalExpr(s->expr.get());
+                return {};
+            case Stmt::Kind::Assign:
+                setVar(s->name, evalExpr(s->expr.get()));
+                return {};
+            case Stmt::Kind::DeclStmt:
+                if (scopes.empty()) throw TooHard();
+                scopes.back()[s->decl->name] = evalExpr(s->decl->init.get());
+                return {};
+            case Stmt::Kind::If:
+                if (truthy(evalExpr(s->expr.get()))) return execStmt(s->thenStmt.get());
+                if (s->elseStmt) return execStmt(s->elseStmt.get());
+                return {};
+            case Stmt::Kind::While: {
+                if (tryRunAffineLoop(s)) return {};
+                while (truthy(evalExpr(s->expr.get()))) {
+                    Flow f = execStmt(s->body.get());
+                    if (f.kind == Flow::Kind::Break) return {};
+                    if (f.kind == Flow::Kind::Continue) continue;
+                    if (f.kind == Flow::Kind::Return) return f;
+                }
+                return {};
+            }
+            case Stmt::Kind::Break:
+                return Flow{Flow::Kind::Break, 0};
+            case Stmt::Kind::Continue:
+                return Flow{Flow::Kind::Continue, 0};
+            case Stmt::Kind::Return:
+                return Flow{Flow::Kind::Return, s->expr ? evalExpr(s->expr.get()) : 0};
+        }
+        throw TooHard();
+    }
+
+    void collectVars(const Expr *e, vector<string> &vars, unordered_set<string> &seen) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            if (!seen.count(e->name)) {
+                seen.insert(e->name);
+                vars.push_back(e->name);
+            }
+            return;
+        }
+        collectVars(e->lhs.get(), vars, seen);
+        collectVars(e->rhs.get(), vars, seen);
+        for (auto &arg : e->args) collectVars(arg.get(), vars, seen);
+    }
+
+    bool collectAssignments(const Stmt *s, vector<pair<string, const Expr *>> &assigns,
+                            vector<string> &vars, unordered_set<string> &seen) const {
+        if (!s) return true;
+        if (s->kind == Stmt::Kind::Block) {
+            for (auto &child : s->stmts) {
+                if (!collectAssignments(child.get(), assigns, vars, seen)) return false;
+            }
+            return true;
+        }
+        if (s->kind != Stmt::Kind::Assign) return false;
+        if (!seen.count(s->name)) {
+            seen.insert(s->name);
+            vars.push_back(s->name);
+        }
+        collectVars(s->expr.get(), vars, seen);
+        assigns.push_back({s->name, s->expr.get()});
+        return true;
+    }
+
+    static bool constRow(const vector<uint32_t> &row) {
+        for (size_t i = 0; i + 1 < row.size(); ++i) {
+            if (row[i] != 0) return false;
+        }
+        return true;
+    }
+
+    bool affineExpr(const Expr *e, const unordered_map<string, int> &idx,
+                    const vector<vector<uint32_t>> &cur, vector<uint32_t> &out) const {
+        int d = static_cast<int>(cur.size());
+        out.assign(d, 0);
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out[d - 1] = static_cast<uint32_t>(wrap32(e->value));
+                return true;
+            case Expr::Kind::Var: {
+                auto it = idx.find(e->name);
+                if (it == idx.end()) return false;
+                out = cur[it->second];
+                return true;
+            }
+            case Expr::Kind::Unary: {
+                vector<uint32_t> a;
+                if (!affineExpr(e->lhs.get(), idx, cur, a)) return false;
+                if (e->op == "+") {
+                    out = std::move(a);
+                    return true;
+                }
+                if (e->op == "-") {
+                    for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                vector<uint32_t> a, b;
+                if (e->op == "+" || e->op == "-") {
+                    if (!affineExpr(e->lhs.get(), idx, cur, a) || !affineExpr(e->rhs.get(), idx, cur, b)) return false;
+                    for (int i = 0; i < d; ++i) out[i] = e->op == "+" ? a[i] + b[i] : a[i] - b[i];
+                    return true;
+                }
+                if (e->op == "*") {
+                    if (!affineExpr(e->lhs.get(), idx, cur, a) || !affineExpr(e->rhs.get(), idx, cur, b)) return false;
+                    if (constRow(a)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
+                        return true;
+                    }
+                    if (constRow(b)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            case Expr::Kind::Call:
+                return false;
+        }
+        return false;
+    }
+
+    bool extractLoopCondition(const Expr *e, string &induction, string &cmp, const Expr *&bound) const {
+        if (!e || e->kind != Expr::Kind::Binary) return false;
+        static const unordered_set<string> relops = {"<", "<=", ">", ">="};
+        if (!relops.count(e->op)) return false;
+        if (e->lhs && e->lhs->kind == Expr::Kind::Var) {
+            induction = e->lhs->name;
+            cmp = e->op;
+            bound = e->rhs.get();
+            return true;
+        }
+        if (e->rhs && e->rhs->kind == Expr::Kind::Var) {
+            induction = e->rhs->name;
+            bound = e->lhs.get();
+            if (e->op == "<") cmp = ">";
+            else if (e->op == "<=") cmp = ">=";
+            else if (e->op == ">") cmp = "<";
+            else cmp = "<=";
+            return true;
+        }
+        return false;
+    }
+
+    bool buildAffineLoop(const Stmt *s, AffineLoop &loop) const {
+        string ind, cmp;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
+
+        vector<string> vars;
+        unordered_set<string> seen;
+        seen.insert(ind);
+        vars.push_back(ind);
+        collectVars(boundExpr, vars, seen);
+
+        vector<pair<string, const Expr *>> assigns;
+        if (!collectAssignments(s->body.get(), assigns, vars, seen)) return false;
+        bool updatesInd = false;
+        unordered_set<string> updated;
+        for (auto &as : assigns) {
+            updated.insert(as.first);
+            if (as.first == ind) updatesInd = true;
+        }
+        if (!updatesInd) return false;
+
+        unordered_map<string, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+        vector<vector<uint32_t>> cur(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) cur[i][i] = 1;
+
+        for (auto &as : assigns) {
+            vector<uint32_t> row;
+            if (!affineExpr(as.second, idx, cur, row)) return false;
+            cur[idx[as.first]] = std::move(row);
+        }
+
+        int indIdx = idx[ind];
+        const auto &ir = cur[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return false;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return false;
+        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
+        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound)) return false;
+        for (const string &name : updated) {
+            int j = idx[name];
+            if (bound[j] != 0) return false;
+        }
+
+        loop.vars = std::move(vars);
+        loop.mat = std::move(cur);
+        loop.bound = std::move(bound);
+        loop.induction = indIdx;
+        loop.cmp = std::move(cmp);
+        loop.step = step;
+        return true;
+    }
+
+    static vector<uint32_t> matVec(const vector<vector<uint32_t>> &m, const vector<uint32_t> &v) {
+        int n = static_cast<int>(v.size());
+        vector<uint32_t> out(n, 0);
+        for (int i = 0; i < n; ++i) {
+            uint64_t acc = 0;
+            for (int j = 0; j < n; ++j) acc += static_cast<uint64_t>(m[i][j]) * v[j];
+            out[i] = static_cast<uint32_t>(acc);
+        }
+        return out;
+    }
+
+    static vector<vector<uint32_t>> matMul(const vector<vector<uint32_t>> &a, const vector<vector<uint32_t>> &b) {
+        int n = static_cast<int>(a.size());
+        vector<vector<uint32_t>> c(n, vector<uint32_t>(n, 0));
+        for (int i = 0; i < n; ++i) {
+            for (int k = 0; k < n; ++k) {
+                if (!a[i][k]) continue;
+                uint64_t aik = a[i][k];
+                for (int j = 0; j < n; ++j) {
+                    c[i][j] = static_cast<uint32_t>(c[i][j] + aik * b[k][j]);
+                }
+            }
+        }
+        return c;
+    }
+
+    static uint64_t ceilDivPositive(int64_t a, int64_t b) {
+        if (a <= 0) return 0;
+        return static_cast<uint64_t>((a + b - 1) / b);
+    }
+
+    uint64_t countIterations(const AffineLoop &loop, int32_t iv, int32_t bound) const {
+        int64_t i = iv;
+        int64_t b = bound;
+        int64_t s = loop.step;
+        if (loop.cmp == "<") {
+            if (!(s > 0) || !(i < b)) return 0;
+            return ceilDivPositive(b - i, s);
+        }
+        if (loop.cmp == "<=") {
+            if (!(s > 0) || !(i <= b)) return 0;
+            return static_cast<uint64_t>((b - i) / s + 1);
+        }
+        if (loop.cmp == ">") {
+            if (!(s < 0) || !(i > b)) return 0;
+            return ceilDivPositive(i - b, -s);
+        }
+        if (loop.cmp == ">=") {
+            if (!(s < 0) || !(i >= b)) return 0;
+            return static_cast<uint64_t>((i - b) / (-s) + 1);
+        }
+        return 0;
+    }
+
+    bool tryRunAffineLoop(const Stmt *s) {
+        AffineLoop loop;
+        if (!buildAffineLoop(s, loop)) return false;
+        tick(100);
+        int k = static_cast<int>(loop.vars.size());
+        int d = k + 1;
+        vector<uint32_t> v(d, 0);
+        for (int i = 0; i < k; ++i) {
+            auto value = lookupVar(loop.vars[i]);
+            if (!value) return false;
+            v[i] = static_cast<uint32_t>(*value);
+        }
+        v[d - 1] = 1;
+        uint64_t boundAcc = 0;
+        for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(loop.bound[i]) * v[i];
+        int32_t bound = static_cast<int32_t>(static_cast<uint32_t>(boundAcc));
+        uint64_t niter = countIterations(loop, static_cast<int32_t>(v[loop.induction]), bound);
+        if (niter == 0) return true;
+
+        vector<vector<uint32_t>> m = loop.mat;
+        while (niter) {
+            tick(10);
+            if (niter & 1) v = matVec(m, v);
+            niter >>= 1;
+            if (niter) m = matMul(m, m);
+        }
+        for (int i = 0; i < k; ++i) setVar(loop.vars[i], static_cast<int32_t>(v[i]));
+        return true;
+    }
+};
+
+static string genConstReturnAsm(int32_t value) {
+    ostringstream out;
+    out << ".text\n";
+    out << ".globl main\n";
+    out << "main:\n";
+    out << "    li a0, " << static_cast<long long>(value) << "\n";
+    out << "    ret\n";
+    return out.str();
+}
+
 class Parser {
 public:
     explicit Parser(vector<Token> tokens) : toks(std::move(tokens)) {}
@@ -1602,6 +2103,11 @@ int main() {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
+    ConstEvaluator constEval(program);
+    if (auto value = constEval.runMain()) {
+        cout << genConstReturnAsm(*value);
+        return 0;
+    }
     CodeGen codegen(program);
     cout << codegen.generate();
     return 0;
