@@ -299,8 +299,6 @@ public:
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
                 funcs[item.func->name] = item.func.get();
-            } else if (item.kind == TopItem::Kind::Decl && !item.decl->isConst) {
-                memoizeCalls = false;
             }
         }
     }
@@ -339,9 +337,7 @@ private:
     chrono::steady_clock::time_point startTime;
     unordered_map<string, Function *> funcs;
     unordered_map<string, int32_t> globals;
-    unordered_map<string, int32_t> callMemo;
     vector<unordered_map<string, int32_t>> scopes;
-    bool memoizeCalls = true;
 
     void tick(long long n = 1) {
         budgetLeft -= n;
@@ -440,23 +436,8 @@ private:
 
     int32_t callFunction(Function *f, const vector<int32_t> &args) {
         tick(8);
-        string memoKey;
-        if (memoizeCalls) {
-            memoKey = f->name;
-            memoKey.push_back('(');
-            for (int32_t arg : args) {
-                memoKey += to_string(arg);
-                memoKey.push_back(',');
-            }
-            memoKey.push_back(')');
-            auto memo = callMemo.find(memoKey);
-            if (memo != callMemo.end()) return memo->second;
-        }
         int32_t folded = 0;
-        if (tryEvalAffineTailCall(f, args, folded)) {
-            if (memoizeCalls) callMemo[memoKey] = folded;
-            return folded;
-        }
+        if (tryEvalAffineTailCall(f, args, folded)) return folded;
         if (scopes.size() > 256) throw TooHard();
         scopes.push_back({});
         for (size_t i = 0; i < f->params.size(); ++i) {
@@ -464,9 +445,7 @@ private:
         }
         Flow flow = execStmt(f->body.get());
         scopes.pop_back();
-        int32_t result = flow.kind == Flow::Kind::Return ? flow.value : 0;
-        if (memoizeCalls) callMemo[memoKey] = result;
-        return result;
+        return flow.kind == Flow::Kind::Return ? flow.value : 0;
     }
 
     bool returnedExpr(const Stmt *s, const Expr *&expr) const {
