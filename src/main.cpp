@@ -294,8 +294,8 @@ static int32_t mod32(int32_t a, int32_t b) {
 
 class ConstEvaluator {
 public:
-    explicit ConstEvaluator(Program &program, long long budget = 2000000)
-        : prog(program), budgetLeft(budget) {
+    explicit ConstEvaluator(Program &program, long long budget = 50000000, int timeLimitMs = 500)
+        : prog(program), budgetLeft(budget), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
                 funcs[item.func->name] = item.func.get();
@@ -331,6 +331,9 @@ private:
 
     Program &prog;
     long long budgetLeft;
+    int timeLimit;
+    uint32_t tickChecks = 0;
+    chrono::steady_clock::time_point startTime;
     unordered_map<string, Function *> funcs;
     unordered_map<string, int32_t> globals;
     vector<unordered_map<string, int32_t>> scopes;
@@ -338,6 +341,11 @@ private:
     void tick(long long n = 1) {
         budgetLeft -= n;
         if (budgetLeft < 0) throw TooHard();
+        tickChecks += static_cast<uint32_t>(n);
+        if ((tickChecks & 4095u) == 0u) {
+            auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
+            if (elapsed > timeLimit) throw TooHard();
+        }
     }
 
     void initGlobals() {
