@@ -515,7 +515,7 @@ private:
     bool extractParamCondition(const Expr *e, const unordered_set<string> &params, string &induction,
                                string &cmp, const Expr *&bound) const {
         if (!e || e->kind != Expr::Kind::Binary) return false;
-        static const unordered_set<string> relops = {"<", "<=", ">", ">=", "==", "!="};
+        static const unordered_set<string> relops = {"<", "<=", ">", ">="};
         if (!relops.count(e->op)) return false;
         if (e->lhs && e->lhs->kind == Expr::Kind::Var && params.count(e->lhs->name)) {
             induction = e->lhs->name;
@@ -529,8 +529,7 @@ private:
             if (e->op == "<") cmp = ">";
             else if (e->op == "<=") cmp = ">=";
             else if (e->op == ">") cmp = "<";
-            else if (e->op == ">=") cmp = "<=";
-            else cmp = e->op;
+            else cmp = "<=";
             return true;
         }
         return false;
@@ -541,8 +540,6 @@ private:
         else if (cmp == "<=") cmp = ">";
         else if (cmp == ">") cmp = "<=";
         else if (cmp == ">=") cmp = "<";
-        else if (cmp == "==") cmp = "!=";
-        else if (cmp == "!=") cmp = "==";
         else return false;
         return true;
     }
@@ -767,7 +764,7 @@ private:
 
     bool extractLoopCondition(const Expr *e, string &induction, string &cmp, const Expr *&bound) const {
         if (!e || e->kind != Expr::Kind::Binary) return false;
-        static const unordered_set<string> relops = {"<", "<=", ">", ">=", "==", "!="};
+        static const unordered_set<string> relops = {"<", "<=", ">", ">="};
         if (!relops.count(e->op)) return false;
         if (e->lhs && e->lhs->kind == Expr::Kind::Var) {
             induction = e->lhs->name;
@@ -781,8 +778,7 @@ private:
             if (e->op == "<") cmp = ">";
             else if (e->op == "<=") cmp = ">=";
             else if (e->op == ">") cmp = "<";
-            else if (e->op == ">=") cmp = "<=";
-            else cmp = e->op;
+            else cmp = "<=";
             return true;
         }
         return false;
@@ -900,16 +896,6 @@ private:
         if (loop.cmp == ">=") {
             if (!(s < 0) || !(i >= b)) return 0;
             return static_cast<uint64_t>((i - b) / (-s) + 1);
-        }
-        if (loop.cmp == "!=") {
-            if (i == b || s == 0) return 0;
-            int64_t diff = b - i;
-            if (diff % s != 0) return 0;
-            int64_t n = diff / s;
-            return n > 0 ? static_cast<uint64_t>(n) : 0;
-        }
-        if (loop.cmp == "==") {
-            return i == b ? 1 : 0;
         }
         return 0;
     }
