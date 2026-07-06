@@ -31,8 +31,8 @@ is currently ignored by this implementation.
 - Arithmetic, relational, equality, logical, unary, parenthesized, variable, and
   function-call expressions.
 - Short-circuit code generation for `&&` and `||`.
-- Constant expression folding and simple `addi` generation for common
-  variable-plus-immediate expressions.
+- Constant expression folding plus simple immediate-form code generation for
+  common add, subtract, equality, and comparison expressions.
 
 ## Notes
 

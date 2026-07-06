@@ -984,6 +984,93 @@ private:
                 return;
             }
         }
+
+        if (e->rhs) {
+            if (auto rhs = tryConst(e->rhs.get())) {
+                if (e->op == "<" && fits12(*rhs)) {
+                    genExpr(e->lhs.get());
+                    emit("slti a0, a0, " + to_string(*rhs));
+                    return;
+                }
+                if (e->op == ">=" && fits12(*rhs)) {
+                    genExpr(e->lhs.get());
+                    emit("slti a0, a0, " + to_string(*rhs));
+                    emit("xori a0, a0, 1");
+                    return;
+                }
+                if (e->op == "==" && *rhs == 0) {
+                    genExpr(e->lhs.get());
+                    emit("sltiu a0, a0, 1");
+                    return;
+                }
+                if (e->op == "!=" && *rhs == 0) {
+                    genExpr(e->lhs.get());
+                    emit("sltu a0, x0, a0");
+                    return;
+                }
+                if ((e->op == "==" || e->op == "!=") && fits12(-*rhs)) {
+                    genExpr(e->lhs.get());
+                    emit("addi a0, a0, " + to_string(-*rhs));
+                    if (e->op == "==") emit("sltiu a0, a0, 1");
+                    else emit("sltu a0, x0, a0");
+                    return;
+                }
+                if (e->op == "*" && *rhs == 0) {
+                    emit("li a0, 0");
+                    return;
+                }
+                if (e->op == "*" && *rhs == 1) {
+                    genExpr(e->lhs.get());
+                    return;
+                }
+                if (e->op == "/" && *rhs == 1) {
+                    genExpr(e->lhs.get());
+                    return;
+                }
+                if (e->op == "%" && *rhs == 1) {
+                    emit("li a0, 0");
+                    return;
+                }
+            }
+        }
+        if (e->lhs) {
+            if (auto lhs = tryConst(e->lhs.get())) {
+                if (e->op == "<") {
+                    genExpr(e->rhs.get());
+                    emit("li t0, " + to_string(*lhs));
+                    emit("slt a0, t0, a0");
+                    return;
+                }
+                if (e->op == ">") {
+                    genExpr(e->rhs.get());
+                    emit("li t0, " + to_string(*lhs));
+                    emit("slt a0, a0, t0");
+                    return;
+                }
+                if (e->op == "<=") {
+                    genExpr(e->rhs.get());
+                    emit("li t0, " + to_string(*lhs));
+                    emit("slt a0, a0, t0");
+                    emit("xori a0, a0, 1");
+                    return;
+                }
+                if (e->op == ">=") {
+                    genExpr(e->rhs.get());
+                    emit("li t0, " + to_string(*lhs));
+                    emit("slt a0, t0, a0");
+                    emit("xori a0, a0, 1");
+                    return;
+                }
+                if (e->op == "*" && *lhs == 0) {
+                    emit("li a0, 0");
+                    return;
+                }
+                if (e->op == "*" && *lhs == 1) {
+                    genExpr(e->rhs.get());
+                    return;
+                }
+            }
+        }
         if (e->op == "+" && e->lhs) {
             if (auto lhs = tryConst(e->lhs.get()); lhs && fits12(*lhs)) {
                 genExpr(e->rhs.get());
