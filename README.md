@@ -9,12 +9,12 @@ source code from standard input and writes RISC-V32 assembly to standard output.
 make
 ```
 
-The build creates an executable named `compiler`.
+The build creates an executable named `main`.
 
 ## Use
 
 ```sh
-./compiler < input.tc > output.s
+./main < input.tc > output.s
 ```
 
 The optional `-opt` argument is accepted by the judge command line contract but
