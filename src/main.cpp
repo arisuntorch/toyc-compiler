@@ -2972,7 +2972,7 @@ private:
         int n = static_cast<int>(e->args.size());
         bool directArgs = n <= 8;
         for (auto &arg : e->args) {
-            if (hasNonInlineCall(arg.get())) {
+            if (hasCall(arg.get())) {
                 directArgs = false;
                 break;
             }
@@ -3029,7 +3029,7 @@ private:
         Function *f = found->second;
         if (e->args.size() != f->params.size()) return false;
         for (auto &arg : e->args) {
-            if (hasNonInlineCall(arg.get())) return false;
+            if (hasCall(arg.get())) return false;
         }
         unordered_map<string, const Expr *> subst;
         for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
@@ -3037,25 +3037,6 @@ private:
         auto expanded = cloneExprSubst(ret, subst);
         genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
         return true;
-    }
-
-    bool hasNonInlineCall(const Expr *e) const {
-        if (!e) return false;
-        if (e->kind == Expr::Kind::Call) {
-            auto found = inlineableFuncs.find(e->name);
-            if (found == inlineableFuncs.end()) return true;
-            Function *f = found->second;
-            if (e->args.size() != f->params.size()) return true;
-            for (auto &arg : e->args) {
-                if (hasNonInlineCall(arg.get())) return true;
-            }
-            return false;
-        }
-        if (hasNonInlineCall(e->lhs.get()) || hasNonInlineCall(e->rhs.get())) return true;
-        for (auto &arg : e->args) {
-            if (hasNonInlineCall(arg.get())) return true;
-        }
-        return false;
     }
 
     void loadVar(const string &name) {
