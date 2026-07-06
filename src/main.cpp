@@ -2985,7 +2985,7 @@ int main(int argc, char **argv) {
     Program program = parser.parseProgram();
     SafeOptimizer optimizer(program);
     optimizer.run();
-    ConstEvaluator constEval(program, optMode ? 2000000000LL : 300000000LL, optMode ? 9000 : 2500);
+    ConstEvaluator constEval(program, optMode ? 5000000000LL : 300000000LL, optMode ? 15000 : 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
         return 0;
