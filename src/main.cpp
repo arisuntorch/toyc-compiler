@@ -1551,7 +1551,6 @@ private:
                     if (alwaysJumps(child.get())) break;
                 }
                 truncateAfterJump(s->stmts);
-                removeUnusedLocalDecls(s->stmts);
                 leave();
                 break;
             case Stmt::Kind::Empty:
@@ -1652,56 +1651,6 @@ private:
         collectAssigned(s->thenStmt.get(), out);
         collectAssigned(s->elseStmt.get(), out);
         collectAssigned(s->body.get(), out);
-    }
-
-    void collectMentionedExpr(const Expr *e, unordered_set<string> &out) const {
-        if (!e) return;
-        if (e->kind == Expr::Kind::Var) {
-            out.insert(e->name);
-            return;
-        }
-        collectMentionedExpr(e->lhs.get(), out);
-        collectMentionedExpr(e->rhs.get(), out);
-        for (auto &arg : e->args) collectMentionedExpr(arg.get(), out);
-    }
-
-    void collectMentionedStmt(const Stmt *s, unordered_set<string> &out) const {
-        if (!s) return;
-        if (s->kind == Stmt::Kind::Assign) out.insert(s->name);
-        if (s->kind == Stmt::Kind::DeclStmt) {
-            out.insert(s->decl->name);
-            collectMentionedExpr(s->decl->init.get(), out);
-        }
-        collectMentionedExpr(s->expr.get(), out);
-        for (auto &child : s->stmts) collectMentionedStmt(child.get(), out);
-        collectMentionedStmt(s->thenStmt.get(), out);
-        collectMentionedStmt(s->elseStmt.get(), out);
-        collectMentionedStmt(s->body.get(), out);
-    }
-
-    unique_ptr<Stmt> makeEmptyStmt() const {
-        auto e = make_unique<Stmt>();
-        e->kind = Stmt::Kind::Empty;
-        return e;
-    }
-
-    void removeUnusedLocalDecls(vector<unique_ptr<Stmt>> &stmts) const {
-        unordered_set<string> mentionedLater;
-        for (int i = static_cast<int>(stmts.size()) - 1; i >= 0; --i) {
-            Stmt *stmt = stmts[i].get();
-            if (!stmt) continue;
-            if (stmt->kind == Stmt::Kind::ExprStmt && !exprHasCall(stmt->expr.get())) {
-                stmts[i] = makeEmptyStmt();
-                continue;
-            }
-            if (stmt->kind == Stmt::Kind::DeclStmt && stmt->decl &&
-                !mentionedLater.count(stmt->decl->name) && !exprHasCall(stmt->decl->init.get())) {
-                collectMentionedExpr(stmt->decl->init.get(), mentionedLater);
-                stmts[i] = makeEmptyStmt();
-                continue;
-            }
-            collectMentionedStmt(stmt, mentionedLater);
-        }
     }
 };
 
