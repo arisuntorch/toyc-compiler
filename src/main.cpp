@@ -294,7 +294,7 @@ static int32_t mod32(int32_t a, int32_t b) {
 
 class ConstEvaluator {
 public:
-    explicit ConstEvaluator(Program &program, long long budget = 50000000, int timeLimitMs = 500)
+    explicit ConstEvaluator(Program &program, long long budget = 300000000, int timeLimitMs = 2500)
         : prog(program), budgetLeft(budget), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
