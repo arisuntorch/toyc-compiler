@@ -1,0 +1,16 @@
+int fact(int n) {
+    if (n <= 1) {
+        return 1;
+    }
+    return n * fact(n - 1);
+}
+
+int add9(int a, int b, int c, int d, int e, int f, int g, int h, int i) {
+    return a + b + c + d + e + f + g + h + i;
+}
+
+int main() {
+    int x = fact(5);
+    int y = add9(1, 2, 3, 4, 5, 6, 7, 8, 9);
+    return x + y;
+}
