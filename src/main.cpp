@@ -548,6 +548,7 @@ struct Symbol {
     bool isGlobal = false;
     string label;
     int offset = 0;
+    string reg;
 };
 
 struct FuncInfo {
@@ -581,8 +582,11 @@ private:
     string currentFunctionName;
     string functionBodyLabel;
     vector<string> currentParams;
+    vector<string> savedVarRegs;
     int labelId = 0;
     int nextSlot = 0;
+    int nextVarReg = 0;
+    int localBaseOffset = -12;
     int frameSize = 0;
 
     static int alignTo(int x, int a) { return (x + a - 1) / a * a; }
@@ -655,11 +659,11 @@ private:
             Decl &d = *item.decl;
             if (d.isConst) {
                 long long v = evalConst(d.init.get());
-                globals[d.name] = Symbol{true, v, true, "", 0};
+                globals[d.name] = Symbol{true, v, true, "", 0, ""};
             } else {
                 long long v = evalConst(d.init.get());
                 string label = globalLabel(d.name);
-                globals[d.name] = Symbol{false, 0, true, label, 0};
+                globals[d.name] = Symbol{false, 0, true, label, 0, ""};
                 data.push_back({label, v});
             }
         }
@@ -849,9 +853,14 @@ private:
     }
 
     int allocSlot() {
-        int off = -12 - nextSlot * 4;
+        int off = localBaseOffset - nextSlot * 4;
         ++nextSlot;
         return off;
+    }
+
+    string allocVarReg() {
+        if (nextVarReg >= static_cast<int>(savedVarRegs.size())) return "";
+        return savedVarRegs[nextVarReg++];
     }
 
     void enterScope() { scopes.push_back({}); }
@@ -859,8 +868,12 @@ private:
 
     void genFunction(Function &f) {
         int slots = countSlots(f);
-        frameSize = alignTo(8 + slots * 4, 16);
+        static const vector<string> allVarRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+        savedVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + min<int>(allVarRegs.size(), slots));
+        frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
         nextSlot = 0;
+        nextVarReg = 0;
+        localBaseOffset = -12 - static_cast<int>(savedVarRegs.size()) * 4;
         scopes.clear();
         breakLabels.clear();
         continueLabels.clear();
@@ -874,6 +887,9 @@ private:
         adjustSp(-frameSize);
         storeMem("ra", "sp", frameSize - 4);
         storeMem("s0", "sp", frameSize - 8);
+        for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
+            storeMem(savedVarRegs[i], "sp", frameSize - 12 - i * 4);
+        }
         if (fits12(frameSize)) emit("addi s0, sp, " + to_string(frameSize));
         else {
             emit("li t6, " + to_string(frameSize));
@@ -882,13 +898,16 @@ private:
 
         enterScope();
         for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
-            int off = allocSlot();
-            scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off};
+            string reg = allocVarReg();
+            int off = reg.empty() ? allocSlot() : 0;
+            scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off, reg};
             if (i < 8) {
-                storeMem("a" + to_string(i), "s0", off);
+                if (!reg.empty()) emit("mv " + reg + ", a" + to_string(i));
+                else storeMem("a" + to_string(i), "s0", off);
             } else {
                 loadMem("t0", "s0", (i - 8) * 4);
-                storeMem("t0", "s0", off);
+                if (!reg.empty()) emit("mv " + reg + ", t0");
+                else storeMem("t0", "s0", off);
             }
         }
 
@@ -896,6 +915,9 @@ private:
         genStmt(f.body.get());
         emit("li a0, 0");
         emitLabel(returnLabel);
+        for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
+            loadMem(savedVarRegs[i], "s0", -12 - i * 4);
+        }
         loadMem("ra", "s0", -4);
         loadMem("s0", "s0", -8);
         adjustSp(frameSize);
@@ -953,13 +975,15 @@ private:
     void genDecl(const Decl &d) {
         if (d.isConst) {
             long long v = evalConst(d.init.get());
-            scopes.back()[d.name] = Symbol{true, v, false, "", 0};
+            scopes.back()[d.name] = Symbol{true, v, false, "", 0, ""};
             return;
         }
         genExpr(d.init.get());
-        int off = allocSlot();
-        scopes.back()[d.name] = Symbol{false, 0, false, "", off};
-        storeMem("a0", "s0", off);
+        string reg = allocVarReg();
+        int off = reg.empty() ? allocSlot() : 0;
+        scopes.back()[d.name] = Symbol{false, 0, false, "", off, reg};
+        if (!reg.empty()) emit("mv " + reg + ", a0");
+        else storeMem("a0", "s0", off);
     }
 
     void genIf(const Stmt *s) {
@@ -1035,6 +1059,8 @@ private:
         }
         if (sym->isConst) {
             emit("li " + dst + ", " + to_string(sym->constValue));
+        } else if (!sym->reg.empty()) {
+            if (dst != sym->reg) emit("mv " + dst + ", " + sym->reg);
         } else if (sym->isGlobal) {
             emit("la t6, " + sym->label);
             loadMem(dst, "t6", 0);
@@ -1046,7 +1072,9 @@ private:
     void storeVarFrom(const string &name, const string &src) {
         auto sym = lookup(name);
         if (!sym || sym->isConst) return;
-        if (sym->isGlobal) {
+        if (!sym->reg.empty()) {
+            if (src != sym->reg) emit("mv " + sym->reg + ", " + src);
+        } else if (sym->isGlobal) {
             emit("la t6, " + sym->label);
             storeMem(src, "t6", 0);
         } else {
@@ -1059,7 +1087,12 @@ private:
         auto it = scopes.front().find(name);
         if (it == scopes.front().end()) return;
         const Symbol &sym = it->second;
-        if (!sym.isConst && !sym.isGlobal) storeMem(src, "s0", sym.offset);
+        if (sym.isConst || sym.isGlobal) return;
+        if (!sym.reg.empty()) {
+            if (src != sym.reg) emit("mv " + sym.reg + ", " + src);
+        } else {
+            storeMem(src, "s0", sym.offset);
+        }
     }
 
     static bool isPowerOfTwo(long long v) {
@@ -1536,6 +1569,8 @@ private:
         }
         if (sym->isConst) {
             emit("li a0, " + to_string(sym->constValue));
+        } else if (!sym->reg.empty()) {
+            if (sym->reg != "a0") emit("mv a0, " + sym->reg);
         } else if (sym->isGlobal) {
             emit("la t0, " + sym->label);
             loadMem("a0", "t0", 0);
@@ -1547,7 +1582,9 @@ private:
     void storeVar(const string &name) {
         auto sym = lookup(name);
         if (!sym || sym->isConst) return;
-        if (sym->isGlobal) {
+        if (!sym->reg.empty()) {
+            if (sym->reg != "a0") emit("mv " + sym->reg + ", a0");
+        } else if (sym->isGlobal) {
             emit("la t0, " + sym->label);
             storeMem("a0", "t0", 0);
         } else {

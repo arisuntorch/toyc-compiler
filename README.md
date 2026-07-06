@@ -35,6 +35,8 @@ is currently ignored by this implementation.
   arithmetic, equality, and comparison expressions.
 - Register-based expression evaluation for call-free expressions, avoiding most
   temporary stack traffic in loop bodies.
+- Simple local variable allocation to `s1`-`s11`, reducing repeated stack loads
+  and stores for loop variables and accumulators.
 - Direct conditional branches for `if` and `while` comparisons.
 - Tail-recursive self calls are rewritten into parameter updates plus a jump.
 
