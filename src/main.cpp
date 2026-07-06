@@ -1969,6 +1969,7 @@ private:
     ostringstream out;
     unordered_map<string, Symbol> globals;
     unordered_map<string, FuncInfo> funcs;
+    unordered_map<string, Function *> inlineableFuncs;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
     vector<string> continueLabels;
@@ -2042,6 +2043,12 @@ private:
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
                 funcs[item.func->name] = FuncInfo{item.func->returnsVoid, static_cast<int>(item.func->params.size())};
+                const Stmt *body = item.func->body.get();
+                if (!item.func->returnsVoid && body && body->kind == Stmt::Kind::Block &&
+                    body->stmts.size() == 1 && body->stmts[0]->kind == Stmt::Kind::Return &&
+                    body->stmts[0]->expr && !exprHasCall(body->stmts[0]->expr.get())) {
+                    inlineableFuncs[item.func->name] = item.func.get();
+                }
             }
         }
     }
@@ -2434,6 +2441,7 @@ private:
                 genBinary(e);
                 break;
             case Expr::Kind::Call:
+                if (tryGenInlineCall(e, "a0")) break;
                 genCall(e);
                 break;
         }
@@ -2538,6 +2546,7 @@ private:
                 loadVarTo(e->name, dst);
                 return;
             case Expr::Kind::Call:
+                if (tryGenInlineCall(e, dst)) return;
                 genExpr(e);
                 if (dst != "a0") emit("mv " + dst + ", a0");
                 return;
@@ -2991,6 +3000,43 @@ private:
         }
         emit("call " + e->name);
         adjustSp(extraBytes + 16 * n);
+    }
+
+    unique_ptr<Expr> cloneExprSubst(const Expr *e, const unordered_map<string, const Expr *> &subst) {
+        if (!e) return nullptr;
+        if (e->kind == Expr::Kind::Var) {
+            auto it = subst.find(e->name);
+            if (it != subst.end()) {
+                unordered_map<string, const Expr *> emptySubst;
+                return cloneExprSubst(it->second, emptySubst);
+            }
+        }
+        auto outExpr = make_unique<Expr>();
+        outExpr->kind = e->kind;
+        outExpr->value = e->value;
+        outExpr->name = e->name;
+        outExpr->op = e->op;
+        outExpr->lhs = cloneExprSubst(e->lhs.get(), subst);
+        outExpr->rhs = cloneExprSubst(e->rhs.get(), subst);
+        for (auto &arg : e->args) outExpr->args.push_back(cloneExprSubst(arg.get(), subst));
+        return outExpr;
+    }
+
+    bool tryGenInlineCall(const Expr *e, const string &dst) {
+        if (!e || e->kind != Expr::Kind::Call) return false;
+        auto found = inlineableFuncs.find(e->name);
+        if (found == inlineableFuncs.end()) return false;
+        Function *f = found->second;
+        if (e->args.size() != f->params.size()) return false;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) return false;
+        }
+        unordered_map<string, const Expr *> subst;
+        for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
+        const Expr *ret = f->body->stmts[0]->expr.get();
+        auto expanded = cloneExprSubst(ret, subst);
+        genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
+        return true;
     }
 
     void loadVar(const string &name) {
