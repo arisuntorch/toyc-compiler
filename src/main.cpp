@@ -769,6 +769,315 @@ static string genConstReturnAsm(int32_t value) {
     return out.str();
 }
 
+static unique_ptr<Expr> makeNumberExpr(long long value) {
+    auto e = make_unique<Expr>();
+    e->kind = Expr::Kind::Number;
+    e->value = wrap32(value);
+    return e;
+}
+
+static bool exprHasCall(const Expr *e) {
+    if (!e) return false;
+    if (e->kind == Expr::Kind::Call) return true;
+    if (exprHasCall(e->lhs.get()) || exprHasCall(e->rhs.get())) return true;
+    for (auto &arg : e->args) {
+        if (exprHasCall(arg.get())) return true;
+    }
+    return false;
+}
+
+static optional<int32_t> foldConstExpr(const Expr *e) {
+    if (!e) return nullopt;
+    switch (e->kind) {
+        case Expr::Kind::Number:
+            return wrap32(e->value);
+        case Expr::Kind::Var:
+        case Expr::Kind::Call:
+            return nullopt;
+        case Expr::Kind::Unary: {
+            auto v = foldConstExpr(e->lhs.get());
+            if (!v) return nullopt;
+            if (e->op == "+") return *v;
+            if (e->op == "-") return sub32(0, *v);
+            if (e->op == "!") return !truthy(*v);
+            return nullopt;
+        }
+        case Expr::Kind::Binary: {
+            if (e->op == "&&") {
+                auto l = foldConstExpr(e->lhs.get());
+                if (!l) return nullopt;
+                if (!truthy(*l)) return 0;
+                auto r = foldConstExpr(e->rhs.get());
+                if (!r) return nullopt;
+                return truthy(*r);
+            }
+            if (e->op == "||") {
+                auto l = foldConstExpr(e->lhs.get());
+                if (!l) return nullopt;
+                if (truthy(*l)) return 1;
+                auto r = foldConstExpr(e->rhs.get());
+                if (!r) return nullopt;
+                return truthy(*r);
+            }
+            auto l = foldConstExpr(e->lhs.get());
+            auto r = foldConstExpr(e->rhs.get());
+            if (!l || !r) return nullopt;
+            if (e->op == "+") return add32(*l, *r);
+            if (e->op == "-") return sub32(*l, *r);
+            if (e->op == "*") return mul32(*l, *r);
+            if (e->op == "/") {
+                if (*r == 0) return nullopt;
+                return div32(*l, *r);
+            }
+            if (e->op == "%") {
+                if (*r == 0) return nullopt;
+                return mod32(*l, *r);
+            }
+            if (e->op == "<") return *l < *r;
+            if (e->op == ">") return *l > *r;
+            if (e->op == "<=") return *l <= *r;
+            if (e->op == ">=") return *l >= *r;
+            if (e->op == "==") return *l == *r;
+            if (e->op == "!=") return *l != *r;
+            return nullopt;
+        }
+    }
+    return nullopt;
+}
+
+class SafeOptimizer {
+public:
+    explicit SafeOptimizer(Program &program) : prog(program) {}
+
+    void run() {
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) {
+                optExpr(item.decl->init);
+                if (item.decl->isConst) {
+                    if (auto v = foldConstExpr(item.decl->init.get())) globalConsts[item.decl->name] = *v;
+                }
+            } else {
+                env.clear();
+                enter();
+                for (const string &param : item.func->params) env.back()[param] = nullopt;
+                optStmt(item.func->body);
+                leave();
+            }
+        }
+    }
+
+private:
+    Program &prog;
+    unordered_map<string, int32_t> globalConsts;
+    vector<unordered_map<string, optional<int32_t>>> env;
+
+    void enter() { env.push_back({}); }
+    void leave() { env.pop_back(); }
+
+    optional<int32_t> lookupLocalConst(const string &name) const {
+        for (auto it = env.rbegin(); it != env.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return found->second;
+        }
+        return nullopt;
+    }
+
+    bool isKnownLocal(const string &name) const {
+        for (auto it = env.rbegin(); it != env.rend(); ++it) {
+            if (it->count(name)) return true;
+        }
+        return false;
+    }
+
+    void setLocalValue(const string &name, optional<int32_t> value) {
+        for (auto it = env.rbegin(); it != env.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) {
+                found->second = value;
+                return;
+            }
+        }
+    }
+
+    void eraseLocalValue(const string &name) {
+        for (auto &scope : env) {
+            auto found = scope.find(name);
+            if (found != scope.end()) found->second = nullopt;
+        }
+    }
+
+    void optExpr(unique_ptr<Expr> &e) {
+        if (!e) return;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return;
+            case Expr::Kind::Var: {
+                if (auto v = lookupLocalConst(e->name)) {
+                    e = makeNumberExpr(*v);
+                    return;
+                }
+                auto g = globalConsts.find(e->name);
+                if (g != globalConsts.end()) e = makeNumberExpr(g->second);
+                return;
+            }
+            case Expr::Kind::Call:
+                for (auto &arg : e->args) optExpr(arg);
+                return;
+            case Expr::Kind::Unary:
+                optExpr(e->lhs);
+                if (auto v = foldConstExpr(e.get())) e = makeNumberExpr(*v);
+                return;
+            case Expr::Kind::Binary:
+                optExpr(e->lhs);
+                optExpr(e->rhs);
+                simplifyBinary(e);
+                return;
+        }
+    }
+
+    void simplifyBinary(unique_ptr<Expr> &e) {
+        if (auto v = foldConstExpr(e.get())) {
+            e = makeNumberExpr(*v);
+            return;
+        }
+        if (!e || e->kind != Expr::Kind::Binary) return;
+        auto l = foldConstExpr(e->lhs.get());
+        auto r = foldConstExpr(e->rhs.get());
+        bool lhsPure = !exprHasCall(e->lhs.get());
+        bool rhsPure = !exprHasCall(e->rhs.get());
+
+        if (e->op == "+" && r && *r == 0) e = std::move(e->lhs);
+        else if (e->op == "+" && l && *l == 0) e = std::move(e->rhs);
+        else if (e->op == "-" && r && *r == 0) e = std::move(e->lhs);
+        else if (e->op == "*" && r && *r == 1) e = std::move(e->lhs);
+        else if (e->op == "*" && l && *l == 1) e = std::move(e->rhs);
+        else if (e->op == "*" && r && *r == 0 && lhsPure) e = makeNumberExpr(0);
+        else if (e->op == "*" && l && *l == 0 && rhsPure) e = makeNumberExpr(0);
+        else if (e->op == "/" && r && *r == 1) e = std::move(e->lhs);
+        else if (e->op == "%" && r && *r == 1 && lhsPure) e = makeNumberExpr(0);
+        else if (e->op == "&&" && l && !truthy(*l)) e = makeNumberExpr(0);
+        else if (e->op == "||" && l && truthy(*l)) e = makeNumberExpr(1);
+    }
+
+    unique_ptr<Stmt> emptyStmt() const {
+        auto s = make_unique<Stmt>();
+        s->kind = Stmt::Kind::Empty;
+        return s;
+    }
+
+    void optStmt(unique_ptr<Stmt> &s) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                enter();
+                for (auto &child : s->stmts) {
+                    optStmt(child);
+                    if (alwaysJumps(child.get())) break;
+                }
+                truncateAfterJump(s->stmts);
+                leave();
+                break;
+            case Stmt::Kind::Empty:
+                break;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                optExpr(s->expr);
+                break;
+            case Stmt::Kind::DeclStmt:
+                optExpr(s->decl->init);
+                env.back()[s->decl->name] = foldConstExpr(s->decl->init.get());
+                break;
+            case Stmt::Kind::Assign:
+                optExpr(s->expr);
+                if (isKnownLocal(s->name)) setLocalValue(s->name, foldConstExpr(s->expr.get()));
+                break;
+            case Stmt::Kind::If: {
+                optExpr(s->expr);
+                if (auto v = foldConstExpr(s->expr.get())) {
+                    if (truthy(*v)) {
+                        s = std::move(s->thenStmt);
+                        optStmt(s);
+                    } else if (s->elseStmt) {
+                        s = std::move(s->elseStmt);
+                        optStmt(s);
+                    } else {
+                        s = emptyStmt();
+                    }
+                    break;
+                }
+                auto saved = env;
+                optStmt(s->thenStmt);
+                auto thenAssigned = assignedInStmt(s->thenStmt.get());
+                env = saved;
+                optStmt(s->elseStmt);
+                auto elseAssigned = assignedInStmt(s->elseStmt.get());
+                env = saved;
+                for (const string &name : thenAssigned) eraseLocalValue(name);
+                for (const string &name : elseAssigned) eraseLocalValue(name);
+                break;
+            }
+            case Stmt::Kind::While: {
+                auto assigned = assignedInStmt(s->body.get());
+                for (const string &name : assigned) eraseLocalValue(name);
+                optExpr(s->expr);
+                if (auto v = foldConstExpr(s->expr.get()); v && !truthy(*v)) {
+                    s = emptyStmt();
+                    break;
+                }
+                auto saved = env;
+                optStmt(s->body);
+                env = saved;
+                for (const string &name : assigned) eraseLocalValue(name);
+                break;
+            }
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                break;
+        }
+    }
+
+    bool alwaysJumps(const Stmt *s) const {
+        if (!s) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Return:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::Block:
+                return !s->stmts.empty() && alwaysJumps(s->stmts.back().get());
+            case Stmt::Kind::If:
+                return s->elseStmt && alwaysJumps(s->thenStmt.get()) && alwaysJumps(s->elseStmt.get());
+            default:
+                return false;
+        }
+    }
+
+    void truncateAfterJump(vector<unique_ptr<Stmt>> &stmts) const {
+        vector<unique_ptr<Stmt>> kept;
+        for (auto &stmt : stmts) {
+            kept.push_back(std::move(stmt));
+            if (alwaysJumps(kept.back().get())) break;
+        }
+        stmts = std::move(kept);
+    }
+
+    unordered_set<string> assignedInStmt(const Stmt *s) const {
+        unordered_set<string> out;
+        collectAssigned(s, out);
+        return out;
+    }
+
+    void collectAssigned(const Stmt *s, unordered_set<string> &out) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign) out.insert(s->name);
+        if (s->kind == Stmt::Kind::DeclStmt) out.insert(s->decl->name);
+        for (auto &child : s->stmts) collectAssigned(child.get(), out);
+        collectAssigned(s->thenStmt.get(), out);
+        collectAssigned(s->elseStmt.get(), out);
+        collectAssigned(s->body.get(), out);
+    }
+};
+
 class Parser {
 public:
     explicit Parser(vector<Token> tokens) : toks(std::move(tokens)) {}
@@ -2111,6 +2420,8 @@ int main() {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
+    SafeOptimizer optimizer(program);
+    optimizer.run();
     ConstEvaluator constEval(program);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
