@@ -516,7 +516,7 @@ private:
     bool extractParamCondition(const Expr *e, const unordered_set<string> &params, string &induction,
                                string &cmp, const Expr *&bound) const {
         if (!e || e->kind != Expr::Kind::Binary) return false;
-        static const unordered_set<string> relops = {"<", "<=", ">", ">="};
+        static const unordered_set<string> relops = {"<", "<=", ">", ">=", "==", "!="};
         if (!relops.count(e->op)) return false;
         if (e->lhs && e->lhs->kind == Expr::Kind::Var && params.count(e->lhs->name)) {
             induction = e->lhs->name;
@@ -530,6 +530,9 @@ private:
             if (e->op == "<") cmp = ">";
             else if (e->op == "<=") cmp = ">=";
             else if (e->op == ">") cmp = "<";
+            else if (e->op == ">=") cmp = "<=";
+            else if (e->op == "==") cmp = "==";
+            else if (e->op == "!=") cmp = "!=";
             else cmp = "<=";
             return true;
         }
@@ -541,6 +544,8 @@ private:
         else if (cmp == "<=") cmp = ">";
         else if (cmp == ">") cmp = "<=";
         else if (cmp == ">=") cmp = "<";
+        else if (cmp == "==") cmp = "!=";
+        else if (cmp == "!=") cmp = "==";
         else return false;
         return true;
     }
@@ -598,7 +603,23 @@ private:
         AffineLoop loop;
         loop.step = step;
         loop.cmp = std::move(cmp);
-        uint64_t niter = countIterations(loop, static_cast<int32_t>(v[indIdx]), static_cast<int32_t>(static_cast<uint32_t>(boundAcc)));
+        int32_t iv0 = static_cast<int32_t>(v[indIdx]);
+        int32_t bound0 = static_cast<int32_t>(static_cast<uint32_t>(boundAcc));
+        uint64_t niter = 0;
+        if (loop.cmp == "!=") {
+            if (iv0 == bound0) return false;
+            int64_t diff = static_cast<int64_t>(bound0) - iv0;
+            int64_t st = step;
+            if (st == 0 || diff % st != 0) return false;
+            int64_t q = diff / st;
+            if (q < 0) return false;
+            niter = static_cast<uint64_t>(q);
+        } else if (loop.cmp == "==") {
+            if (iv0 != bound0) return false;
+            niter = 1;
+        } else {
+            niter = countIterations(loop, iv0, bound0);
+        }
         if (niter == 0) return false;
 
         while (niter) {
