@@ -7007,9 +7007,9 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        long long remaining = 19000 - elapsedMs();
+        long long remaining = 11000 - elapsedMs();
         if (remaining > 1000) {
-            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 16500)));
+            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 8500)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
