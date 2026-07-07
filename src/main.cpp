@@ -1643,7 +1643,7 @@ private:
     static constexpr int kGlobalBit = 1 << 28;
     enum { CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_EQ, CMP_NE };
     enum FoldRes { FoldStructFail, FoldValueFail, FoldOk };
-    enum : uint8_t { NO_PERIODIC = 1, NO_GUARDED = 2, NO_AFFINE = 4, NO_NESTED = 8 };
+    enum : uint8_t { NO_PERIODIC = 1, NO_GUARDED = 2, NO_AFFINE = 4, NO_NESTED = 8, NO_POLY_SUM = 16 };
     enum class TransformFlow { Fail, Normal, Continue, Break };
 
     struct AffineLoopS {
@@ -2317,6 +2317,22 @@ private:
         return 0;
     }
 
+    static optional<uint64_t> countIterationsMaybe(int cmp, int32_t step, int32_t iv, int32_t bound) {
+        constexpr uint64_t INF = numeric_limits<uint64_t>::max() / 4;
+        if (cmp == CMP_NE) {
+            if (iv == bound) return 0;
+            uint64_t d = distanceToEqual(iv, bound, step);
+            if (d == INF) return nullopt;
+            return d;
+        }
+        if (cmp == CMP_EQ) {
+            if (iv != bound) return 0;
+            if (step == 0) return nullopt;
+            return 1;
+        }
+        return countIterations(cmp, step, iv, bound);
+    }
+
     static int invertCmpCode(int cmp) {
         switch (cmp) {
             case CMP_LT: return CMP_GE;
@@ -2489,31 +2505,101 @@ private:
     // ---- affine loop analysis (slot-based) ----
 
     static bool isRelOpc(int opc) {
-        return opc == OPC_LT || opc == OPC_LE || opc == OPC_GT || opc == OPC_GE;
+        return opc == OPC_LT || opc == OPC_LE || opc == OPC_GT || opc == OPC_GE ||
+               opc == OPC_EQ || opc == OPC_NE;
     }
 
-    bool extractLoopCondition(const Expr *e, int &indKey, int &cmp, const Expr *&bound) const {
-        if (!e || e->kind != Expr::Kind::Binary || !isRelOpc(e->opc)) return false;
-        if (e->lhs && e->lhs->kind == Expr::Kind::Var) {
-            indKey = exprSlotKey(e->lhs.get());
-            switch (e->opc) {
-                case OPC_LT: cmp = CMP_LT; break;
-                case OPC_LE: cmp = CMP_LE; break;
-                case OPC_GT: cmp = CMP_GT; break;
-                default: cmp = CMP_GE; break;
-            }
-            bound = e->rhs.get();
+    static int reverseRelCmp(int cmp) {
+        switch (cmp) {
+            case CMP_LT: return CMP_GT;
+            case CMP_LE: return CMP_GE;
+            case CMP_GT: return CMP_LT;
+            case CMP_GE: return CMP_LE;
+            case CMP_EQ: return CMP_EQ;
+            case CMP_NE: return CMP_NE;
+        }
+        return cmp;
+    }
+
+    bool extractInductionPlusConst(const Expr *e, int &key, int32_t &offset) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var) {
+            key = exprSlotKey(e);
+            offset = 0;
             return true;
         }
-        if (e->rhs && e->rhs->kind == Expr::Kind::Var) {
-            indKey = exprSlotKey(e->rhs.get());
-            bound = e->lhs.get();
-            switch (e->opc) {
-                case OPC_LT: cmp = CMP_GT; break;
-                case OPC_LE: cmp = CMP_GE; break;
-                case OPC_GT: cmp = CMP_LT; break;
-                default: cmp = CMP_LE; break;
+        if (e->kind != Expr::Kind::Binary) return false;
+        if (e->opc == OPC_ADD) {
+            if (e->lhs && e->lhs->kind == Expr::Kind::Var) {
+                if (auto c = staticConstS(e->rhs.get())) {
+                    key = exprSlotKey(e->lhs.get());
+                    offset = *c;
+                    return true;
+                }
             }
+            if (e->rhs && e->rhs->kind == Expr::Kind::Var) {
+                if (auto c = staticConstS(e->lhs.get())) {
+                    key = exprSlotKey(e->rhs.get());
+                    offset = *c;
+                    return true;
+                }
+            }
+        }
+        if (e->opc == OPC_SUB && e->lhs && e->lhs->kind == Expr::Kind::Var) {
+            if (auto c = staticConstS(e->rhs.get())) {
+                key = exprSlotKey(e->lhs.get());
+                offset = sub32(0, *c);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool extractLoopCondition(const Expr *e, int &indKey, int &cmp, const Expr *&bound,
+                              int32_t &boundAdjust) const {
+        if (!e || e->kind != Expr::Kind::Binary) return false;
+        if (e->opc == OPC_AND) {
+            if (auto l = staticConstS(e->lhs.get()); l && truthy(*l)) {
+                return extractLoopCondition(e->rhs.get(), indKey, cmp, bound, boundAdjust);
+            }
+            if (auto r = staticConstS(e->rhs.get()); r && truthy(*r)) {
+                return extractLoopCondition(e->lhs.get(), indKey, cmp, bound, boundAdjust);
+            }
+            return false;
+        }
+        if (e->opc == OPC_OR) {
+            if (auto l = staticConstS(e->lhs.get()); l && !truthy(*l)) {
+                return extractLoopCondition(e->rhs.get(), indKey, cmp, bound, boundAdjust);
+            }
+            if (auto r = staticConstS(e->rhs.get()); r && !truthy(*r)) {
+                return extractLoopCondition(e->lhs.get(), indKey, cmp, bound, boundAdjust);
+            }
+            return false;
+        }
+        if (!isRelOpc(e->opc)) return false;
+        int rel = CMP_LT;
+        switch (e->opc) {
+            case OPC_LT: rel = CMP_LT; break;
+            case OPC_LE: rel = CMP_LE; break;
+            case OPC_GT: rel = CMP_GT; break;
+            case OPC_GE: rel = CMP_GE; break;
+            case OPC_EQ: rel = CMP_EQ; break;
+            default: rel = CMP_NE; break;
+        }
+        int key = -1;
+        int32_t offset = 0;
+        if (extractInductionPlusConst(e->lhs.get(), key, offset)) {
+            indKey = key;
+            cmp = rel;
+            bound = e->rhs.get();
+            boundAdjust = sub32(0, offset);
+            return true;
+        }
+        if (extractInductionPlusConst(e->rhs.get(), key, offset)) {
+            indKey = key;
+            cmp = reverseRelCmp(rel);
+            bound = e->lhs.get();
+            boundAdjust = sub32(0, offset);
             return true;
         }
         return false;
@@ -2785,7 +2871,8 @@ private:
         int indKey = -1;
         int cmp = CMP_LT;
         const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
 
         vector<int> vars;
         unordered_set<int> seen;
@@ -2831,6 +2918,7 @@ private:
         for (int i = 0; i < d; ++i) idmat[i][i] = 1;
         vector<uint32_t> bound;
         if (!affineExpr(boundExpr, idx, idmat, bound, frame)) return FoldStructFail;
+        bound[d - 1] += static_cast<uint32_t>(boundAdjust);
         for (int key : updated) {
             if (bound[idx[key]] != 0) return FoldValueFail;
         }
@@ -2885,7 +2973,8 @@ private:
         int indKey = -1;
         int cmp = CMP_LT;
         const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return false;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return false;
         auto indIt = idx.find(indKey);
         if (indIt == idx.end()) return false;
         int indIdx = indIt->second;
@@ -2909,11 +2998,14 @@ private:
 
         vector<uint32_t> boundRow;
         if (!affineExpr(boundExpr, idx, cur, boundRow, frame)) return false;
+        boundRow[d - 1] += static_cast<uint32_t>(boundAdjust);
         auto iv = constRowValue(cur[indIdx]);
         auto bound = constRowValue(boundRow);
         if (!iv || !bound) return false;
 
-        uint64_t niter = countIterations(cmp, step, *iv, *bound);
+        auto niterOpt = countIterationsMaybe(cmp, step, *iv, *bound);
+        if (!niterOpt) return false;
+        uint64_t niter = *niterOpt;
         if (niter == 0) return true;
 
         const vector<vector<uint32_t>> &combined = cachedMatPow(s->fastLoopId, bodyMat, niter);
@@ -2925,7 +3017,8 @@ private:
         int indKey = -1;
         int cmp = CMP_LT;
         const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
 
         vector<int> vars;
         unordered_set<int> seen;
@@ -2959,6 +3052,7 @@ private:
         for (int i = 0; i < d; ++i) idmat[i][i] = 1;
         vector<uint32_t> bound;
         if (!affineExpr(boundExpr, idx, idmat, bound, frame)) return FoldStructFail;
+        bound[d - 1] += static_cast<uint32_t>(boundAdjust);
         for (int i = 0; i < k; ++i) {
             if (bound[i] != 0) return FoldValueFail;
         }
@@ -3343,7 +3437,8 @@ private:
         int indKey = -1;
         int cmp = CMP_LT;
         const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
 
         vector<int> vars;
         unordered_set<int> seen;
@@ -3364,6 +3459,7 @@ private:
         for (int i = 0; i < d; ++i) idmat[i][i] = 1;
         vector<uint32_t> boundRow;
         if (!affineExpr(boundExpr, idx, idmat, boundRow, frame)) return FoldStructFail;
+        boundRow[d - 1] += static_cast<uint32_t>(boundAdjust);
         for (int i = 0; i < k; ++i) {
             if (boundRow[i] != 0) return FoldValueFail;
         }
@@ -3407,7 +3503,9 @@ private:
             if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
             if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
 
-            uint64_t niter = countIterations(cmp, step, iv, bound);
+            auto niterOpt = countIterationsMaybe(cmp, step, iv, bound);
+            if (!niterOpt) return FoldValueFail;
+            uint64_t niter = *niterOpt;
             if (niter == 0) return FoldValueFail;
             uint64_t span = niter;
             for (const Guard &g : guards) {
@@ -3429,7 +3527,8 @@ private:
         int indKey = -1;
         int cmp = CMP_LT;
         const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
 
         unordered_set<int> assigned;
         collectAssignedKeys(s->body.get(), assigned);
@@ -3470,13 +3569,16 @@ private:
 
         vector<uint32_t> bound;
         if (!affineExpr(boundExpr, idx, idmat, bound, frame)) return FoldStructFail;
+        bound[d - 1] += static_cast<uint32_t>(boundAdjust);
         for (int i = 0; i < k; ++i) {
             if (bound[i] != 0) return FoldValueFail;
         }
         uint64_t boundAcc = 0;
         for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(bound[i]) * state[i];
-        uint64_t niter = countIterations(cmp, step, static_cast<int32_t>(state[indIdx]),
-                                         static_cast<int32_t>(static_cast<uint32_t>(boundAcc)));
+        auto niterOpt = countIterationsMaybe(cmp, step, static_cast<int32_t>(state[indIdx]),
+                                             static_cast<int32_t>(static_cast<uint32_t>(boundAcc)));
+        if (!niterOpt) return FoldValueFail;
+        uint64_t niter = *niterOpt;
         if (niter == 0) return FoldOk;
         if (niter < 100000) return FoldValueFail;
 
@@ -3522,6 +3624,564 @@ private:
         return FoldOk;
     }
 
+
+
+    // ---- polynomial accumulator loop analysis (slot-based) ----
+
+    struct PolyS {
+        array<uint32_t, 4> c{};
+    };
+
+    static PolyS polyConst(uint32_t v) {
+        PolyS p;
+        p.c[0] = v;
+        return p;
+    }
+
+    static PolyS polyAdd(PolyS a, const PolyS &b) {
+        for (int i = 0; i < 4; ++i) a.c[i] += b.c[i];
+        return a;
+    }
+
+    static PolyS polySub(PolyS a, const PolyS &b) {
+        for (int i = 0; i < 4; ++i) a.c[i] -= b.c[i];
+        return a;
+    }
+
+    static PolyS polyNeg(PolyS a) {
+        for (int i = 0; i < 4; ++i) a.c[i] = 0u - a.c[i];
+        return a;
+    }
+
+    static bool polyMul(const PolyS &a, const PolyS &b, PolyS &out) {
+        out = PolyS{};
+        for (int i = 0; i < 4; ++i) {
+            if (!a.c[i]) continue;
+            for (int j = 0; j < 4; ++j) {
+                if (!b.c[j]) continue;
+                if (i + j >= 4) return false;
+                out.c[i + j] = static_cast<uint32_t>(out.c[i + j] +
+                    static_cast<uint64_t>(a.c[i]) * b.c[j]);
+            }
+        }
+        return true;
+    }
+
+    static uint32_t mulMod32(uint64_t a, uint64_t b) {
+        return static_cast<uint32_t>(static_cast<uint64_t>(static_cast<uint32_t>(a)) *
+                                     static_cast<uint32_t>(b));
+    }
+
+    static uint32_t sumPow(uint64_t n, int pow) {
+        switch (pow) {
+            case 0:
+                return static_cast<uint32_t>(n);
+            case 1: {
+                uint64_t a = n, b = n - 1;
+                if ((a & 1u) == 0) a >>= 1;
+                else b >>= 1;
+                return mulMod32(a, b);
+            }
+            case 2: {
+                uint64_t a = n, b = n - 1, c = 2 * n - 1;
+                if ((a & 1u) == 0) a >>= 1;
+                else b >>= 1;
+                if (a % 3 == 0) a /= 3;
+                else if (b % 3 == 0) b /= 3;
+                else c /= 3;
+                return mulMod32(mulMod32(a, b), c);
+            }
+            case 3: {
+                uint64_t a = n, b = n - 1;
+                if ((a & 1u) == 0) a >>= 1;
+                else b >>= 1;
+                uint32_t t = mulMod32(a, b);
+                return mulMod32(t, t);
+            }
+        }
+        return 0;
+    }
+
+    static uint32_t sumPoly(const PolyS &p, uint64_t n) {
+        uint32_t out = 0;
+        for (int i = 0; i < 4; ++i) {
+            out = static_cast<uint32_t>(out + static_cast<uint64_t>(p.c[i]) * sumPow(n, i));
+        }
+        return out;
+    }
+
+    bool flattenPolyLoopStmt(const Stmt *s, vector<const Stmt *> &out) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!flattenPolyLoopStmt(child.get(), out)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+                out.push_back(s);
+                return true;
+            case Stmt::Kind::ExprStmt:
+                if (exprHasCallS(s->expr.get())) return false;
+                out.push_back(s);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool evalExprNoChanging(const Expr *e, const unordered_set<int> &changing,
+                            const int32_t *frame, int32_t &out) const {
+        if (!e) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out = wrap32(e->value);
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                if (changing.count(key)) return false;
+                out = readSlot(key, frame);
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                int32_t v = 0;
+                if (!evalExprNoChanging(e->lhs.get(), changing, frame, v)) return false;
+                if (e->opc == OPC_PLUS) out = v;
+                else if (e->opc == OPC_NEG) out = sub32(0, v);
+                else if (e->opc == OPC_NOT) out = !truthy(v);
+                else return false;
+                return true;
+            }
+            case Expr::Kind::Binary: {
+                if (e->opc == OPC_AND) {
+                    int32_t l = 0;
+                    if (!evalExprNoChanging(e->lhs.get(), changing, frame, l)) return false;
+                    if (!truthy(l)) { out = 0; return true; }
+                    int32_t r = 0;
+                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, r)) return false;
+                    out = truthy(r);
+                    return true;
+                }
+                if (e->opc == OPC_OR) {
+                    int32_t l = 0;
+                    if (!evalExprNoChanging(e->lhs.get(), changing, frame, l)) return false;
+                    if (truthy(l)) { out = 1; return true; }
+                    int32_t r = 0;
+                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, r)) return false;
+                    out = truthy(r);
+                    return true;
+                }
+                int32_t l = 0, r = 0;
+                if (!evalExprNoChanging(e->lhs.get(), changing, frame, l) ||
+                    !evalExprNoChanging(e->rhs.get(), changing, frame, r)) return false;
+                switch (e->opc) {
+                    case OPC_ADD: out = add32(l, r); return true;
+                    case OPC_SUB: out = sub32(l, r); return true;
+                    case OPC_MUL: out = mul32(l, r); return true;
+                    case OPC_DIV: if (r == 0) return false; out = div32(l, r); return true;
+                    case OPC_MOD: if (r == 0) return false; out = mod32(l, r); return true;
+                    case OPC_LT: out = l < r; return true;
+                    case OPC_GT: out = l > r; return true;
+                    case OPC_LE: out = l <= r; return true;
+                    case OPC_GE: out = l >= r; return true;
+                    case OPC_EQ: out = l == r; return true;
+                    case OPC_NE: out = l != r; return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool polyExpr(const Expr *e, int indKey, int64_t indBase, int32_t step,
+                  const unordered_set<int> &changing, const unordered_map<int, PolyS> &aliases,
+                  const int32_t *frame, PolyS &out) const {
+        if (!e) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out = polyConst(static_cast<uint32_t>(wrap32(e->value)));
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                auto alias = aliases.find(key);
+                if (alias != aliases.end()) {
+                    out = alias->second;
+                    return true;
+                }
+                if (key == indKey) {
+                    out = PolyS{};
+                    out.c[0] = static_cast<uint32_t>(wrap32(indBase));
+                    out.c[1] = static_cast<uint32_t>(step);
+                    return true;
+                }
+                if (changing.count(key)) return false;
+                out = polyConst(static_cast<uint32_t>(readSlot(key, frame)));
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                PolyS a;
+                if (!polyExpr(e->lhs.get(), indKey, indBase, step, changing, aliases, frame, a)) return false;
+                if (e->opc == OPC_PLUS) out = a;
+                else if (e->opc == OPC_NEG) out = polyNeg(a);
+                else return false;
+                return true;
+            }
+            case Expr::Kind::Binary: {
+                PolyS a, b;
+                if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
+                    if (!polyExpr(e->lhs.get(), indKey, indBase, step, changing, aliases, frame, a) ||
+                        !polyExpr(e->rhs.get(), indKey, indBase, step, changing, aliases, frame, b)) return false;
+                    out = e->opc == OPC_ADD ? polyAdd(a, b) : polySub(a, b);
+                    return true;
+                }
+                if (e->opc == OPC_MUL) {
+                    if (!polyExpr(e->lhs.get(), indKey, indBase, step, changing, aliases, frame, a) ||
+                        !polyExpr(e->rhs.get(), indKey, indBase, step, changing, aliases, frame, b)) return false;
+                    return polyMul(a, b, out);
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool isVarKeyExpr(const Expr *e, int key) const {
+        return e && e->kind == Expr::Kind::Var && exprSlotKey(e) == key;
+    }
+
+    bool extractAccumDeltaExpr(const Expr *e, int key, const Expr *&term, int &sign) const {
+        if (isVarKeyExpr(e, key)) {
+            term = nullptr;
+            sign = 1;
+            return true;
+        }
+        if (!e || e->kind != Expr::Kind::Binary) return false;
+        if (e->opc == OPC_ADD) {
+            if (isVarKeyExpr(e->lhs.get(), key)) {
+                term = e->rhs.get();
+                sign = 1;
+                return true;
+            }
+            if (isVarKeyExpr(e->rhs.get(), key)) {
+                term = e->lhs.get();
+                sign = 1;
+                return true;
+            }
+        }
+        if (e->opc == OPC_SUB && isVarKeyExpr(e->lhs.get(), key)) {
+            term = e->rhs.get();
+            sign = -1;
+            return true;
+        }
+        return false;
+    }
+
+
+    bool exprContainsSlotKey(const Expr *e, int key) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var) return exprSlotKey(e) == key;
+        if (exprContainsSlotKey(e->lhs.get(), key) || exprContainsSlotKey(e->rhs.get(), key)) return true;
+        for (auto &arg : e->args) {
+            if (exprContainsSlotKey(arg.get(), key)) return true;
+        }
+        return false;
+    }
+
+    bool collectAccumDeltaTerms(const Expr *e, int key, int sign, int &accCoeff,
+                                vector<pair<int, const Expr *>> &terms) const {
+        if (!e) return false;
+        if (isVarKeyExpr(e, key)) {
+            accCoeff += sign;
+            return accCoeff >= -1 && accCoeff <= 1;
+        }
+        if (e->kind == Expr::Kind::Binary && e->opc == OPC_ADD) {
+            return collectAccumDeltaTerms(e->lhs.get(), key, sign, accCoeff, terms) &&
+                   collectAccumDeltaTerms(e->rhs.get(), key, sign, accCoeff, terms);
+        }
+        if (e->kind == Expr::Kind::Binary && e->opc == OPC_SUB) {
+            return collectAccumDeltaTerms(e->lhs.get(), key, sign, accCoeff, terms) &&
+                   collectAccumDeltaTerms(e->rhs.get(), key, -sign, accCoeff, terms);
+        }
+        if (exprContainsSlotKey(e, key)) return false;
+        terms.push_back({sign, e});
+        return true;
+    }
+
+
+    bool collectStrictPeriodicModuli(const Expr *e, int indKey, const unordered_set<int> &changing,
+                                     const int32_t *frame, vector<int32_t> &mods) const {
+        if (!e) return true;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                return key != indKey && !changing.count(key);
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary:
+                return e->opc != OPC_NOT && collectStrictPeriodicModuli(e->lhs.get(), indKey, changing, frame, mods);
+            case Expr::Kind::Binary:
+                if (e->opc == OPC_MOD) {
+                    int key = -1;
+                    int32_t off = 0;
+                    if (!extractInductionPlusConst(e->lhs.get(), key, off) || key != indKey) return false;
+                    int32_t m = 0;
+                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m < 0) m = -m;
+                    if (m > 1) mods.push_back(m);
+                    return true;
+                }
+                if (e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL) {
+                    return collectStrictPeriodicModuli(e->lhs.get(), indKey, changing, frame, mods) &&
+                           collectStrictPeriodicModuli(e->rhs.get(), indKey, changing, frame, mods);
+                }
+                return false;
+        }
+        return false;
+    }
+
+    bool evalExprWithInductionValue(const Expr *e, int indKey, int32_t indValue,
+                                    const unordered_set<int> &changing, const int32_t *frame,
+                                    int32_t &out) const {
+        if (!e) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out = wrap32(e->value);
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                if (key == indKey) {
+                    out = indValue;
+                    return true;
+                }
+                if (changing.count(key)) return false;
+                out = readSlot(key, frame);
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                int32_t v = 0;
+                if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, v)) return false;
+                if (e->opc == OPC_PLUS) out = v;
+                else if (e->opc == OPC_NEG) out = sub32(0, v);
+                else return false;
+                return true;
+            }
+            case Expr::Kind::Binary: {
+                int32_t l = 0, r = 0;
+                if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l) ||
+                    !evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
+                switch (e->opc) {
+                    case OPC_ADD: out = add32(l, r); return true;
+                    case OPC_SUB: out = sub32(l, r); return true;
+                    case OPC_MUL: out = mul32(l, r); return true;
+                    case OPC_DIV: if (r == 0) return false; out = div32(l, r); return true;
+                    case OPC_MOD: if (r == 0) return false; out = mod32(l, r); return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool sumStrictPeriodicExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
+                               int32_t step, uint64_t niter, const unordered_set<int> &changing,
+                               const int32_t *frame, uint32_t &out) const {
+        vector<int32_t> mods;
+        if (!collectStrictPeriodicModuli(e, indKey, changing, frame, mods) || mods.empty()) return false;
+        uint64_t period = 1;
+        uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
+        for (int32_t mod : mods) {
+            uint64_t m = static_cast<uint64_t>(mod);
+            uint64_t reduced = m / gcd64(m, absStep % m);
+            period = lcmCapped(period, reduced, 4096);
+            if (period > 4096) return false;
+        }
+        if (period == 0 || period > 4096) return false;
+        vector<uint32_t> vals;
+        vals.reserve(static_cast<size_t>(period));
+        uint32_t cycle = 0;
+        for (uint64_t t = 0; t < period; ++t) {
+            int32_t iv = static_cast<int32_t>(static_cast<uint32_t>(startIv) +
+                                             static_cast<uint32_t>(offset) +
+                                             static_cast<uint32_t>(step) * static_cast<uint32_t>(t));
+            int32_t v = 0;
+            if (!evalExprWithInductionValue(e, indKey, iv, changing, frame, v)) return false;
+            vals.push_back(static_cast<uint32_t>(v));
+            cycle += static_cast<uint32_t>(v);
+        }
+        uint64_t whole = niter / period;
+        uint64_t rem = niter % period;
+        out = static_cast<uint32_t>(static_cast<uint64_t>(cycle) * static_cast<uint32_t>(whole));
+        for (uint64_t t = 0; t < rem; ++t) out += vals[static_cast<size_t>(t)];
+        return true;
+    }
+
+
+    static uint32_t floorSumMod32(uint64_t n, uint64_t m, uint64_t a, uint64_t b) {
+        uint32_t ans = 0;
+        while (true) {
+            if (a >= m) {
+                ans += mulMod32(a / m, sumPow(n, 1));
+                a %= m;
+            }
+            if (b >= m) {
+                ans += mulMod32(b / m, n);
+                b %= m;
+            }
+            uint64_t yMax = a * n + b;
+            if (yMax < m) break;
+            n = yMax / m;
+            b = yMax % m;
+            swap(m, a);
+        }
+        return ans;
+    }
+
+    bool sumLinearDivExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
+                          int32_t step, uint64_t niter, const unordered_set<int> &changing,
+                          const int32_t *frame, uint32_t &out) const {
+        if (!e || e->kind != Expr::Kind::Binary || e->opc != OPC_DIV) return false;
+        int key = -1;
+        int32_t innerOffset = 0;
+        if (!extractInductionPlusConst(e->lhs.get(), key, innerOffset) || key != indKey) return false;
+        int32_t divv = 0;
+        if (!evalExprNoChanging(e->rhs.get(), changing, frame, divv) || divv == 0) return false;
+        bool neg = divv < 0;
+        uint64_t m = static_cast<uint64_t>(neg ? -static_cast<int64_t>(divv) : divv);
+        int64_t first = static_cast<int64_t>(startIv) + static_cast<int64_t>(offset) + static_cast<int64_t>(innerOffset);
+        int64_t delta = static_cast<int64_t>(step);
+        int64_t last = first + delta * static_cast<int64_t>(niter - 1);
+        if (first < 0 || last < 0) return false;
+        uint64_t a = static_cast<uint64_t>(delta >= 0 ? delta : -delta);
+        uint64_t b = static_cast<uint64_t>(delta >= 0 ? first : last);
+        uint32_t sum = floorSumMod32(niter, m, a, b);
+        out = neg ? 0u - sum : sum;
+        return true;
+    }
+
+    FoldRes tryRunPolynomialSumLoop(const Stmt *s, int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
+
+        vector<const Stmt *> flat;
+        if (!flattenPolyLoopStmt(s->body.get(), flat)) return FoldStructFail;
+        if (flat.empty()) return FoldStructFail;
+
+        unordered_set<int> changing;
+        for (const Stmt *st : flat) {
+            if (st->kind == Stmt::Kind::Assign) changing.insert(assignSlotKey(st));
+            else if (st->kind == Stmt::Kind::DeclStmt && st->decl) changing.insert(st->decl->fastSlot);
+        }
+        if (!changing.count(indKey)) return FoldStructFail;
+
+        int32_t bound = 0;
+        if (!evalExprNoChanging(boundExpr, changing, frame, bound)) return FoldStructFail;
+        bound = add32(bound, boundAdjust);
+
+        int32_t iterOffset = 0;
+        int indUpdates = 0;
+        for (const Stmt *st : flat) {
+            if (st->kind != Stmt::Kind::Assign || assignSlotKey(st) != indKey) continue;
+            int key = -1;
+            int32_t off = 0;
+            if (!extractInductionPlusConst(st->expr.get(), key, off) || key != indKey) return FoldStructFail;
+            iterOffset = add32(iterOffset, off);
+            ++indUpdates;
+        }
+        if (indUpdates == 0 || iterOffset == 0) return FoldStructFail;
+        int32_t step = iterOffset;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+        int32_t startIv = readSlot(indKey, frame);
+        auto niterOpt = countIterationsMaybe(cmp, step, startIv, bound);
+        if (!niterOpt) return FoldValueFail;
+        uint64_t niter = *niterOpt;
+        if (niter == 0) return FoldOk;
+
+        unordered_map<int, PolyS> deltas;
+        unordered_map<int, uint32_t> periodicDeltas;
+        unordered_map<int, PolyS> aliases;
+        iterOffset = 0;
+        bool sawAccumulator = false;
+        for (const Stmt *st : flat) {
+            if (st->kind == Stmt::Kind::Empty || st->kind == Stmt::Kind::ExprStmt) continue;
+            if (st->kind == Stmt::Kind::DeclStmt) {
+                if (!st->decl || !st->decl->init) return FoldStructFail;
+                PolyS p;
+                int64_t base = static_cast<int64_t>(startIv) + static_cast<int64_t>(iterOffset);
+                if (!polyExpr(st->decl->init.get(), indKey, base, step, changing, aliases, frame, p)) return FoldValueFail;
+                aliases[st->decl->fastSlot] = p;
+                continue;
+            }
+            if (st->kind != Stmt::Kind::Assign) return FoldStructFail;
+            int key = assignSlotKey(st);
+            if (key == indKey) {
+                int rhsKey = -1;
+                int32_t off = 0;
+                if (!extractInductionPlusConst(st->expr.get(), rhsKey, off) || rhsKey != indKey) return FoldStructFail;
+                iterOffset = add32(iterOffset, off);
+                aliases.erase(key);
+                continue;
+            }
+            int accCoeff = 0;
+            vector<pair<int, const Expr *>> terms;
+            if (!collectAccumDeltaTerms(st->expr.get(), key, 1, accCoeff, terms) || accCoeff != 1) {
+                return FoldStructFail;
+            }
+            for (auto &piece : terms) {
+                int sign = piece.first;
+                const Expr *term = piece.second;
+                PolyS p;
+                int64_t base = static_cast<int64_t>(startIv) + static_cast<int64_t>(iterOffset);
+                if (polyExpr(term, indKey, base, step, changing, aliases, frame, p)) {
+                    if (sign < 0) p = polyNeg(p);
+                    deltas[key] = polyAdd(deltas[key], p);
+                } else if (aliases.empty()) {
+                    uint32_t sum = 0;
+                    if (sumStrictPeriodicExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
+                        sumLinearDivExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum)) {
+                        periodicDeltas[key] += sign < 0 ? 0u - sum : sum;
+                    } else {
+                        return FoldValueFail;
+                    }
+                } else {
+                    return FoldValueFail;
+                }
+            }
+            sawAccumulator = true;
+            aliases.erase(key);
+        }
+        if (!sawAccumulator || iterOffset != step) return FoldStructFail;
+
+        uint32_t finalIv = static_cast<uint32_t>(startIv) + static_cast<uint32_t>(step) * static_cast<uint32_t>(niter);
+        writeSlot(indKey, static_cast<int32_t>(finalIv), frame);
+        for (auto &kv : deltas) {
+            uint32_t v = static_cast<uint32_t>(readSlot(kv.first, frame));
+            v += sumPoly(kv.second, niter);
+            writeSlot(kv.first, static_cast<int32_t>(v), frame);
+        }
+        for (auto &kv : periodicDeltas) {
+            uint32_t v = static_cast<uint32_t>(readSlot(kv.first, frame));
+            v += kv.second;
+            writeSlot(kv.first, static_cast<int32_t>(v), frame);
+        }
+        return FoldOk;
+    }
+
     // ---- fold driver ----
 
     bool applyAffineLoop(const Stmt *s, const AffineLoopS &loop, int32_t *frame) {
@@ -3537,7 +4197,9 @@ private:
         uint64_t boundAcc = 0;
         for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(loop.bound[i]) * v[i];
         int32_t bound = static_cast<int32_t>(static_cast<uint32_t>(boundAcc));
-        uint64_t niter = countIterations(loop.cmp, loop.step, static_cast<int32_t>(v[loop.induction]), bound);
+        auto niterOpt = countIterationsMaybe(loop.cmp, loop.step, static_cast<int32_t>(v[loop.induction]), bound);
+        if (!niterOpt) return false;
+        uint64_t niter = *niterOpt;
         if (niter == 0) return true;
         v = matVec(cachedMatPow(s->fastLoopId, loop.mat, niter), v);
         for (int i = 0; i < k; ++i) {
@@ -3549,7 +4211,7 @@ private:
     bool tryFoldWhile(const Stmt *s, int32_t *frame) {
         if (s->fastLoopId < 0 || s->fastLoopId >= static_cast<int>(loopStats.size())) return false;
         LoopStat &st = loopStats[s->fastLoopId];
-        constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED;
+        constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED | NO_POLY_SUM;
         if ((st.structFlags & allStruct) == allStruct) return false;
         if (!st.everFolded && st.failCount >= 8) {
             ++st.failCount;
@@ -3596,6 +4258,14 @@ private:
             } else if (r == FoldStructFail) {
                 st.structFlags |= NO_NESTED;
             }
+        }
+        if (!(st.structFlags & NO_POLY_SUM)) {
+            FoldRes r = tryRunPolynomialSumLoop(s, frame);
+            if (r == FoldOk) {
+                st.everFolded = true;
+                return true;
+            }
+            if (r == FoldStructFail) st.structFlags |= NO_POLY_SUM;
         }
         ++st.failCount;
         return false;
@@ -5437,20 +6107,26 @@ int main(int argc, char **argv) {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
+    bool optimized = false;
     if (optMode) {
         ConstEvaluator quickConstEval(program, 1000000LL, 50);
         if (auto value = quickConstEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
+        SafeOptimizer earlyOptimizer(program);
+        earlyOptimizer.run();
+        optimized = true;
         FastEvaluator fastEval(program, 5000);
         if (auto value = fastEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
     }
-    SafeOptimizer optimizer(program);
-    optimizer.run();
+    if (!optimized) {
+        SafeOptimizer optimizer(program);
+        optimizer.run();
+    }
     ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
