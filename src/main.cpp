@@ -721,6 +721,79 @@ private:
         return true;
     }
 
+    const Expr *pureReturnExpr(const Function *f) const {
+        if (!f || f->returnsVoid) return nullptr;
+        const Expr *expr = nullptr;
+        if (!returnedExpr(f->body.get(), expr) || !expr || exprContainsCall(expr)) return nullptr;
+        return expr;
+    }
+
+    bool affineExprWithAliases(const Expr *e, const unordered_map<string, vector<uint32_t>> &aliases,
+                               const unordered_map<string, int> &idx,
+                               const vector<vector<uint32_t>> &cur, vector<uint32_t> &out) const {
+        int d = static_cast<int>(cur.size());
+        out.assign(d, 0);
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out[d - 1] = static_cast<uint32_t>(wrap32(e->value));
+                return true;
+            case Expr::Kind::Var: {
+                auto alias = aliases.find(e->name);
+                if (alias != aliases.end()) {
+                    out = alias->second;
+                    return true;
+                }
+                auto it = idx.find(e->name);
+                if (it == idx.end()) {
+                    auto v = lookupVar(e->name);
+                    if (!v) return false;
+                    out[d - 1] = static_cast<uint32_t>(*v);
+                    return true;
+                }
+                out = cur[it->second];
+                return true;
+            }
+            case Expr::Kind::Unary: {
+                vector<uint32_t> a;
+                if (!affineExprWithAliases(e->lhs.get(), aliases, idx, cur, a)) return false;
+                if (e->op == "+") {
+                    out = std::move(a);
+                    return true;
+                }
+                if (e->op == "-") {
+                    for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                vector<uint32_t> a, b;
+                if (e->op == "+" || e->op == "-") {
+                    if (!affineExprWithAliases(e->lhs.get(), aliases, idx, cur, a) ||
+                        !affineExprWithAliases(e->rhs.get(), aliases, idx, cur, b)) return false;
+                    for (int i = 0; i < d; ++i) out[i] = e->op == "+" ? a[i] + b[i] : a[i] - b[i];
+                    return true;
+                }
+                if (e->op == "*") {
+                    if (!affineExprWithAliases(e->lhs.get(), aliases, idx, cur, a) ||
+                        !affineExprWithAliases(e->rhs.get(), aliases, idx, cur, b)) return false;
+                    if (constRow(a)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
+                        return true;
+                    }
+                    if (constRow(b)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            case Expr::Kind::Call:
+                return false;
+        }
+        return false;
+    }
+
     bool affineExpr(const Expr *e, const unordered_map<string, int> &idx,
                     const vector<vector<uint32_t>> &cur, vector<uint32_t> &out) const {
         int d = static_cast<int>(cur.size());
@@ -773,8 +846,19 @@ private:
                 }
                 return false;
             }
-            case Expr::Kind::Call:
-                return false;
+            case Expr::Kind::Call: {
+                auto found = funcs.find(e->name);
+                if (found == funcs.end()) return false;
+                const Expr *ret = pureReturnExpr(found->second);
+                if (!ret || e->args.size() != found->second->params.size()) return false;
+                unordered_map<string, vector<uint32_t>> aliases;
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    vector<uint32_t> row;
+                    if (!affineExpr(e->args[i].get(), idx, cur, row)) return false;
+                    aliases[found->second->params[i]] = std::move(row);
+                }
+                return affineExprWithAliases(ret, aliases, idx, cur, out);
+            }
         }
         return false;
     }
@@ -1682,11 +1766,32 @@ static optional<int32_t> foldConstExpr(const Expr *e) {
     return nullopt;
 }
 
+static unique_ptr<Expr> cloneExprSubstGeneric(const Expr *e, const unordered_map<string, const Expr *> &subst) {
+    if (!e) return nullptr;
+    if (e->kind == Expr::Kind::Var) {
+        auto it = subst.find(e->name);
+        if (it != subst.end()) {
+            unordered_map<string, const Expr *> emptySubst;
+            return cloneExprSubstGeneric(it->second, emptySubst);
+        }
+    }
+    auto out = make_unique<Expr>();
+    out->kind = e->kind;
+    out->value = e->value;
+    out->name = e->name;
+    out->op = e->op;
+    out->lhs = cloneExprSubstGeneric(e->lhs.get(), subst);
+    out->rhs = cloneExprSubstGeneric(e->rhs.get(), subst);
+    for (auto &arg : e->args) out->args.push_back(cloneExprSubstGeneric(arg.get(), subst));
+    return out;
+}
+
 class SafeOptimizer {
 public:
     explicit SafeOptimizer(Program &program) : prog(program) {}
 
     void run() {
+        collectInlineableFunctions();
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl) {
                 optExpr(item.decl->init);
@@ -1706,7 +1811,20 @@ public:
 private:
     Program &prog;
     unordered_map<string, int32_t> globalConsts;
+    unordered_map<string, Function *> inlineableFuncs;
     vector<unordered_map<string, optional<int32_t>>> env;
+
+    void collectInlineableFunctions() {
+        inlineableFuncs.clear();
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func || item.func->returnsVoid) continue;
+            const Stmt *body = item.func->body.get();
+            if (!body || body->kind != Stmt::Kind::Block || body->stmts.size() != 1) continue;
+            const Stmt *ret = body->stmts[0].get();
+            if (ret->kind != Stmt::Kind::Return || !ret->expr || exprHasCall(ret->expr.get())) continue;
+            inlineableFuncs[item.func->name] = item.func.get();
+        }
+    }
 
     void enter() { env.push_back({}); }
     void leave() { env.pop_back(); }
@@ -1759,6 +1877,7 @@ private:
             }
             case Expr::Kind::Call:
                 for (auto &arg : e->args) optExpr(arg);
+                inlinePureCall(e);
                 return;
             case Expr::Kind::Unary:
                 optExpr(e->lhs);
@@ -1794,6 +1913,21 @@ private:
         else if (e->op == "%" && r && *r == 1 && lhsPure) e = makeNumberExpr(0);
         else if (e->op == "&&" && l && !truthy(*l)) e = makeNumberExpr(0);
         else if (e->op == "||" && l && truthy(*l)) e = makeNumberExpr(1);
+    }
+
+    void inlinePureCall(unique_ptr<Expr> &e) {
+        if (!e || e->kind != Expr::Kind::Call) return;
+        auto found = inlineableFuncs.find(e->name);
+        if (found == inlineableFuncs.end()) return;
+        Function *f = found->second;
+        if (e->args.size() != f->params.size()) return;
+        for (auto &arg : e->args) {
+            if (exprHasCall(arg.get())) return;
+        }
+        unordered_map<string, const Expr *> subst;
+        for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
+        e = cloneExprSubstGeneric(f->body->stmts[0]->expr.get(), subst);
+        optExpr(e);
     }
 
     unique_ptr<Stmt> emptyStmt() const {
@@ -3263,26 +3397,6 @@ private:
         adjustSp(extraBytes + 16 * n);
     }
 
-    unique_ptr<Expr> cloneExprSubst(const Expr *e, const unordered_map<string, const Expr *> &subst) {
-        if (!e) return nullptr;
-        if (e->kind == Expr::Kind::Var) {
-            auto it = subst.find(e->name);
-            if (it != subst.end()) {
-                unordered_map<string, const Expr *> emptySubst;
-                return cloneExprSubst(it->second, emptySubst);
-            }
-        }
-        auto outExpr = make_unique<Expr>();
-        outExpr->kind = e->kind;
-        outExpr->value = e->value;
-        outExpr->name = e->name;
-        outExpr->op = e->op;
-        outExpr->lhs = cloneExprSubst(e->lhs.get(), subst);
-        outExpr->rhs = cloneExprSubst(e->rhs.get(), subst);
-        for (auto &arg : e->args) outExpr->args.push_back(cloneExprSubst(arg.get(), subst));
-        return outExpr;
-    }
-
     bool tryGenInlineCall(const Expr *e, const string &dst) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
@@ -3295,7 +3409,7 @@ private:
         unordered_map<string, const Expr *> subst;
         for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
         const Expr *ret = f->body->stmts[0]->expr.get();
-        auto expanded = cloneExprSubst(ret, subst);
+        auto expanded = cloneExprSubstGeneric(ret, subst);
         genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
         return true;
     }
