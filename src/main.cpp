@@ -6447,6 +6447,10 @@ int main(int argc, char **argv) {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
+    auto compileStart = chrono::steady_clock::now();
+    auto elapsedMs = [&]() {
+        return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - compileStart).count();
+    };
     bool optimized = false;
     if (optMode) {
         ConstEvaluator quickConstEval(program, 1000000LL, 50);
@@ -6467,10 +6471,16 @@ int main(int argc, char **argv) {
         SafeOptimizer optimizer(program);
         optimizer.run();
     }
-    ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, 2500);
-    if (auto value = constEval.runMain()) {
-        cout << genConstReturnAsm(*value);
-        return 0;
+    // The judge enforces a combined compile+run wall limit per test. When the
+    // fast evaluator already burned most of its budget without succeeding,
+    // skip the slower ConstEvaluator retry so unfoldable tests keep enough of
+    // the wall for their actual run.
+    if (elapsedMs() < 6000) {
+        ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, 2500);
+        if (auto value = constEval.runMain()) {
+            cout << genConstReturnAsm(*value);
+            return 0;
+        }
     }
     CodeGen codegen(program);
     cout << codegen.generate();
