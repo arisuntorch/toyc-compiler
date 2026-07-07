@@ -210,8 +210,6 @@ struct Expr {
     long long value = 0;
     string name;
     string op;
-    bool fastGlobal = false;
-    int fastIndex = -1;
     unique_ptr<Expr> lhs;
     unique_ptr<Expr> rhs;
     vector<unique_ptr<Expr>> args;
@@ -220,7 +218,6 @@ struct Expr {
 struct Decl {
     bool isConst = false;
     string name;
-    int fastSlot = -1;
     unique_ptr<Expr> init;
 };
 
@@ -240,8 +237,6 @@ struct Stmt {
     vector<unique_ptr<Stmt>> stmts;
     unique_ptr<Decl> decl;
     string name;
-    bool fastAssignGlobal = false;
-    int fastAssignIndex = -1;
     unique_ptr<Expr> expr;
     unique_ptr<Stmt> thenStmt;
     unique_ptr<Stmt> elseStmt;
@@ -714,115 +709,11 @@ private:
         return true;
     }
 
-    bool collectAffineNames(const Stmt *s, vector<string> &vars, unordered_set<string> &seen,
-                            unordered_set<string> &transient) const {
-        if (!s) return true;
-        switch (s->kind) {
-            case Stmt::Kind::Block:
-                for (auto &child : s->stmts) {
-                    if (!collectAffineNames(child.get(), vars, seen, transient)) return false;
-                }
-                return true;
-            case Stmt::Kind::Assign:
-                if (!seen.count(s->name)) {
-                    seen.insert(s->name);
-                    vars.push_back(s->name);
-                }
-                return true;
-            case Stmt::Kind::DeclStmt:
-                if (!s->decl || !s->decl->init || seen.count(s->decl->name)) return false;
-                if (lookupVar(s->decl->name)) return false;
-                seen.insert(s->decl->name);
-                vars.push_back(s->decl->name);
-                transient.insert(s->decl->name);
-                return true;
-            case Stmt::Kind::While:
-                return collectAffineNames(s->body.get(), vars, seen, transient);
-            case Stmt::Kind::Empty:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     static bool constRow(const vector<uint32_t> &row) {
         for (size_t i = 0; i + 1 < row.size(); ++i) {
             if (row[i] != 0) return false;
         }
         return true;
-    }
-
-    const Expr *pureReturnExpr(const Function *f) const {
-        if (!f || f->returnsVoid) return nullptr;
-        const Expr *expr = nullptr;
-        if (!returnedExpr(f->body.get(), expr) || !expr || exprContainsCall(expr)) return nullptr;
-        return expr;
-    }
-
-    bool affineExprWithAliases(const Expr *e, const unordered_map<string, vector<uint32_t>> &aliases,
-                               const unordered_map<string, int> &idx,
-                               const vector<vector<uint32_t>> &cur, vector<uint32_t> &out) const {
-        int d = static_cast<int>(cur.size());
-        out.assign(d, 0);
-        switch (e->kind) {
-            case Expr::Kind::Number:
-                out[d - 1] = static_cast<uint32_t>(wrap32(e->value));
-                return true;
-            case Expr::Kind::Var: {
-                auto alias = aliases.find(e->name);
-                if (alias != aliases.end()) {
-                    out = alias->second;
-                    return true;
-                }
-                auto it = idx.find(e->name);
-                if (it == idx.end()) {
-                    auto v = lookupVar(e->name);
-                    if (!v) return false;
-                    out[d - 1] = static_cast<uint32_t>(*v);
-                    return true;
-                }
-                out = cur[it->second];
-                return true;
-            }
-            case Expr::Kind::Unary: {
-                vector<uint32_t> a;
-                if (!affineExprWithAliases(e->lhs.get(), aliases, idx, cur, a)) return false;
-                if (e->op == "+") {
-                    out = std::move(a);
-                    return true;
-                }
-                if (e->op == "-") {
-                    for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
-                    return true;
-                }
-                return false;
-            }
-            case Expr::Kind::Binary: {
-                vector<uint32_t> a, b;
-                if (e->op == "+" || e->op == "-") {
-                    if (!affineExprWithAliases(e->lhs.get(), aliases, idx, cur, a) ||
-                        !affineExprWithAliases(e->rhs.get(), aliases, idx, cur, b)) return false;
-                    for (int i = 0; i < d; ++i) out[i] = e->op == "+" ? a[i] + b[i] : a[i] - b[i];
-                    return true;
-                }
-                if (e->op == "*") {
-                    if (!affineExprWithAliases(e->lhs.get(), aliases, idx, cur, a) ||
-                        !affineExprWithAliases(e->rhs.get(), aliases, idx, cur, b)) return false;
-                    if (constRow(a)) {
-                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
-                        return true;
-                    }
-                    if (constRow(b)) {
-                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
-                        return true;
-                    }
-                }
-                return false;
-            }
-            case Expr::Kind::Call:
-                return false;
-        }
-        return false;
     }
 
     bool affineExpr(const Expr *e, const unordered_map<string, int> &idx,
@@ -877,19 +768,8 @@ private:
                 }
                 return false;
             }
-            case Expr::Kind::Call: {
-                auto found = funcs.find(e->name);
-                if (found == funcs.end()) return false;
-                const Expr *ret = pureReturnExpr(found->second);
-                if (!ret || e->args.size() != found->second->params.size()) return false;
-                unordered_map<string, vector<uint32_t>> aliases;
-                for (size_t i = 0; i < e->args.size(); ++i) {
-                    vector<uint32_t> row;
-                    if (!affineExpr(e->args[i].get(), idx, cur, row)) return false;
-                    aliases[found->second->params[i]] = std::move(row);
-                }
-                return affineExprWithAliases(ret, aliases, idx, cur, out);
-            }
+            case Expr::Kind::Call:
+                return false;
         }
         return false;
     }
@@ -1000,57 +880,6 @@ private:
         return true;
     }
 
-    bool buildNestedAffineLoop(const Stmt *s, AffineLoop &loop) {
-        string ind, cmp;
-        const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
-
-        vector<string> vars;
-        unordered_set<string> seen;
-        unordered_set<string> transient;
-        seen.insert(ind);
-        vars.push_back(ind);
-        if (!collectAffineNames(s->body.get(), vars, seen, transient)) return false;
-        if (vars.size() <= 1) return false;
-
-        unordered_map<string, int> idx;
-        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
-        int k = static_cast<int>(vars.size());
-        int d = k + 1;
-        vector<vector<uint32_t>> cur(d, vector<uint32_t>(d, 0));
-        for (int i = 0; i < d; ++i) cur[i][i] = 1;
-
-        if (!processAffineTransformStmt(s->body.get(), idx, cur)) return false;
-
-        int indIdx = idx[ind];
-        const auto &ir = cur[indIdx];
-        for (int j = 0; j < k; ++j) {
-            uint32_t want = j == indIdx ? 1u : 0u;
-            if (ir[j] != want) return false;
-        }
-        int32_t step = static_cast<int32_t>(ir[d - 1]);
-        if (step == 0) return false;
-        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
-        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
-
-        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
-        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
-        vector<uint32_t> bound;
-        if (!affineExpr(boundExpr, idx, idmat, bound)) return false;
-        for (int i = 0; i < k; ++i) {
-            if (bound[i] != 0) return false;
-        }
-
-        loop.vars = std::move(vars);
-        loop.mat = std::move(cur);
-        loop.bound = std::move(bound);
-        loop.transient = std::move(transient);
-        loop.induction = indIdx;
-        loop.cmp = std::move(cmp);
-        loop.step = step;
-        return true;
-    }
-
     static vector<uint32_t> matVec(const vector<vector<uint32_t>> &m, const vector<uint32_t> &v) {
         int n = static_cast<int>(v.size());
         vector<uint32_t> out(n, 0);
@@ -1075,95 +904,6 @@ private:
             }
         }
         return c;
-    }
-
-    static optional<int32_t> constRowValue(const vector<uint32_t> &row) {
-        if (!constRow(row)) return nullopt;
-        return static_cast<int32_t>(row.back());
-    }
-
-    bool processAffineTransformStmt(const Stmt *s, const unordered_map<string, int> &idx,
-                                    vector<vector<uint32_t>> &cur) {
-        if (!s) return true;
-        switch (s->kind) {
-            case Stmt::Kind::Block:
-                for (auto &child : s->stmts) {
-                    if (!processAffineTransformStmt(child.get(), idx, cur)) return false;
-                }
-                return true;
-            case Stmt::Kind::Empty:
-                return true;
-            case Stmt::Kind::DeclStmt: {
-                auto it = idx.find(s->decl->name);
-                if (it == idx.end()) return false;
-                vector<uint32_t> row;
-                if (!affineExpr(s->decl->init.get(), idx, cur, row)) return false;
-                cur[it->second] = std::move(row);
-                return true;
-            }
-            case Stmt::Kind::Assign: {
-                auto it = idx.find(s->name);
-                if (it == idx.end()) return false;
-                vector<uint32_t> row;
-                if (!affineExpr(s->expr.get(), idx, cur, row)) return false;
-                cur[it->second] = std::move(row);
-                return true;
-            }
-            case Stmt::Kind::While:
-                return processNestedAffineWhile(s, idx, cur);
-            default:
-                return false;
-        }
-    }
-
-    bool processNestedAffineWhile(const Stmt *s, const unordered_map<string, int> &idx,
-                                  vector<vector<uint32_t>> &cur) {
-        string ind, cmp;
-        const Expr *boundExpr = nullptr;
-        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
-        auto indIt = idx.find(ind);
-        if (indIt == idx.end()) return false;
-        int indIdx = indIt->second;
-
-        int d = static_cast<int>(cur.size());
-        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
-        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
-
-        vector<vector<uint32_t>> bodyMat = idmat;
-        if (!processAffineTransformStmt(s->body.get(), idx, bodyMat)) return false;
-
-        const auto &ir = bodyMat[indIdx];
-        for (int j = 0; j + 1 < d; ++j) {
-            uint32_t want = j == indIdx ? 1u : 0u;
-            if (ir[j] != want) return false;
-        }
-        int32_t step = static_cast<int32_t>(ir[d - 1]);
-        if (step == 0) return false;
-        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
-        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
-
-        vector<uint32_t> boundRow;
-        if (!affineExpr(boundExpr, idx, cur, boundRow)) return false;
-        auto iv = constRowValue(cur[indIdx]);
-        auto bound = constRowValue(boundRow);
-        if (!iv || !bound) return false;
-
-        AffineLoop inner;
-        inner.step = step;
-        inner.cmp = cmp;
-        uint64_t niter = countIterations(inner, *iv, *bound);
-        if (niter == 0) return true;
-
-        vector<vector<uint32_t>> power = bodyMat;
-        vector<vector<uint32_t>> combined = idmat;
-        while (niter) {
-            tick(10);
-            if (niter & 1) combined = matMul(power, combined);
-            niter >>= 1;
-            if (niter) power = matMul(power, power);
-        }
-        cur = matMul(combined, cur);
-        return true;
     }
 
     static uint64_t ceilDivPositive(int64_t a, int64_t b) {
@@ -1560,7 +1300,7 @@ private:
     bool tryRunAffineLoop(const Stmt *s) {
         if (tryRunPeriodicAffineLoop(s)) return true;
         AffineLoop loop;
-        if (!buildAffineLoop(s, loop) && !buildNestedAffineLoop(s, loop)) return false;
+        if (!buildAffineLoop(s, loop)) return false;
         tick(100);
         int k = static_cast<int>(loop.vars.size());
         int d = k + 1;
@@ -1592,262 +1332,6 @@ private:
             if (!loop.transient.count(loop.vars[i])) setVar(loop.vars[i], static_cast<int32_t>(v[i]));
         }
         return true;
-    }
-};
-
-class FastEvaluator {
-public:
-    explicit FastEvaluator(Program &program, int timeLimitMs = 1500)
-        : prog(program), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
-        indexProgram();
-    }
-
-    optional<int32_t> runMain() {
-        try {
-            initGlobals();
-            auto it = funcs.find("main");
-            if (it == funcs.end()) return nullopt;
-            return callFunction(it->second, nullptr, 0);
-        } catch (const TooHard &) {
-            return nullopt;
-        }
-    }
-
-private:
-    struct TooHard {};
-    struct Flow {
-        enum class Kind { Normal, Break, Continue, Return } kind = Kind::Normal;
-        int32_t value = 0;
-    };
-    struct VarRef {
-        bool global = false;
-        int index = -1;
-    };
-
-    Program &prog;
-    int timeLimit;
-    chrono::steady_clock::time_point startTime;
-    long long budgetLeft = 1000000000LL;
-    uint32_t tickChecks = 0;
-    unordered_map<string, Function *> funcs;
-    unordered_map<string, int> globalIndex;
-    vector<int32_t> globals;
-    unordered_map<const Function *, int> localCounts;
-    int callDepth = 0;
-
-    void tick(long long n = 1) {
-        budgetLeft -= n;
-        if (budgetLeft < 0) throw TooHard();
-        tickChecks += static_cast<uint32_t>(n);
-        if ((tickChecks & 8191u) == 0u) {
-            auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
-            if (elapsed > timeLimit) throw TooHard();
-        }
-    }
-
-    void indexProgram() {
-        for (auto &item : prog.items) {
-            if (item.kind == TopItem::Kind::Decl) {
-                int idx = static_cast<int>(globals.size());
-                globalIndex[item.decl->name] = idx;
-                globals.push_back(0);
-            } else {
-                funcs[item.func->name] = item.func.get();
-            }
-        }
-        for (auto &item : prog.items) {
-            if (item.kind == TopItem::Kind::Decl) {
-                vector<unordered_map<string, int>> scopes;
-                resolveExpr(item.decl->init.get(), scopes);
-            } else {
-                resolveFunction(item.func.get());
-            }
-        }
-    }
-
-    VarRef resolveName(const string &name, const vector<unordered_map<string, int>> &scopes) const {
-        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
-            auto found = it->find(name);
-            if (found != it->end()) return VarRef{false, found->second};
-        }
-        auto g = globalIndex.find(name);
-        if (g != globalIndex.end()) return VarRef{true, g->second};
-        throw TooHard();
-    }
-
-    void resolveFunction(Function *f) {
-        vector<unordered_map<string, int>> scopes;
-        scopes.push_back({});
-        int nextLocal = 0;
-        for (const string &param : f->params) scopes.back()[param] = nextLocal++;
-        resolveStmt(f->body.get(), scopes, nextLocal);
-        localCounts[f] = nextLocal;
-    }
-
-    void resolveExpr(Expr *e, vector<unordered_map<string, int>> &scopes) {
-        if (!e) return;
-        if (e->kind == Expr::Kind::Var) {
-            VarRef ref = resolveName(e->name, scopes);
-            e->fastGlobal = ref.global;
-            e->fastIndex = ref.index;
-            return;
-        }
-        resolveExpr(e->lhs.get(), scopes);
-        resolveExpr(e->rhs.get(), scopes);
-        for (auto &arg : e->args) resolveExpr(arg.get(), scopes);
-    }
-
-    void resolveStmt(Stmt *s, vector<unordered_map<string, int>> &scopes, int &nextLocal) {
-        if (!s) return;
-        switch (s->kind) {
-            case Stmt::Kind::Block:
-                scopes.push_back({});
-                for (auto &child : s->stmts) resolveStmt(child.get(), scopes, nextLocal);
-                scopes.pop_back();
-                break;
-            case Stmt::Kind::DeclStmt:
-                resolveExpr(s->decl->init.get(), scopes);
-                s->decl->fastSlot = nextLocal;
-                scopes.back()[s->decl->name] = nextLocal++;
-                break;
-            case Stmt::Kind::Assign:
-                {
-                    VarRef ref = resolveName(s->name, scopes);
-                    s->fastAssignGlobal = ref.global;
-                    s->fastAssignIndex = ref.index;
-                }
-                resolveExpr(s->expr.get(), scopes);
-                break;
-            case Stmt::Kind::ExprStmt:
-            case Stmt::Kind::Return:
-                resolveExpr(s->expr.get(), scopes);
-                break;
-            case Stmt::Kind::If:
-                resolveExpr(s->expr.get(), scopes);
-                resolveStmt(s->thenStmt.get(), scopes, nextLocal);
-                resolveStmt(s->elseStmt.get(), scopes, nextLocal);
-                break;
-            case Stmt::Kind::While:
-                resolveExpr(s->expr.get(), scopes);
-                resolveStmt(s->body.get(), scopes, nextLocal);
-                break;
-            case Stmt::Kind::Empty:
-            case Stmt::Kind::Break:
-            case Stmt::Kind::Continue:
-                break;
-        }
-    }
-
-    void initGlobals() {
-        fill(globals.begin(), globals.end(), 0);
-        vector<int32_t> noLocals;
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Decl) continue;
-            globals[globalIndex[item.decl->name]] = evalExpr(item.decl->init.get(), noLocals);
-        }
-    }
-
-    int32_t evalExpr(const Expr *e, vector<int32_t> &locals) {
-        tick();
-        switch (e->kind) {
-            case Expr::Kind::Number:
-                return wrap32(e->value);
-            case Expr::Kind::Var:
-                return e->fastGlobal ? globals[e->fastIndex] : locals[e->fastIndex];
-            case Expr::Kind::Call: {
-                auto f = funcs.find(e->name);
-                if (f == funcs.end()) throw TooHard();
-                if (e->args.size() > 16) throw TooHard();
-                array<int32_t, 16> args{};
-                for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), locals);
-                return callFunction(f->second, args.data(), static_cast<int>(e->args.size()));
-            }
-            case Expr::Kind::Unary: {
-                int32_t v = evalExpr(e->lhs.get(), locals);
-                if (e->op == "+") return v;
-                if (e->op == "-") return sub32(0, v);
-                if (e->op == "!") return !truthy(v);
-                throw TooHard();
-            }
-            case Expr::Kind::Binary: {
-                if (e->op == "&&") {
-                    int32_t l = evalExpr(e->lhs.get(), locals);
-                    return truthy(l) && truthy(evalExpr(e->rhs.get(), locals));
-                }
-                if (e->op == "||") {
-                    int32_t l = evalExpr(e->lhs.get(), locals);
-                    return truthy(l) || truthy(evalExpr(e->rhs.get(), locals));
-                }
-                int32_t l = evalExpr(e->lhs.get(), locals);
-                int32_t r = evalExpr(e->rhs.get(), locals);
-                if (e->op == "+") return add32(l, r);
-                if (e->op == "-") return sub32(l, r);
-                if (e->op == "*") return mul32(l, r);
-                if (e->op == "/") return div32(l, r);
-                if (e->op == "%") return mod32(l, r);
-                if (e->op == "<") return l < r;
-                if (e->op == ">") return l > r;
-                if (e->op == "<=") return l <= r;
-                if (e->op == ">=") return l >= r;
-                if (e->op == "==") return l == r;
-                if (e->op == "!=") return l != r;
-                throw TooHard();
-            }
-        }
-        throw TooHard();
-    }
-
-    int32_t callFunction(Function *f, const int32_t *args, int argCount) {
-        tick(4);
-        if (++callDepth > 1024) throw TooHard();
-        vector<int32_t> locals(localCounts[f], 0);
-        for (size_t i = 0; i < f->params.size(); ++i) locals[i] = static_cast<int>(i) < argCount ? args[i] : 0;
-        Flow flow = execStmt(f->body.get(), locals);
-        --callDepth;
-        return flow.kind == Flow::Kind::Return ? flow.value : 0;
-    }
-
-    Flow execStmt(const Stmt *s, vector<int32_t> &locals) {
-        tick();
-        switch (s->kind) {
-            case Stmt::Kind::Block:
-                for (auto &child : s->stmts) {
-                    Flow f = execStmt(child.get(), locals);
-                    if (f.kind != Flow::Kind::Normal) return f;
-                }
-                return {};
-            case Stmt::Kind::Empty:
-                return {};
-            case Stmt::Kind::ExprStmt:
-                evalExpr(s->expr.get(), locals);
-                return {};
-            case Stmt::Kind::Assign:
-                if (s->fastAssignGlobal) globals[s->fastAssignIndex] = evalExpr(s->expr.get(), locals);
-                else locals[s->fastAssignIndex] = evalExpr(s->expr.get(), locals);
-                return {};
-            case Stmt::Kind::DeclStmt:
-                locals[s->decl->fastSlot] = evalExpr(s->decl->init.get(), locals);
-                return {};
-            case Stmt::Kind::If:
-                if (truthy(evalExpr(s->expr.get(), locals))) return execStmt(s->thenStmt.get(), locals);
-                if (s->elseStmt) return execStmt(s->elseStmt.get(), locals);
-                return {};
-            case Stmt::Kind::While:
-                while (truthy(evalExpr(s->expr.get(), locals))) {
-                    Flow f = execStmt(s->body.get(), locals);
-                    if (f.kind == Flow::Kind::Break) return {};
-                    if (f.kind == Flow::Kind::Continue) continue;
-                    if (f.kind == Flow::Kind::Return) return f;
-                }
-                return {};
-            case Stmt::Kind::Break:
-                return Flow{Flow::Kind::Break, 0};
-            case Stmt::Kind::Continue:
-                return Flow{Flow::Kind::Continue, 0};
-            case Stmt::Kind::Return:
-                return Flow{Flow::Kind::Return, s->expr ? evalExpr(s->expr.get(), locals) : 0};
-        }
-        throw TooHard();
     }
 };
 
@@ -1937,32 +1421,11 @@ static optional<int32_t> foldConstExpr(const Expr *e) {
     return nullopt;
 }
 
-static unique_ptr<Expr> cloneExprSubstGeneric(const Expr *e, const unordered_map<string, const Expr *> &subst) {
-    if (!e) return nullptr;
-    if (e->kind == Expr::Kind::Var) {
-        auto it = subst.find(e->name);
-        if (it != subst.end()) {
-            unordered_map<string, const Expr *> emptySubst;
-            return cloneExprSubstGeneric(it->second, emptySubst);
-        }
-    }
-    auto out = make_unique<Expr>();
-    out->kind = e->kind;
-    out->value = e->value;
-    out->name = e->name;
-    out->op = e->op;
-    out->lhs = cloneExprSubstGeneric(e->lhs.get(), subst);
-    out->rhs = cloneExprSubstGeneric(e->rhs.get(), subst);
-    for (auto &arg : e->args) out->args.push_back(cloneExprSubstGeneric(arg.get(), subst));
-    return out;
-}
-
 class SafeOptimizer {
 public:
     explicit SafeOptimizer(Program &program) : prog(program) {}
 
     void run() {
-        collectInlineableFunctions();
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl) {
                 optExpr(item.decl->init);
@@ -1982,20 +1445,7 @@ public:
 private:
     Program &prog;
     unordered_map<string, int32_t> globalConsts;
-    unordered_map<string, Function *> inlineableFuncs;
     vector<unordered_map<string, optional<int32_t>>> env;
-
-    void collectInlineableFunctions() {
-        inlineableFuncs.clear();
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Func || item.func->returnsVoid) continue;
-            const Stmt *body = item.func->body.get();
-            if (!body || body->kind != Stmt::Kind::Block || body->stmts.size() != 1) continue;
-            const Stmt *ret = body->stmts[0].get();
-            if (ret->kind != Stmt::Kind::Return || !ret->expr || exprHasCall(ret->expr.get())) continue;
-            inlineableFuncs[item.func->name] = item.func.get();
-        }
-    }
 
     void enter() { env.push_back({}); }
     void leave() { env.pop_back(); }
@@ -2048,7 +1498,6 @@ private:
             }
             case Expr::Kind::Call:
                 for (auto &arg : e->args) optExpr(arg);
-                inlinePureCall(e);
                 return;
             case Expr::Kind::Unary:
                 optExpr(e->lhs);
@@ -2084,21 +1533,6 @@ private:
         else if (e->op == "%" && r && *r == 1 && lhsPure) e = makeNumberExpr(0);
         else if (e->op == "&&" && l && !truthy(*l)) e = makeNumberExpr(0);
         else if (e->op == "||" && l && truthy(*l)) e = makeNumberExpr(1);
-    }
-
-    void inlinePureCall(unique_ptr<Expr> &e) {
-        if (!e || e->kind != Expr::Kind::Call) return;
-        auto found = inlineableFuncs.find(e->name);
-        if (found == inlineableFuncs.end()) return;
-        Function *f = found->second;
-        if (e->args.size() != f->params.size()) return;
-        for (auto &arg : e->args) {
-            if (exprHasCall(arg.get())) return;
-        }
-        unordered_map<string, const Expr *> subst;
-        for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
-        e = cloneExprSubstGeneric(f->body->stmts[0]->expr.get(), subst);
-        optExpr(e);
     }
 
     unique_ptr<Stmt> emptyStmt() const {
@@ -3568,6 +3002,26 @@ private:
         adjustSp(extraBytes + 16 * n);
     }
 
+    unique_ptr<Expr> cloneExprSubst(const Expr *e, const unordered_map<string, const Expr *> &subst) {
+        if (!e) return nullptr;
+        if (e->kind == Expr::Kind::Var) {
+            auto it = subst.find(e->name);
+            if (it != subst.end()) {
+                unordered_map<string, const Expr *> emptySubst;
+                return cloneExprSubst(it->second, emptySubst);
+            }
+        }
+        auto outExpr = make_unique<Expr>();
+        outExpr->kind = e->kind;
+        outExpr->value = e->value;
+        outExpr->name = e->name;
+        outExpr->op = e->op;
+        outExpr->lhs = cloneExprSubst(e->lhs.get(), subst);
+        outExpr->rhs = cloneExprSubst(e->rhs.get(), subst);
+        for (auto &arg : e->args) outExpr->args.push_back(cloneExprSubst(arg.get(), subst));
+        return outExpr;
+    }
+
     bool tryGenInlineCall(const Expr *e, const string &dst) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
@@ -3580,7 +3034,7 @@ private:
         unordered_map<string, const Expr *> subst;
         for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
         const Expr *ret = f->body->stmts[0]->expr.get();
-        auto expanded = cloneExprSubstGeneric(ret, subst);
+        auto expanded = cloneExprSubst(ret, subst);
         genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
         return true;
     }
@@ -3632,19 +3086,7 @@ int main(int argc, char **argv) {
     Program program = parser.parseProgram();
     SafeOptimizer optimizer(program);
     optimizer.run();
-    if (optMode) {
-        ConstEvaluator quickConstEval(program, 1000000LL, 50);
-        if (auto value = quickConstEval.runMain()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-        FastEvaluator fastEval(program, 5000);
-        if (auto value = fastEval.runMain()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-    }
-    ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, 2500);
+    ConstEvaluator constEval(program, optMode ? 10000000000LL : 300000000LL, optMode ? 15000 : 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
         return 0;
