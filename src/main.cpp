@@ -210,6 +210,8 @@ struct Expr {
     long long value = 0;
     string name;
     string op;
+    bool fastGlobal = false;
+    int fastIndex = -1;
     unique_ptr<Expr> lhs;
     unique_ptr<Expr> rhs;
     vector<unique_ptr<Expr>> args;
@@ -218,6 +220,7 @@ struct Expr {
 struct Decl {
     bool isConst = false;
     string name;
+    int fastSlot = -1;
     unique_ptr<Expr> init;
 };
 
@@ -237,6 +240,8 @@ struct Stmt {
     vector<unique_ptr<Stmt>> stmts;
     unique_ptr<Decl> decl;
     string name;
+    bool fastAssignGlobal = false;
+    int fastAssignIndex = -1;
     unique_ptr<Expr> expr;
     unique_ptr<Stmt> thenStmt;
     unique_ptr<Stmt> elseStmt;
@@ -1367,14 +1372,11 @@ private:
     Program &prog;
     int timeLimit;
     chrono::steady_clock::time_point startTime;
-    long long budgetLeft = 120000000;
+    long long budgetLeft = 1000000000LL;
     uint32_t tickChecks = 0;
     unordered_map<string, Function *> funcs;
     unordered_map<string, int> globalIndex;
     vector<int32_t> globals;
-    unordered_map<const Expr *, VarRef> varRefs;
-    unordered_map<const Stmt *, VarRef> assignRefs;
-    unordered_map<const Decl *, int> declSlots;
     unordered_map<const Function *, int> localCounts;
     int callDepth = 0;
 
@@ -1430,7 +1432,9 @@ private:
     void resolveExpr(Expr *e, vector<unordered_map<string, int>> &scopes) {
         if (!e) return;
         if (e->kind == Expr::Kind::Var) {
-            varRefs[e] = resolveName(e->name, scopes);
+            VarRef ref = resolveName(e->name, scopes);
+            e->fastGlobal = ref.global;
+            e->fastIndex = ref.index;
             return;
         }
         resolveExpr(e->lhs.get(), scopes);
@@ -1448,11 +1452,15 @@ private:
                 break;
             case Stmt::Kind::DeclStmt:
                 resolveExpr(s->decl->init.get(), scopes);
-                declSlots[s->decl.get()] = nextLocal;
+                s->decl->fastSlot = nextLocal;
                 scopes.back()[s->decl->name] = nextLocal++;
                 break;
             case Stmt::Kind::Assign:
-                assignRefs[s] = resolveName(s->name, scopes);
+                {
+                    VarRef ref = resolveName(s->name, scopes);
+                    s->fastAssignGlobal = ref.global;
+                    s->fastAssignIndex = ref.index;
+                }
                 resolveExpr(s->expr.get(), scopes);
                 break;
             case Stmt::Kind::ExprStmt:
@@ -1484,22 +1492,13 @@ private:
         }
     }
 
-    int32_t getVar(const VarRef &ref, const vector<int32_t> &locals) const {
-        return ref.global ? globals[ref.index] : locals[ref.index];
-    }
-
-    void setVar(const VarRef &ref, vector<int32_t> &locals, int32_t value) {
-        if (ref.global) globals[ref.index] = value;
-        else locals[ref.index] = value;
-    }
-
     int32_t evalExpr(const Expr *e, vector<int32_t> &locals) {
         tick();
         switch (e->kind) {
             case Expr::Kind::Number:
                 return wrap32(e->value);
             case Expr::Kind::Var:
-                return getVar(varRefs.at(e), locals);
+                return e->fastGlobal ? globals[e->fastIndex] : locals[e->fastIndex];
             case Expr::Kind::Call: {
                 auto f = funcs.find(e->name);
                 if (f == funcs.end()) throw TooHard();
@@ -1568,10 +1567,11 @@ private:
                 evalExpr(s->expr.get(), locals);
                 return {};
             case Stmt::Kind::Assign:
-                setVar(assignRefs.at(s), locals, evalExpr(s->expr.get(), locals));
+                if (s->fastAssignGlobal) globals[s->fastAssignIndex] = evalExpr(s->expr.get(), locals);
+                else locals[s->fastAssignIndex] = evalExpr(s->expr.get(), locals);
                 return {};
             case Stmt::Kind::DeclStmt:
-                locals[declSlots.at(s->decl.get())] = evalExpr(s->decl->init.get(), locals);
+                locals[s->decl->fastSlot] = evalExpr(s->decl->init.get(), locals);
                 return {};
             case Stmt::Kind::If:
                 if (truthy(evalExpr(s->expr.get(), locals))) return execStmt(s->thenStmt.get(), locals);
@@ -3353,13 +3353,13 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        FastEvaluator fastEval(program, 1500);
+        FastEvaluator fastEval(program, 5000);
         if (auto value = fastEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
     }
-    ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, optMode ? 7000 : 2500);
+    ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
         return 0;
