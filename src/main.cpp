@@ -3348,6 +3348,11 @@ int main(int argc, char **argv) {
     SafeOptimizer optimizer(program);
     optimizer.run();
     if (optMode) {
+        ConstEvaluator quickConstEval(program, 10000000000LL, 300);
+        if (auto value = quickConstEval.runMain()) {
+            cout << genConstReturnAsm(*value);
+            return 0;
+        }
         FastEvaluator fastEval(program, 1500);
         if (auto value = fastEval.runMain()) {
             cout << genConstReturnAsm(*value);
