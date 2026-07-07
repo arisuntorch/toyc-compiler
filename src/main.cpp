@@ -2752,10 +2752,99 @@ private:
         for (int i = 0; i < 4; ++i) jitCode[at + i] = static_cast<uint8_t>((static_cast<uint32_t>(v) >> (8 * i)) & 0xff);
     }
 
-    void jLdEax(int slot) { jb(0x8B); jb(0x83); j32(4 * slot); }
-    void jLdEcx(int slot) { jb(0x8B); jb(0x8B); j32(4 * slot); }
-    void jStEax(int slot) { jb(0x89); jb(0x83); j32(4 * slot); }
-    void jStEdx(int slot) { jb(0x89); jb(0x93); j32(4 * slot); }
+    // The first kRegSlots frame slots of every function are pinned to physical
+    // registers (rbp, rsi, rdi, r8, r9, r10) instead of frame memory. This
+    // keeps hot-loop induction/accumulator variables in registers. Slots at or
+    // above kRegSlots stay in rbx-relative memory. rax/rcx/rdx are scratch,
+    // rbx=frame, r12=globals, r13=budget, r14=stack limit, r15=depth.
+    static constexpr int kRegSlots = 6;
+    static int pregId(int slot) {
+        static const int tbl[kRegSlots] = {5, 6, 7, 8, 9, 10};  // rbp rsi rdi r8 r9 r10
+        return tbl[slot];
+    }
+    static bool slotInReg(int slot) { return slot < kRegSlots; }
+
+    // mov <gpr>, <preg>  (gpr encoded in reg field, preg in rm field, mod=11)
+    void jMovGprFromPreg(uint8_t gpr, int pr) {
+        uint8_t rex = 0x40;
+        if (gpr >= 8) rex |= 0x04;   // REX.R
+        if (pr >= 8) rex |= 0x01;    // REX.B
+        if (rex != 0x40) jb(rex);
+        jb(0x8B);
+        jb(0xC0 | ((gpr & 7) << 3) | (pr & 7));
+    }
+    void jMovPregFromGpr(uint8_t gpr, int pr) {
+        uint8_t rex = 0x40;
+        if (gpr >= 8) rex |= 0x04;
+        if (pr >= 8) rex |= 0x01;
+        if (rex != 0x40) jb(rex);
+        jb(0x89);
+        jb(0xC0 | ((gpr & 7) << 3) | (pr & 7));
+    }
+    // op eax, <preg>  (reg field = eax = 0)
+    void jAluEaxPreg(uint8_t opc, int pr) {
+        if (pr >= 8) jb(0x41);
+        jb(opc);
+        jb(0xC0 | (pr & 7));
+    }
+
+    void jLoadEax(int slot) {
+        if (slotInReg(slot)) jMovGprFromPreg(0, pregId(slot));
+        else { jb(0x8B); jb(0x83); j32(4 * slot); }
+    }
+    void jLoadEcx(int slot) {
+        if (slotInReg(slot)) jMovGprFromPreg(1, pregId(slot));
+        else { jb(0x8B); jb(0x8B); j32(4 * slot); }
+    }
+    void jStoreEax(int slot) {
+        if (slotInReg(slot)) jMovPregFromGpr(0, pregId(slot));
+        else { jb(0x89); jb(0x83); j32(4 * slot); }
+    }
+    void jStoreEdx(int slot) {
+        if (slotInReg(slot)) jMovPregFromGpr(2, pregId(slot));
+        else { jb(0x89); jb(0x93); j32(4 * slot); }
+    }
+    void jAluEax(uint8_t opc, int slot) {   // add/sub/cmp eax, slot
+        if (slotInReg(slot)) jAluEaxPreg(opc, pregId(slot));
+        else { jb(opc); jb(0x83); j32(4 * slot); }
+    }
+    void jImulEax(int slot) {               // imul eax, slot
+        if (slotInReg(slot)) { int p = pregId(slot); if (p >= 8) jb(0x41); jb(0x0F); jb(0xAF); jb(0xC0 | (p & 7)); }
+        else { jb(0x0F); jb(0xAF); jb(0x83); j32(4 * slot); }
+    }
+    void jImulEaxImm(int slot, int32_t imm) {   // imul eax, slot, imm
+        if (slotInReg(slot)) { int p = pregId(slot); if (p >= 8) jb(0x41); jb(0x69); jb(0xC0 | (p & 7)); j32(imm); }
+        else { jb(0x69); jb(0x83); j32(4 * slot); j32(imm); }
+    }
+    void jLiSlot(int slot, int32_t imm) {   // slot = imm
+        if (slotInReg(slot)) { int p = pregId(slot); if (p >= 8) jb(0x41); jb(0xB8 | (p & 7)); j32(imm); }
+        else { jb(0xC7); jb(0x83); j32(4 * slot); j32(imm); }
+    }
+    // preg <-> memory frame sync (for FOLD trampoline and entry)
+    void jSyncPregToMem(int slot) {         // [rbx+4*slot] = preg
+        int p = pregId(slot);
+        uint8_t rex = 0x40;
+        if (p >= 8) rex |= 0x04;            // REX.R (preg in reg field)
+        if (rex != 0x40) jb(rex);
+        jb(0x89); jb(0x83 | ((p & 7) << 3)); j32(4 * slot);
+    }
+    void jSyncPregFromMem(int slot) {       // preg = [rbx+4*slot]
+        int p = pregId(slot);
+        uint8_t rex = 0x40;
+        if (p >= 8) rex |= 0x04;
+        if (rex != 0x40) jb(rex);
+        jb(0x8B); jb(0x83 | ((p & 7) << 3)); j32(4 * slot);
+    }
+    void jZeroPreg(int slot) {              // xor preg, preg
+        int p = pregId(slot);
+        uint8_t rex = 0x40;
+        if (p >= 8) rex |= 0x05;            // REX.R|REX.B
+        if (rex != 0x40) jb(rex);
+        jb(0x31); jb(0xC0 | ((p & 7) << 3) | (p & 7));
+    }
+    void jPushPreg(int slot) { int p = pregId(slot); if (p >= 8) jb(0x41); jb(0x50 | (p & 7)); }
+    void jPopPreg(int slot) { int p = pregId(slot); if (p >= 8) jb(0x41); jb(0x58 | (p & 7)); }
+
     void jLdGlobEax(int idx) { jb(0x41); jb(0x8B); jb(0x84); jb(0x24); j32(4 * idx); }
     void jStGlobEax(int idx) { jb(0x41); jb(0x89); jb(0x84); jb(0x24); j32(4 * idx); }
 
@@ -2774,7 +2863,7 @@ private:
     void jSetccMovzx(int opc, int destSlot) {
         jb(0x0F); jb(jSetcc(opc)); jb(0xC0);   // setcc al
         jb(0x0F); jb(0xB6); jb(0xC0);          // movzx eax, al
-        jStEax(destSlot);
+        jStoreEax(destSlot);
     }
 
     // Signed divide/modulo with the same guards as div32/mod32. Dividend in
@@ -2801,7 +2890,29 @@ private:
         else { jb(0x31); jb(0xC0); }           // xor eax, eax
         jpatch8(hStore1);
         jpatch8(hStore2);                      // L_store:
-        if (isMod) jStEdx(destSlot); else jStEax(destSlot);
+        if (isMod) jStoreEdx(destSlot); else jStoreEax(destSlot);
+    }
+
+    // Signed x / 100 and x % 100 without the very slow idiv instruction.
+    // This mirrors gcc -O2 -fwrapv for a positive constant divisor:
+    // q = (((int64)x * 1374389535) >> 37) - (x >> 31), r = x - q * 100.
+    // Dividend is loaded from srcSlot; quotient/remainder is stored to destSlot.
+    void jDivModI100(int destSlot, int srcSlot, bool isMod) {
+        jLoadEax(srcSlot);                      // eax = x
+        jb(0x89); jb(0xC2);                     // mov edx, eax
+        jb(0x48); jb(0x98);                     // cdqe
+        jb(0x48); jb(0x69); jb(0xC0); j32(1374389535); // imul rax, rax, magic
+        jb(0x48); jb(0xC1); jb(0xF8); jb(37);   // sar rax, 37
+        jb(0x89); jb(0xD1);                     // mov ecx, edx
+        jb(0xC1); jb(0xF9); jb(31);             // sar ecx, 31
+        jb(0x29); jb(0xC8);                     // sub eax, ecx
+        if (!isMod) {
+            jStoreEax(destSlot);
+            return;
+        }
+        jb(0x69); jb(0xC0); j32(100);           // imul eax, eax, 100
+        jb(0x29); jb(0xC2);                     // sub edx, eax
+        jStoreEdx(destSlot);
     }
 
     void jEmitCallC(uint64_t fnAddr) {
@@ -2815,9 +2926,25 @@ private:
     void jEmitBudgetCheck() {
         jb(0x49); jb(0xFF); jb(0xCD);          // dec r13
         jb(0x79); size_t hOk = jhole8();       // jns L_ok
+        // checkTramp is a C call; it clobbers the caller-saved pinned registers
+        // (rsi/rdi/r8/r9/r10). Save/restore all pinned slots across it. (6
+        // pushes keep rsp 16-aligned.)
+        for (int i = 0; i < kRegSlots; ++i) jPushPreg(i);
         jEmitCallC(reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&FastEvaluator::jitCheckTramp)));
+        for (int i = kRegSlots - 1; i >= 0; --i) jPopPreg(i);
         jb(0x49); jb(0xC7); jb(0xC5); j32(static_cast<int32_t>(kJitRecheckPeriod)); // mov r13, RESET
         jpatch8(hOk);
+    }
+
+    // Sync the register-pinned slots of curFunc to/from frame memory. Used
+    // around the FOLD trampoline, which reads and writes the frame directly.
+    void jSyncRegsToMem(int frameSize) {
+        int lim = min(kRegSlots, frameSize);
+        for (int i = 0; i < lim; ++i) jSyncPregToMem(i);
+    }
+    void jSyncRegsFromMem(int frameSize) {
+        int lim = min(kRegSlots, frameSize);
+        for (int i = 0; i < lim; ++i) jSyncPregFromMem(i);
     }
 
     void jEmitInsn(int curFunc, const Insn &in) {
@@ -2826,63 +2953,65 @@ private:
         int b = in.b;
         int32_t c = in.c;
         switch (in.op) {
-            case VM_LI: jb(0xC7); jb(0x83); j32(4 * a); j32(c); return;         // mov dword [rbx+4a], imm
-            case VM_MOV: jLdEax(b); jStEax(a); return;
-            case VM_GLD: jLdGlobEax(c); jStEax(a); return;
-            case VM_GST: jLdEax(b); jStGlobEax(c); return;
-            case VM_ADD: jLdEax(b); jb(0x03); jb(0x83); j32(4 * c); jStEax(a); return; // add eax,[rbx+4c]
-            case VM_SUB: jLdEax(b); jb(0x2B); jb(0x83); j32(4 * c); jStEax(a); return; // sub eax,[rbx+4c]
-            case VM_MUL: jLdEax(b); jb(0x0F); jb(0xAF); jb(0x83); j32(4 * c); jStEax(a); return; // imul eax,[rbx+4c]
-            case VM_DIV: jLdEax(b); jLdEcx(c); jDivSeq(a, false); return;
-            case VM_MOD: jLdEax(b); jLdEcx(c); jDivSeq(a, true); return;
+            case VM_LI: jLiSlot(a, c); return;
+            case VM_MOV: jLoadEax(b); jStoreEax(a); return;
+            case VM_GLD: jLdGlobEax(c); jStoreEax(a); return;
+            case VM_GST: jLoadEax(b); jStGlobEax(c); return;
+            case VM_ADD: jLoadEax(b); jAluEax(0x03, c); jStoreEax(a); return;
+            case VM_SUB: jLoadEax(b); jAluEax(0x2B, c); jStoreEax(a); return;
+            case VM_MUL: jLoadEax(b); jImulEax(c); jStoreEax(a); return;
+            case VM_DIV: jLoadEax(b); jLoadEcx(c); jDivSeq(a, false); return;
+            case VM_MOD: jLoadEax(b); jLoadEcx(c); jDivSeq(a, true); return;
             case VM_SLT: case VM_SGT: case VM_SLE: case VM_SGE: case VM_SEQ: case VM_SNE: {
                 static const int m[] = {OPC_LT, OPC_GT, OPC_LE, OPC_GE, OPC_EQ, OPC_NE};
-                jLdEax(b); jb(0x3B); jb(0x83); j32(4 * c);   // cmp eax,[rbx+4c]
+                jLoadEax(b); jAluEax(0x3B, c);
                 jSetccMovzx(m[in.op - VM_SLT], a);
                 return;
             }
-            case VM_ADDI: jLdEax(b); jb(0x05); j32(c); jStEax(a); return;       // add eax, imm
-            case VM_MULI: jb(0x69); jb(0x83); j32(4 * b); j32(c); jStEax(a); return; // imul eax,[rbx+4b],imm
+            case VM_ADDI: jLoadEax(b); jb(0x05); j32(c); jStoreEax(a); return;  // add eax, imm
+            case VM_MULI: jImulEaxImm(b, c); jStoreEax(a); return;
             case VM_DIVI:
-                if (c == 0) { jb(0xC7); jb(0x83); j32(4 * a); j32(0); return; }
-                jLdEax(b); jb(0xB9); j32(c); jDivSeq(a, false); return;         // mov ecx, imm
+                if (c == 0) { jLiSlot(a, 0); return; }
+                if (c == 100) { jDivModI100(a, b, false); return; }
+                jLoadEax(b); jb(0xB9); j32(c); jDivSeq(a, false); return;       // mov ecx, imm
             case VM_MODI:
-                if (c == 0) { jb(0xC7); jb(0x83); j32(4 * a); j32(0); return; }
-                jLdEax(b); jb(0xB9); j32(c); jDivSeq(a, true); return;
-            case VM_RSUBI: jb(0xB8); j32(c); jb(0x2B); jb(0x83); j32(4 * b); jStEax(a); return; // mov eax,imm; sub eax,[rbx+4b]
-            case VM_RDIVI: jb(0xB8); j32(c); jLdEcx(b); jDivSeq(a, false); return;
-            case VM_RMODI: jb(0xB8); j32(c); jLdEcx(b); jDivSeq(a, true); return;
+                if (c == 0) { jLiSlot(a, 0); return; }
+                if (c == 100) { jDivModI100(a, b, true); return; }
+                jLoadEax(b); jb(0xB9); j32(c); jDivSeq(a, true); return;
+            case VM_RSUBI: jb(0xB8); j32(c); jAluEax(0x2B, b); jStoreEax(a); return; // mov eax,imm; sub eax,slot b
+            case VM_RDIVI: jb(0xB8); j32(c); jLoadEcx(b); jDivSeq(a, false); return;
+            case VM_RMODI: jb(0xB8); j32(c); jLoadEcx(b); jDivSeq(a, true); return;
             case VM_SLTI: case VM_SGTI: case VM_SLEI: case VM_SGEI: case VM_SEQI: case VM_SNEI: {
                 static const int m[] = {OPC_LT, OPC_GT, OPC_LE, OPC_GE, OPC_EQ, OPC_NE};
-                jLdEax(b); jb(0x3D); j32(c);                 // cmp eax, imm
+                jLoadEax(b); jb(0x3D); j32(c);               // cmp eax, imm
                 jSetccMovzx(m[in.op - VM_SLTI], a);
                 return;
             }
-            case VM_NEG: jLdEax(b); jb(0xF7); jb(0xD8); jStEax(a); return;      // neg eax
-            case VM_SNEZ: jLdEax(b); jb(0x85); jb(0xC0); jSetccMovzx(OPC_NE, a); return;
-            case VM_SEQZ: jLdEax(b); jb(0x85); jb(0xC0); jSetccMovzx(OPC_EQ, a); return;
+            case VM_NEG: jLoadEax(b); jb(0xF7); jb(0xD8); jStoreEax(a); return; // neg eax
+            case VM_SNEZ: jLoadEax(b); jb(0x85); jb(0xC0); jSetccMovzx(OPC_NE, a); return;
+            case VM_SEQZ: jLoadEax(b); jb(0x85); jb(0xC0); jSetccMovzx(OPC_EQ, a); return;
             case VM_JMP:
                 jEmitBudgetCheck();
                 jb(0xE9); { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
             case VM_JZ:
-                jLdEax(b); jb(0x85); jb(0xC0);               // test eax,eax
+                jLoadEax(b); jb(0x85); jb(0xC0);
                 jb(0x0F); jb(0x84); { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
             case VM_JNZ:
-                jLdEax(b); jb(0x85); jb(0xC0);
+                jLoadEax(b); jb(0x85); jb(0xC0);
                 jb(0x0F); jb(0x85); { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
             case VM_BLT_RR: case VM_BLE_RR: case VM_BGT_RR: case VM_BGE_RR: case VM_BEQ_RR: case VM_BNE_RR: {
                 static const int m[] = {OPC_LT, OPC_LE, OPC_GT, OPC_GE, OPC_EQ, OPC_NE};
-                jLdEax(a); jb(0x3B); jb(0x83); j32(4 * b);   // cmp eax,[rbx+4b]
+                jLoadEax(a); jAluEax(0x3B, b);
                 jb(0x0F); jb(jJcc(m[in.op - VM_BLT_RR]));
                 { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
             }
             case VM_BLT_RI: case VM_BLE_RI: case VM_BGT_RI: case VM_BGE_RI: case VM_BEQ_RI: case VM_BNE_RI: {
                 static const int m[] = {OPC_LT, OPC_LE, OPC_GT, OPC_GE, OPC_EQ, OPC_NE};
-                jLdEax(a); jb(0x3D); j32(b);                 // cmp eax, imm(b)
+                jLoadEax(a); jb(0x3D); j32(b);               // cmp eax, imm(b)
                 jb(0x0F); jb(jJcc(m[in.op - VM_BLT_RI]));
                 { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
@@ -2891,31 +3020,44 @@ private:
                 int callee = static_cast<int>(c);
                 int np = vmFuncs[callee].nparams;
                 int calleeFrame = vmFuncs[callee].frameSize;
-                for (int i = 0; i < np; ++i) { jLdEax(b + i); jStEax(cf2 + i); }
+                // Args go to the callee frame in memory (callee entry loads them
+                // into its own pinned registers).
+                for (int i = 0; i < np; ++i) {
+                    jLoadEax(b + i);
+                    jb(0x89); jb(0x83); j32(4 * (cf2 + i));      // mov [rbx+off], eax
+                }
+                for (int i = 0; i < kRegSlots; ++i) jPushPreg(i);   // save caller's pinned regs
                 jb(0x49); jb(0xFF); jb(0xC7);                        // inc r15
                 jb(0x49); jb(0x81); jb(0xFF); j32(kJitMaxNativeDepth); // cmp r15, MAX
-                jb(0x76); size_t hd = jhole8();                      // jbe L_ok_depth
+                jb(0x76); size_t hd = jhole8();
                 jEmitAbort();
                 jpatch8(hd);
                 jb(0x48); jb(0x8D); jb(0x83); j32(4 * (cf2 + calleeFrame)); // lea rax,[rbx+off]
                 jb(0x4C); jb(0x39); jb(0xF0);                        // cmp rax, r14
-                jb(0x76); size_t hs = jhole8();                      // jbe L_ok_stack
+                jb(0x76); size_t hs = jhole8();
                 jEmitAbort();
                 jpatch8(hs);
                 jEmitBudgetCheck();
                 jb(0x48); jb(0x81); jb(0xC3); j32(4 * cf2);          // add rbx, 4*cf2
                 jb(0xE8); { size_t h = jhole32(); jitCallFix.push_back({h, callee, -1}); }
                 jb(0x48); jb(0x81); jb(0xEB); j32(4 * cf2);          // sub rbx, 4*cf2
+                for (int i = kRegSlots - 1; i >= 0; --i) jPopPreg(i); // restore caller's regs
                 jb(0x49); jb(0xFF); jb(0xCF);                        // dec r15
-                jStEax(a);
+                jStoreEax(a);                                        // result (eax survives pops)
                 return;
             }
             case VM_TCALL: {
                 int callee = static_cast<int>(c);
                 int np = vmFuncs[callee].nparams;
                 int calleeFrame = vmFuncs[callee].frameSize;
-                for (int i = 0; i < np; ++i) { jLdEax(b + i); jStEax(i); }
-                jb(0x48); jb(0x8D); jb(0x83); j32(4 * calleeFrame);  // lea rax,[rbx+4*calleeFrame]
+                // Same frame: write args to memory slots 0..np-1 so the callee
+                // entry reloads them. Sources (temps) are high slots, dsts low,
+                // no overlap.
+                for (int i = 0; i < np; ++i) {
+                    jLoadEax(b + i);
+                    jb(0x89); jb(0x83); j32(4 * i);              // mov [rbx+4i], eax
+                }
+                jb(0x48); jb(0x8D); jb(0x83); j32(4 * calleeFrame); // lea rax,[rbx+4*calleeFrame]
                 jb(0x4C); jb(0x39); jb(0xF0);                        // cmp rax, r14
                 jb(0x76); size_t hs = jhole8();
                 jEmitAbort();
@@ -2926,7 +3068,7 @@ private:
                 return;
             }
             case VM_RET:
-                jLdEax(b);
+                jLoadEax(b);
                 jb(0x48); jb(0x83); jb(0xC4); jb(0x08);              // add rsp, 8
                 jb(0xC3);                                            // ret
                 return;
@@ -2936,12 +3078,15 @@ private:
                 jb(0xC3);
                 return;
             case VM_FOLD:
+                jSyncRegsToMem(cf2);                                        // flush pinned regs to frame
                 jb(0x48); jb(0xBF); j64(reinterpret_cast<uint64_t>(this));  // mov rdi, this
                 jb(0xBE); j32(b);                                           // mov esi, id
                 jb(0x48); jb(0x89); jb(0xDA);                               // mov rdx, rbx
                 jb(0x48); jb(0xB8); j64(reinterpret_cast<uint64_t>(reinterpret_cast<void *>(&FastEvaluator::jitFoldTramp)));
-                jb(0xFF); jb(0xD0);                                         // call rax
-                jb(0x85); jb(0xC0);                                         // test eax, eax
+                jb(0xFF); jb(0xD0);                                         // call rax (may modify frame)
+                jb(0x88); jb(0xC1);                                         // mov cl, al (save fold result)
+                jSyncRegsFromMem(cf2);                                      // reload pinned regs from frame
+                jb(0x84); jb(0xC9);                                         // test cl, cl
                 jb(0x0F); jb(0x85); { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
             default:
@@ -2951,22 +3096,28 @@ private:
 
     void jEmitThunk() {
         jitThunkOffset = jitCode.size();
+        // Save all callee-saved registers the JIT clobbers: rbp is pinned slot
+        // 0, plus rbx/r12/r13/r14/r15. rsi/rdi/r8/r9/r10 are caller-saved.
+        jb(0x55);                          // push rbp
         jb(0x53);                          // push rbx
         jb(0x41); jb(0x54);                // push r12
         jb(0x41); jb(0x55);                // push r13
         jb(0x41); jb(0x56);                // push r14
         jb(0x41); jb(0x57);                // push r15
+        jb(0x48); jb(0x83); jb(0xEC); jb(0x08); // sub rsp, 8 (align: 6 pushes -> +8)
         jb(0x48); jb(0x89); jb(0xF3);      // mov rbx, rsi
         jb(0x49); jb(0x89); jb(0xD4);      // mov r12, rdx
         jb(0x49); jb(0x89); jb(0xCD);      // mov r13, rcx
         jb(0x4D); jb(0x89); jb(0xC6);      // mov r14, r8
         jb(0x45); jb(0x31); jb(0xFF);      // xor r15d, r15d
         jb(0xFF); jb(0xD7);                // call rdi
+        jb(0x48); jb(0x83); jb(0xC4); jb(0x08); // add rsp, 8
         jb(0x41); jb(0x5F);                // pop r15
         jb(0x41); jb(0x5E);                // pop r14
         jb(0x41); jb(0x5D);                // pop r13
         jb(0x41); jb(0x5C);                // pop r12
         jb(0x5B);                          // pop rbx
+        jb(0x5D);                          // pop rbp
         jb(0xC3);                          // ret
     }
 
@@ -2996,7 +3147,12 @@ private:
             jEmitThunk();
             for (size_t f = 0; f < n; ++f) {
                 jitFuncEntry[f] = jitCode.size();
-                jb(0x48); jb(0x83); jb(0xEC); jb(0x08);   // sub rsp, 8 (prologue)
+                jb(0x48); jb(0x83); jb(0xEC); jb(0x08);   // sub rsp, 8 (prologue, keeps rsp 16-aligned)
+                int np = vmFuncs[f].nparams;
+                int fsz = vmFuncs[f].frameSize;
+                int regLim = min(kRegSlots, fsz);
+                for (int i = 0; i < min(kRegSlots, np); ++i) jSyncPregFromMem(i); // load params
+                for (int i = np; i < regLim; ++i) jZeroPreg(i);                   // zero local regs
                 const auto &code = vmFuncs[f].code;
                 jitInsnAddr[f].resize(code.size());
                 for (size_t i = 0; i < code.size(); ++i) {
