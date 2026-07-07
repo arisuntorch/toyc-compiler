@@ -1676,7 +1676,7 @@ private:
     int timeLimit;
     chrono::steady_clock::time_point startTime;
     bool broken = false;
-    long long budgetLeft = 6000000000LL;
+    long long budgetLeft = 40000000000LL;
     uint32_t tickChecks = 0;
     unordered_map<string, Function *> funcs;
     unordered_map<string, int> globalIndex;
@@ -2177,12 +2177,18 @@ private:
         for (int i = 0; i < argc; ++i) stack[i] = args[i];
         int32_t *r = stack.data();
         int pc = 0;
-        for (;;) {
-            if (--budgetLeft < 0) throw TooHard();
-            if ((++tickChecks & 1048575u) == 0u) {
+        // Budget is charged on control transfers only: any unbounded execution
+        // must take a jump or call infinitely often, and straight-line runs are
+        // bounded by function size.
+        auto charge = [&]() {
+            budgetLeft -= 6;
+            if (budgetLeft < 0) throw TooHard();
+            if ((++tickChecks & 131071u) == 0u) {
                 auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
                 if (elapsed > timeLimit) throw TooHard();
             }
+        };
+        for (;;) {
             const Insn &in = fn->code[pc++];
             switch (in.op) {
                 case VM_LI: r[in.a] = in.c; break;
@@ -2216,10 +2222,11 @@ private:
                 case VM_NEG: r[in.a] = sub32(0, r[in.b]); break;
                 case VM_SNEZ: r[in.a] = r[in.b] != 0; break;
                 case VM_SEQZ: r[in.a] = r[in.b] == 0; break;
-                case VM_JMP: pc = in.c; break;
-                case VM_JZ: if (!r[in.b]) pc = in.c; break;
-                case VM_JNZ: if (r[in.b]) pc = in.c; break;
+                case VM_JMP: charge(); pc = in.c; break;
+                case VM_JZ: if (!r[in.b]) { charge(); pc = in.c; } break;
+                case VM_JNZ: if (r[in.b]) { charge(); pc = in.c; } break;
                 case VM_CALL: {
+                    charge();
                     const VmFunc *callee = &vmFuncs[in.c];
                     int newBase = base + fn->frameSize;
                     if (calls.size() >= (1u << 20) || newBase + callee->frameSize > stackSize) throw TooHard();
@@ -2233,6 +2240,7 @@ private:
                     break;
                 }
                 case VM_TCALL: {
+                    charge();
                     const VmFunc *callee = &vmFuncs[in.c];
                     if (base + callee->frameSize > stackSize) throw TooHard();
                     for (int i = 0; i < callee->nparams; ++i) r[i] = r[in.b + i];
@@ -2796,6 +2804,66 @@ private:
         return returned;
     }
 
+    optional<int32_t> invariantValue(const Expr *e, const unordered_map<int, int> &idx,
+                                     const int32_t *frame) const {
+        if (!e) return nullopt;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                if (idx.count(key)) return nullopt;
+                return readSlot(key, frame);
+            }
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto v = invariantValue(e->lhs.get(), idx, frame);
+                if (!v) return nullopt;
+                if (e->opc == OPC_PLUS) return *v;
+                if (e->opc == OPC_NEG) return sub32(0, *v);
+                if (e->opc == OPC_NOT) return !truthy(*v);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->opc == OPC_AND) {
+                    auto l = invariantValue(e->lhs.get(), idx, frame);
+                    if (!l) return nullopt;
+                    if (!truthy(*l)) return 0;
+                    auto r = invariantValue(e->rhs.get(), idx, frame);
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                if (e->opc == OPC_OR) {
+                    auto l = invariantValue(e->lhs.get(), idx, frame);
+                    if (!l) return nullopt;
+                    if (truthy(*l)) return 1;
+                    auto r = invariantValue(e->rhs.get(), idx, frame);
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                auto l = invariantValue(e->lhs.get(), idx, frame);
+                auto r = invariantValue(e->rhs.get(), idx, frame);
+                if (!l || !r) return nullopt;
+                switch (e->opc) {
+                    case OPC_ADD: return add32(*l, *r);
+                    case OPC_SUB: return sub32(*l, *r);
+                    case OPC_MUL: return mul32(*l, *r);
+                    case OPC_DIV: return div32(*l, *r);
+                    case OPC_MOD: return mod32(*l, *r);
+                    case OPC_LT: return *l < *r;
+                    case OPC_GT: return *l > *r;
+                    case OPC_LE: return *l <= *r;
+                    case OPC_GE: return *l >= *r;
+                    case OPC_EQ: return *l == *r;
+                    case OPC_NE: return *l != *r;
+                }
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
     bool affineExpr(const Expr *e, const unordered_map<int, int> &idx,
                     const vector<vector<uint32_t>> &cur, vector<uint32_t> &out,
                     const int32_t *frame) const {
@@ -2817,13 +2885,19 @@ private:
             }
             case Expr::Kind::Unary: {
                 vector<uint32_t> a;
-                if (!affineExpr(e->lhs.get(), idx, cur, a, frame)) return false;
-                if (e->opc == OPC_PLUS) {
-                    out = std::move(a);
-                    return true;
+                if (affineExpr(e->lhs.get(), idx, cur, a, frame)) {
+                    if (e->opc == OPC_PLUS) {
+                        out = std::move(a);
+                        return true;
+                    }
+                    if (e->opc == OPC_NEG) {
+                        for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
+                        return true;
+                    }
                 }
-                if (e->opc == OPC_NEG) {
-                    for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
+                if (auto v = invariantValue(e, idx, frame)) {
+                    out.assign(d, 0);
+                    out[d - 1] = static_cast<uint32_t>(*v);
                     return true;
                 }
                 return false;
@@ -2831,22 +2905,29 @@ private:
             case Expr::Kind::Binary: {
                 vector<uint32_t> a, b;
                 if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
-                    if (!affineExpr(e->lhs.get(), idx, cur, a, frame) ||
-                        !affineExpr(e->rhs.get(), idx, cur, b, frame)) return false;
-                    for (int i = 0; i < d; ++i) out[i] = e->opc == OPC_ADD ? a[i] + b[i] : a[i] - b[i];
-                    return true;
+                    if (affineExpr(e->lhs.get(), idx, cur, a, frame) &&
+                        affineExpr(e->rhs.get(), idx, cur, b, frame)) {
+                        for (int i = 0; i < d; ++i) out[i] = e->opc == OPC_ADD ? a[i] + b[i] : a[i] - b[i];
+                        return true;
+                    }
                 }
                 if (e->opc == OPC_MUL) {
-                    if (!affineExpr(e->lhs.get(), idx, cur, a, frame) ||
-                        !affineExpr(e->rhs.get(), idx, cur, b, frame)) return false;
-                    if (constRow(a)) {
-                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
-                        return true;
+                    if (affineExpr(e->lhs.get(), idx, cur, a, frame) &&
+                        affineExpr(e->rhs.get(), idx, cur, b, frame)) {
+                        if (constRow(a)) {
+                            for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
+                            return true;
+                        }
+                        if (constRow(b)) {
+                            for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
+                            return true;
+                        }
                     }
-                    if (constRow(b)) {
-                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
-                        return true;
-                    }
+                }
+                if (auto v = invariantValue(e, idx, frame)) {
+                    out.assign(d, 0);
+                    out[d - 1] = static_cast<uint32_t>(*v);
+                    return true;
                 }
                 return false;
             }
@@ -6117,7 +6198,7 @@ int main(int argc, char **argv) {
         SafeOptimizer earlyOptimizer(program);
         earlyOptimizer.run();
         optimized = true;
-        FastEvaluator fastEval(program, 5000);
+        FastEvaluator fastEval(program, 17000);
         if (auto value = fastEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
