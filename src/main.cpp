@@ -1641,9 +1641,10 @@ private:
     };
 
     static constexpr int kGlobalBit = 1 << 28;
-    enum { CMP_LT, CMP_LE, CMP_GT, CMP_GE };
+    enum { CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_EQ, CMP_NE };
     enum FoldRes { FoldStructFail, FoldValueFail, FoldOk };
-    enum : uint8_t { NO_PERIODIC = 1, NO_AFFINE = 2, NO_NESTED = 4 };
+    enum : uint8_t { NO_PERIODIC = 1, NO_GUARDED = 2, NO_AFFINE = 4, NO_NESTED = 8 };
+    enum class TransformFlow { Fail, Normal, Continue, Break };
 
     struct AffineLoopS {
         vector<int> vars;
@@ -1658,6 +1659,11 @@ private:
         uint8_t structFlags = 0;
         uint32_t failCount = 0;
         bool everFolded = false;
+    };
+    struct Guard {
+        int cmp = CMP_LT;
+        int32_t bound = 0;
+        bool truth = false;
     };
     struct PowCacheEntry {
         vector<vector<uint32_t>> mat;
@@ -2311,6 +2317,48 @@ private:
         return 0;
     }
 
+    static int invertCmpCode(int cmp) {
+        switch (cmp) {
+            case CMP_LT: return CMP_GE;
+            case CMP_LE: return CMP_GT;
+            case CMP_GT: return CMP_LE;
+            case CMP_GE: return CMP_LT;
+            case CMP_EQ: return CMP_NE;
+            case CMP_NE: return CMP_EQ;
+        }
+        return CMP_NE;
+    }
+
+    static uint64_t distanceToEqual(int32_t iv, int32_t bound, int32_t step) {
+        constexpr uint64_t INF = numeric_limits<uint64_t>::max() / 4;
+        if (iv == bound) return 0;
+        if (step == 0) return INF;
+        int64_t delta = static_cast<int64_t>(bound) - static_cast<int64_t>(iv);
+        int64_t s = step;
+        if ((delta > 0 && s <= 0) || (delta < 0 && s >= 0)) return INF;
+        int64_t ad = delta < 0 ? -delta : delta;
+        int64_t as = s < 0 ? -s : s;
+        if (ad % as != 0) return INF;
+        return static_cast<uint64_t>(ad / as);
+    }
+
+    static uint64_t guardSameTruthSpan(const Guard &g, int32_t step, int32_t iv) {
+        constexpr uint64_t INF = numeric_limits<uint64_t>::max() / 4;
+        if (g.cmp == CMP_EQ) {
+            if (g.truth) return step == 0 ? INF : 1;
+            uint64_t d = distanceToEqual(iv, g.bound, step);
+            return d == 0 ? INF : d;
+        }
+        if (g.cmp == CMP_NE) {
+            if (!g.truth) return step == 0 ? INF : 1;
+            uint64_t d = distanceToEqual(iv, g.bound, step);
+            return d == 0 ? INF : d;
+        }
+        int cmp = g.truth ? g.cmp : invertCmpCode(g.cmp);
+        uint64_t n = countIterations(cmp, step, iv, g.bound);
+        return n == 0 ? INF : n;
+    }
+
     static vector<uint32_t> matVec(const vector<vector<uint32_t>> &m, const vector<uint32_t> &v) {
         int n = static_cast<int>(v.size());
         vector<uint32_t> out(n, 0);
@@ -2613,6 +2661,55 @@ private:
         return false;
     }
 
+    bool affinePureStmt(const Stmt *s, unordered_map<int, vector<uint32_t>> &aliases,
+                        int d, vector<uint32_t> &out, bool &returned) const {
+        if (!s || returned) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!affinePureStmt(child.get(), aliases, d, out, returned)) return false;
+                    if (returned) return true;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return false;
+                vector<uint32_t> row;
+                if (!affineExprAliases(s->decl->init.get(), aliases, d, row)) return false;
+                aliases[s->decl->fastSlot] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                int key = assignSlotKey(s);
+                if (key & kGlobalBit) return false;
+                vector<uint32_t> row;
+                if (!affineExprAliases(s->expr.get(), aliases, d, row)) return false;
+                aliases[key] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::Return:
+                if (!s->expr) out.assign(d, 0);
+                else if (!affineExprAliases(s->expr.get(), aliases, d, out)) return false;
+                returned = true;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool affinePureFunction(const Function *f, const vector<vector<uint32_t>> &args,
+                            int d, vector<uint32_t> &out) const {
+        if (!f || f->returnsVoid || args.size() != f->params.size()) return false;
+        unordered_map<int, vector<uint32_t>> aliases;
+        for (size_t i = 0; i < args.size(); ++i) aliases[static_cast<int>(i)] = args[i];
+        bool returned = false;
+        if (!affinePureStmt(f->body.get(), aliases, d, out, returned)) return false;
+        return returned;
+    }
+
     bool affineExpr(const Expr *e, const unordered_map<int, int> &idx,
                     const vector<vector<uint32_t>> &cur, vector<uint32_t> &out,
                     const int32_t *frame) const {
@@ -2670,15 +2767,15 @@ private:
             case Expr::Kind::Call: {
                 auto found = funcs.find(e->name);
                 if (found == funcs.end()) return false;
-                const Expr *ret = pureReturnExpr(found->second);
-                if (!ret || e->args.size() != found->second->params.size()) return false;
-                unordered_map<int, vector<uint32_t>> aliases;
+                if (e->args.size() != found->second->params.size()) return false;
+                vector<vector<uint32_t>> args;
+                args.reserve(e->args.size());
                 for (size_t i = 0; i < e->args.size(); ++i) {
                     vector<uint32_t> row;
                     if (!affineExpr(e->args[i].get(), idx, cur, row, frame)) return false;
-                    aliases[static_cast<int>(i)] = std::move(row);
+                    args.push_back(std::move(row));
                 }
-                return affineExprAliases(ret, aliases, d, out);
+                return affinePureFunction(found->second, args, d, out);
             }
         }
         return false;
@@ -2892,6 +2989,7 @@ private:
     void collectAssignedKeys(const Stmt *s, unordered_set<int> &out) const {
         if (!s) return;
         if (s->kind == Stmt::Kind::Assign) out.insert(assignSlotKey(s));
+        if (s->kind == Stmt::Kind::DeclStmt && s->decl) out.insert(s->decl->fastSlot);
         for (auto &child : s->stmts) collectAssignedKeys(child.get(), out);
         collectAssignedKeys(s->thenStmt.get(), out);
         collectAssignedKeys(s->elseStmt.get(), out);
@@ -2929,6 +3027,8 @@ private:
                 return true;
             case Stmt::Kind::Empty:
             case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::Continue:
                 return true;
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
@@ -3020,38 +3120,309 @@ private:
         return nullopt;
     }
 
-    bool buildPeriodicTransformStmt(const Stmt *s, const unordered_map<int, int> &idx,
-                                    const vector<uint32_t> &base, vector<vector<uint32_t>> &cur,
-                                    const int32_t *frame) const {
+    TransformFlow buildPeriodicTransformStmt(const Stmt *s, const unordered_map<int, int> &idx,
+                                             const vector<uint32_t> &base, vector<vector<uint32_t>> &cur,
+                                             const int32_t *frame) const {
+        if (!s) return TransformFlow::Normal;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    TransformFlow f = buildPeriodicTransformStmt(child.get(), idx, base, cur, frame);
+                    if (f != TransformFlow::Normal) return f;
+                }
+                return TransformFlow::Normal;
+            case Stmt::Kind::Empty:
+                return TransformFlow::Normal;
+            case Stmt::Kind::ExprStmt:
+                return exprHasCallS(s->expr.get()) ? TransformFlow::Fail : TransformFlow::Normal;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return TransformFlow::Fail;
+                auto it = idx.find(s->decl->fastSlot);
+                if (it == idx.end()) return TransformFlow::Fail;
+                vector<uint32_t> row;
+                if (!affineExpr(s->decl->init.get(), idx, cur, row, frame)) return TransformFlow::Fail;
+                cur[it->second] = std::move(row);
+                return TransformFlow::Normal;
+            }
+            case Stmt::Kind::Assign: {
+                auto it = idx.find(assignSlotKey(s));
+                if (it == idx.end()) return TransformFlow::Fail;
+                vector<uint32_t> row;
+                if (!affineExpr(s->expr.get(), idx, cur, row, frame)) return TransformFlow::Fail;
+                cur[it->second] = std::move(row);
+                return TransformFlow::Normal;
+            }
+            case Stmt::Kind::If: {
+                auto cond = evalExprWithRows(s->expr.get(), idx, cur, base, frame);
+                if (!cond) return TransformFlow::Fail;
+                return truthy(*cond)
+                    ? buildPeriodicTransformStmt(s->thenStmt.get(), idx, base, cur, frame)
+                    : buildPeriodicTransformStmt(s->elseStmt.get(), idx, base, cur, frame);
+            }
+            case Stmt::Kind::Continue:
+                return TransformFlow::Continue;
+            case Stmt::Kind::Break:
+                return TransformFlow::Break;
+            default:
+                return TransformFlow::Fail;
+        }
+    }
+
+    bool collectGuardedAffineNames(const Stmt *s, vector<int> &vars, unordered_set<int> &seen,
+                                   unordered_set<int> &transient, bool &sawControl) const {
         if (!s) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
-                    if (!buildPeriodicTransformStmt(child.get(), idx, base, cur, frame)) return false;
+                    if (!collectGuardedAffineNames(child.get(), vars, seen, transient, sawControl)) return false;
                 }
                 return true;
             case Stmt::Kind::Empty:
                 return true;
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
-            case Stmt::Kind::Assign: {
-                auto it = idx.find(assignSlotKey(s));
-                if (it == idx.end()) return false;
-                vector<uint32_t> row;
-                if (!affineExpr(s->expr.get(), idx, cur, row, frame)) return false;
-                cur[it->second] = std::move(row);
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return false;
+                int key = s->decl->fastSlot;
+                if (key < 0 || seen.count(key)) return false;
+                seen.insert(key);
+                vars.push_back(key);
+                transient.insert(key);
                 return true;
             }
-            case Stmt::Kind::If: {
-                auto cond = evalExprWithRows(s->expr.get(), idx, cur, base, frame);
-                if (!cond) return false;
-                return truthy(*cond)
-                    ? buildPeriodicTransformStmt(s->thenStmt.get(), idx, base, cur, frame)
-                    : buildPeriodicTransformStmt(s->elseStmt.get(), idx, base, cur, frame);
+            case Stmt::Kind::Assign: {
+                int key = assignSlotKey(s);
+                if (!seen.count(key)) {
+                    seen.insert(key);
+                    vars.push_back(key);
+                }
+                return true;
             }
+            case Stmt::Kind::If:
+                sawControl = true;
+                return collectGuardedAffineNames(s->thenStmt.get(), vars, seen, transient, sawControl) &&
+                       collectGuardedAffineNames(s->elseStmt.get(), vars, seen, transient, sawControl);
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Break:
+                sawControl = true;
+                return true;
             default:
                 return false;
         }
+    }
+
+    static bool cmpHolds(int cmp, int32_t a, int32_t b) {
+        switch (cmp) {
+            case CMP_LT: return a < b;
+            case CMP_LE: return a <= b;
+            case CMP_GT: return a > b;
+            case CMP_GE: return a >= b;
+            case CMP_EQ: return a == b;
+            case CMP_NE: return a != b;
+        }
+        return false;
+    }
+
+    static bool cmpFromOpc(int opc, int &cmp) {
+        switch (opc) {
+            case OPC_LT: cmp = CMP_LT; return true;
+            case OPC_LE: cmp = CMP_LE; return true;
+            case OPC_GT: cmp = CMP_GT; return true;
+            case OPC_GE: cmp = CMP_GE; return true;
+            case OPC_EQ: cmp = CMP_EQ; return true;
+            case OPC_NE: cmp = CMP_NE; return true;
+        }
+        return false;
+    }
+
+    static int reverseCmpForNegatedLinear(int cmp) {
+        switch (cmp) {
+            case CMP_LT: return CMP_GT;
+            case CMP_LE: return CMP_GE;
+            case CMP_GT: return CMP_LT;
+            case CMP_GE: return CMP_LE;
+            case CMP_EQ: return CMP_EQ;
+            case CMP_NE: return CMP_NE;
+        }
+        return cmp;
+    }
+
+    bool guardFromCondition(const Expr *e, const unordered_map<int, int> &idx,
+                            const vector<vector<uint32_t>> &cur, const int32_t *frame,
+                            int indIdx, Guard &guard, bool &hasGuard) const {
+        hasGuard = false;
+        if (!e || e->kind != Expr::Kind::Binary) return false;
+        int cmp = CMP_LT;
+        if (!cmpFromOpc(e->opc, cmp)) return false;
+        vector<uint32_t> lhs, rhs;
+        if (!affineExpr(e->lhs.get(), idx, cur, lhs, frame) ||
+            !affineExpr(e->rhs.get(), idx, cur, rhs, frame)) return false;
+        int d = static_cast<int>(cur.size());
+        vector<uint32_t> diff(d, 0);
+        for (int i = 0; i < d; ++i) diff[i] = lhs[i] - rhs[i];
+        for (int i = 0; i + 1 < d; ++i) {
+            if (i == indIdx) continue;
+            if (diff[i] != 0) return false;
+        }
+        int32_t coeff = static_cast<int32_t>(diff[indIdx]);
+        int32_t constant = static_cast<int32_t>(diff[d - 1]);
+        if (coeff == 0) return true;
+        int64_t bound64 = 0;
+        if (coeff == 1) {
+            bound64 = -static_cast<int64_t>(constant);
+        } else if (coeff == -1) {
+            bound64 = static_cast<int64_t>(constant);
+            cmp = reverseCmpForNegatedLinear(cmp);
+        } else {
+            return false;
+        }
+        if (bound64 < numeric_limits<int32_t>::min() || bound64 > numeric_limits<int32_t>::max()) return false;
+        guard.cmp = cmp;
+        guard.bound = static_cast<int32_t>(bound64);
+        hasGuard = true;
+        return true;
+    }
+
+    TransformFlow buildGuardedTransformStmt(const Stmt *s, const unordered_map<int, int> &idx,
+                                            const vector<uint32_t> &base, vector<vector<uint32_t>> &cur,
+                                            const int32_t *frame, int indIdx,
+                                            vector<Guard> &guards) const {
+        if (!s) return TransformFlow::Normal;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    TransformFlow f = buildGuardedTransformStmt(child.get(), idx, base, cur, frame, indIdx, guards);
+                    if (f != TransformFlow::Normal) return f;
+                }
+                return TransformFlow::Normal;
+            case Stmt::Kind::Empty:
+                return TransformFlow::Normal;
+            case Stmt::Kind::ExprStmt:
+                return exprHasCallS(s->expr.get()) ? TransformFlow::Fail : TransformFlow::Normal;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return TransformFlow::Fail;
+                auto it = idx.find(s->decl->fastSlot);
+                if (it == idx.end()) return TransformFlow::Fail;
+                vector<uint32_t> row;
+                if (!affineExpr(s->decl->init.get(), idx, cur, row, frame)) return TransformFlow::Fail;
+                cur[it->second] = std::move(row);
+                return TransformFlow::Normal;
+            }
+            case Stmt::Kind::Assign: {
+                auto it = idx.find(assignSlotKey(s));
+                if (it == idx.end()) return TransformFlow::Fail;
+                vector<uint32_t> row;
+                if (!affineExpr(s->expr.get(), idx, cur, row, frame)) return TransformFlow::Fail;
+                cur[it->second] = std::move(row);
+                return TransformFlow::Normal;
+            }
+            case Stmt::Kind::If: {
+                auto cond = evalExprWithRows(s->expr.get(), idx, cur, base, frame);
+                if (!cond) return TransformFlow::Fail;
+                Guard g;
+                bool hasGuard = false;
+                if (!guardFromCondition(s->expr.get(), idx, cur, frame, indIdx, g, hasGuard)) return TransformFlow::Fail;
+                if (hasGuard) {
+                    g.truth = truthy(*cond);
+                    guards.push_back(g);
+                }
+                return truthy(*cond)
+                    ? buildGuardedTransformStmt(s->thenStmt.get(), idx, base, cur, frame, indIdx, guards)
+                    : buildGuardedTransformStmt(s->elseStmt.get(), idx, base, cur, frame, indIdx, guards);
+            }
+            case Stmt::Kind::Continue:
+                return TransformFlow::Continue;
+            case Stmt::Kind::Break:
+                return TransformFlow::Break;
+            default:
+                return TransformFlow::Fail;
+        }
+    }
+
+    FoldRes tryRunGuardedAffineLoop(const Stmt *s, int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+
+        vector<int> vars;
+        unordered_set<int> seen;
+        unordered_set<int> transient;
+        bool sawControl = false;
+        seen.insert(indKey);
+        vars.push_back(indKey);
+        if (!collectGuardedAffineNames(s->body.get(), vars, seen, transient, sawControl)) return FoldStructFail;
+        if (!sawControl) return FoldStructFail;
+
+        unordered_map<int, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+        int indIdx = idx[indKey];
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<uint32_t> boundRow;
+        if (!affineExpr(boundExpr, idx, idmat, boundRow, frame)) return FoldStructFail;
+        for (int i = 0; i < k; ++i) {
+            if (boundRow[i] != 0) return FoldValueFail;
+        }
+
+        vector<uint32_t> state(d, 0);
+        for (int i = 0; i < k; ++i) {
+            state[i] = transient.count(vars[i]) ? 0u : static_cast<uint32_t>(readSlot(vars[i], frame));
+        }
+        state[d - 1] = 1;
+        int32_t bound = static_cast<int32_t>(boundRow[d - 1]);
+
+        for (int segment = 0; segment < 128; ++segment) {
+            int32_t iv = static_cast<int32_t>(state[indIdx]);
+            if (!cmpHolds(cmp, iv, bound)) {
+                for (int i = 0; i < k; ++i) {
+                    if (!transient.count(vars[i])) writeSlot(vars[i], static_cast<int32_t>(state[i]), frame);
+                }
+                return FoldOk;
+            }
+
+            vector<vector<uint32_t>> cur = idmat;
+            vector<Guard> guards;
+            TransformFlow flow = buildGuardedTransformStmt(s->body.get(), idx, state, cur, frame, indIdx, guards);
+            if (flow == TransformFlow::Fail) return FoldValueFail;
+
+            if (flow == TransformFlow::Break) {
+                state = matVec(cur, state);
+                for (int i = 0; i < k; ++i) {
+                    if (!transient.count(vars[i])) writeSlot(vars[i], static_cast<int32_t>(state[i]), frame);
+                }
+                return FoldOk;
+            }
+
+            const auto &ir = cur[indIdx];
+            for (int j = 0; j < k; ++j) {
+                uint32_t want = j == indIdx ? 1u : 0u;
+                if (ir[j] != want) return FoldValueFail;
+            }
+            int32_t step = static_cast<int32_t>(ir[d - 1]);
+            if (step == 0) return FoldValueFail;
+            if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+            if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+            uint64_t niter = countIterations(cmp, step, iv, bound);
+            if (niter == 0) return FoldValueFail;
+            uint64_t span = niter;
+            for (const Guard &g : guards) {
+                span = min(span, guardSameTruthSpan(g, step, iv));
+            }
+            if (span == 0 || span > niter) span = niter;
+            state = matVec(cachedMatPow(s->fastLoopId, cur, span), state);
+            if (span == niter) {
+                for (int i = 0; i < k; ++i) {
+                    if (!transient.count(vars[i])) writeSlot(vars[i], static_cast<int32_t>(state[i]), frame);
+                }
+                return FoldOk;
+            }
+        }
+        return FoldValueFail;
     }
 
     FoldRes tryRunPeriodicAffineLoop(const Stmt *s, int32_t *frame) {
@@ -3084,7 +3455,8 @@ private:
         vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
         for (int i = 0; i < d; ++i) idmat[i][i] = 1;
         vector<vector<uint32_t>> first = idmat;
-        if (!buildPeriodicTransformStmt(s->body.get(), idx, state, first, frame)) return FoldValueFail;
+        TransformFlow firstFlow = buildPeriodicTransformStmt(s->body.get(), idx, state, first, frame);
+        if (firstFlow == TransformFlow::Fail || firstFlow == TransformFlow::Break) return FoldValueFail;
         int indIdx = idx[indKey];
         const auto &ir = first[indIdx];
         for (int j = 0; j < k; ++j) {
@@ -3124,7 +3496,8 @@ private:
         for (uint64_t i = 0; i < period; ++i) {
             tick(4);
             vector<vector<uint32_t>> mat = idmat;
-            if (!buildPeriodicTransformStmt(s->body.get(), idx, sample, mat, frame)) return FoldValueFail;
+            TransformFlow flow = buildPeriodicTransformStmt(s->body.get(), idx, sample, mat, frame);
+            if (flow == TransformFlow::Fail || flow == TransformFlow::Break) return FoldValueFail;
             const auto &row = mat[indIdx];
             for (int j = 0; j < k; ++j) {
                 uint32_t want = j == indIdx ? 1u : 0u;
@@ -3176,7 +3549,7 @@ private:
     bool tryFoldWhile(const Stmt *s, int32_t *frame) {
         if (s->fastLoopId < 0 || s->fastLoopId >= static_cast<int>(loopStats.size())) return false;
         LoopStat &st = loopStats[s->fastLoopId];
-        constexpr uint8_t allStruct = NO_PERIODIC | NO_AFFINE | NO_NESTED;
+        constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED;
         if ((st.structFlags & allStruct) == allStruct) return false;
         if (!st.everFolded && st.failCount >= 8) {
             ++st.failCount;
@@ -3191,6 +3564,14 @@ private:
                 return true;
             }
             if (r == FoldStructFail) st.structFlags |= NO_PERIODIC;
+        }
+        if (!(st.structFlags & NO_GUARDED)) {
+            FoldRes r = tryRunGuardedAffineLoop(s, frame);
+            if (r == FoldOk) {
+                st.everFolded = true;
+                return true;
+            }
+            if (r == FoldStructFail) st.structFlags |= NO_GUARDED;
         }
         if (!(st.structFlags & NO_AFFINE)) {
             AffineLoopS loop;
