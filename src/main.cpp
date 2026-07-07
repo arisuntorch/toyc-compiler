@@ -6653,6 +6653,112 @@ private:
         return n;
     }
 
+    struct CodegenMagicDiv {
+        int divisor;
+        int32_t magic;
+        int shift;
+        bool addDividend;
+        bool logicalShift;
+    };
+
+    static optional<CodegenMagicDiv> codegenMagicForDivisor(int divisor) {
+        switch (divisor) {
+            case 3: return CodegenMagicDiv{3, 1431655766, 32, false, true};
+            case 5: return CodegenMagicDiv{5, 1717986919, 33, false, false};
+            case 7: return CodegenMagicDiv{7, static_cast<int32_t>(2454267027u), 2, true, true};
+            case 10: return CodegenMagicDiv{10, 1717986919, 34, false, false};
+            case 11: return CodegenMagicDiv{11, 780903145, 33, false, false};
+            case 13: return CodegenMagicDiv{13, 1321528399, 34, false, false};
+            case 31: return CodegenMagicDiv{31, static_cast<int32_t>(2216757315u), 4, true, true};
+            case 100: return CodegenMagicDiv{100, 1374389535, 37, false, false};
+            default: return nullopt;
+        }
+    }
+
+    bool canStrengthReduceDivisor(long long divisor) const {
+        if (divisor <= 0 || divisor > INT32_MAX) return false;
+        if (isPowerOfTwo(divisor) && divisor <= 2048) return true;
+        return codegenMagicForDivisor(static_cast<int>(divisor)).has_value();
+    }
+
+    static bool regBlocked(const string &reg, initializer_list<string> blocked) {
+        for (const string &b : blocked) {
+            if (reg == b) return true;
+        }
+        return false;
+    }
+
+    string pickScratch(initializer_list<string> blocked, const vector<string> &preferred = {}) const {
+        for (const string &r : preferred) {
+            if (!regBlocked(r, blocked)) return r;
+        }
+        static const vector<string> regs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
+        for (const string &r : regs) {
+            if (!regBlocked(r, blocked)) return r;
+        }
+        return "t6";
+    }
+
+    void emitQuotientConst(const string &dst, const string &src, int divisor, const string &tmp) {
+        if (isPowerOfTwo(divisor)) {
+            if (divisor == 1) {
+                if (dst != src) emit("mv " + dst + ", " + src);
+                return;
+            }
+            int shift = log2Int(divisor);
+            emit("srai " + tmp + ", " + src + ", 31");
+            emit("andi " + tmp + ", " + tmp + ", " + to_string(divisor - 1));
+            emit("add " + dst + ", " + src + ", " + tmp);
+            emit("srai " + dst + ", " + dst + ", " + to_string(shift));
+            return;
+        }
+        auto spec = codegenMagicForDivisor(divisor);
+        if (!spec) {
+            emit("li " + tmp + ", " + to_string(divisor));
+            emit("div " + dst + ", " + src + ", " + tmp);
+            return;
+        }
+        emit("li " + tmp + ", " + to_string(spec->magic));
+        emit("mulh " + dst + ", " + src + ", " + tmp);
+        int postShift = spec->logicalShift
+            ? (spec->addDividend ? spec->shift : spec->shift - 32)
+            : spec->shift - 32;
+        if (spec->addDividend) emit("add " + dst + ", " + dst + ", " + src);
+        if (postShift > 0) emit("srai " + dst + ", " + dst + ", " + to_string(postShift));
+        emit("srai " + tmp + ", " + src + ", 31");
+        emit("sub " + dst + ", " + dst + ", " + tmp);
+    }
+
+    void emitDivModConst(const string &dst, const string &src, int divisor, bool isMod,
+                         const vector<string> &scratchPrefs = {}) {
+        if (!isMod) {
+            if (dst == src) {
+                string orig = pickScratch({dst, src}, scratchPrefs);
+                string tmp = pickScratch({dst, src, orig}, scratchPrefs);
+                emit("mv " + orig + ", " + src);
+                emitQuotientConst(dst, orig, divisor, tmp);
+            } else {
+                string tmp = pickScratch({dst, src}, scratchPrefs);
+                emitQuotientConst(dst, src, divisor, tmp);
+            }
+            return;
+        }
+        if (divisor == 1) {
+            emit("li " + dst + ", 0");
+            return;
+        }
+        string orig = pickScratch({dst, src}, scratchPrefs);
+        string tmp = pickScratch({dst, src, orig}, scratchPrefs);
+        emit("mv " + orig + ", " + src);
+        emitQuotientConst(dst, orig, divisor, tmp);
+        if (isPowerOfTwo(divisor)) emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(divisor)));
+        else {
+            emit("li " + tmp + ", " + to_string(divisor));
+            emit("mul " + dst + ", " + dst + ", " + tmp);
+        }
+        emit("sub " + dst + ", " + orig + ", " + dst);
+    }
+
     void emitBinaryReg(const string &op, const string &dst, const string &lhs, const string &rhs) {
         if (op == "+") emit("add " + dst + ", " + lhs + ", " + rhs);
         else if (op == "-") emit("sub " + dst + ", " + lhs + ", " + rhs);
@@ -6788,6 +6894,11 @@ private:
             }
             if (e->op == "%" && *rhs == 1) {
                 emit("li " + dst + ", 0");
+                return;
+            }
+            if ((e->op == "/" || e->op == "%") && canStrengthReduceDivisor(*rhs)) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emitDivModConst(dst, dst, static_cast<int>(*rhs), e->op == "%", regs);
                 return;
             }
         }
@@ -7007,6 +7118,11 @@ private:
                 }
                 if (e->op == "%" && *rhs == 1) {
                     emit("li a0, 0");
+                    return;
+                }
+                if ((e->op == "/" || e->op == "%") && canStrengthReduceDivisor(*rhs)) {
+                    genExpr(e->lhs.get());
+                    emitDivModConst("a0", "a0", static_cast<int>(*rhs), e->op == "%");
                     return;
                 }
             }
