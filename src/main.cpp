@@ -1947,7 +1947,7 @@ private:
                 return !exprHasNonSefCall(s->expr.get()) && sefStmtOk(s->thenStmt.get()) &&
                        sefStmtOk(s->elseStmt.get());
             case Stmt::Kind::While:
-                return false;
+                return !exprHasNonSefCall(s->expr.get()) && sefStmtOk(s->body.get());
             case Stmt::Kind::Assign:
                 return !s->fastAssignGlobal && !exprHasNonSefCall(s->expr.get());
             case Stmt::Kind::DeclStmt:
@@ -2039,6 +2039,7 @@ private:
                 return;
             case Stmt::Kind::ExprStmt:
                 if (exprHasNonSefCall(s->expr.get())) blExprReads(s->expr.get(), live);
+                else if (mark) s->fastDeadStore = true;
                 return;
             case Stmt::Kind::Return:
                 live.clear();
@@ -2504,6 +2505,7 @@ private:
             case Stmt::Kind::Empty:
                 return;
             case Stmt::Kind::ExprStmt: {
+                if (s->fastDeadStore || !exprHasNonSefCall(s->expr.get())) return;
                 int save = cTempTop;
                 compileExpr(s->expr.get());
                 cTempTop = save;
@@ -6791,7 +6793,7 @@ private:
             case Stmt::Kind::Empty:
                 break;
             case Stmt::Kind::ExprStmt:
-                if (!hasCall(s->expr.get())) break;
+                if (s->fastDeadStore || !hasCall(s->expr.get())) break;
                 genExpr(s->expr.get());
                 break;
             case Stmt::Kind::Assign:
@@ -7657,7 +7659,7 @@ int main(int argc, char **argv) {
         // Short time cap: closed-form foldable programs finish in well under a
         // second here, so unfoldable ones only waste ~1.2s before the fast
         // evaluator (which has DCE + JIT the ConstEvaluator lacks) takes over.
-        ConstEvaluator constEval(program, 1000000000LL, 200);
+        ConstEvaluator constEval(program, 1000000000LL, 50);
         if (auto value = constEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
