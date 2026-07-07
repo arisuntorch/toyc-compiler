@@ -212,6 +212,7 @@ struct Expr {
     string op;
     bool fastGlobal = false;
     int fastIndex = -1;
+    int opc = -1;
     unique_ptr<Expr> lhs;
     unique_ptr<Expr> rhs;
     vector<unique_ptr<Expr>> args;
@@ -242,6 +243,7 @@ struct Stmt {
     string name;
     bool fastAssignGlobal = false;
     int fastAssignIndex = -1;
+    int fastLoopId = -1;
     unique_ptr<Expr> expr;
     unique_ptr<Stmt> thenStmt;
     unique_ptr<Stmt> elseStmt;
@@ -252,6 +254,7 @@ struct Function {
     bool returnsVoid = false;
     string name;
     vector<string> params;
+    int fastLocalCount = -1;
     unique_ptr<Stmt> body;
 };
 
@@ -1595,14 +1598,26 @@ private:
     }
 };
 
+enum : int {
+    OPC_ADD = 0, OPC_SUB, OPC_MUL, OPC_DIV, OPC_MOD,
+    OPC_LT, OPC_GT, OPC_LE, OPC_GE, OPC_EQ, OPC_NE,
+    OPC_AND, OPC_OR, OPC_PLUS, OPC_NEG, OPC_NOT
+};
+
 class FastEvaluator {
 public:
     explicit FastEvaluator(Program &program, int timeLimitMs = 1500)
         : prog(program), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
-        indexProgram();
+        try {
+            indexProgram();
+        } catch (const TooHard &) {
+            broken = true;
+        }
+        stack.resize(1 << 20);
     }
 
     optional<int32_t> runMain() {
+        if (broken) return nullopt;
         try {
             initGlobals();
             auto it = funcs.find("main");
@@ -1624,25 +1639,80 @@ private:
         int index = -1;
     };
 
+    static constexpr int kGlobalBit = 1 << 28;
+    enum { CMP_LT, CMP_LE, CMP_GT, CMP_GE };
+    enum FoldRes { FoldStructFail, FoldValueFail, FoldOk };
+    enum : uint8_t { NO_PERIODIC = 1, NO_AFFINE = 2, NO_NESTED = 4 };
+
+    struct AffineLoopS {
+        vector<int> vars;
+        vector<vector<uint32_t>> mat;
+        vector<uint32_t> bound;
+        unordered_set<int> transient;
+        int induction = -1;
+        int cmp = CMP_LT;
+        int32_t step = 0;
+    };
+    struct LoopStat {
+        uint8_t structFlags = 0;
+        uint32_t failCount = 0;
+        bool everFolded = false;
+    };
+    struct PowCacheEntry {
+        vector<vector<uint32_t>> mat;
+        uint64_t n = 0;
+        bool valid = false;
+        vector<vector<uint32_t>> pw;
+    };
+
     Program &prog;
     int timeLimit;
     chrono::steady_clock::time_point startTime;
-    long long budgetLeft = 1000000000LL;
+    bool broken = false;
+    long long budgetLeft = 6000000000LL;
     uint32_t tickChecks = 0;
     unordered_map<string, Function *> funcs;
     unordered_map<string, int> globalIndex;
     vector<int32_t> globals;
-    unordered_map<const Function *, int> localCounts;
+    vector<int32_t> stack;
+    size_t stackTop = 0;
     int callDepth = 0;
+    int loopCount = 0;
+    vector<LoopStat> loopStats;
+    vector<PowCacheEntry> powCache;
 
     void tick(long long n = 1) {
         budgetLeft -= n;
         if (budgetLeft < 0) throw TooHard();
         tickChecks += static_cast<uint32_t>(n);
-        if ((tickChecks & 8191u) == 0u) {
+        if ((tickChecks & 65535u) == 0u) {
             auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
             if (elapsed > timeLimit) throw TooHard();
         }
+    }
+
+    static int encodeBinaryOpc(const string &op) {
+        if (op == "+") return OPC_ADD;
+        if (op == "-") return OPC_SUB;
+        if (op == "*") return OPC_MUL;
+        if (op == "/") return OPC_DIV;
+        if (op == "%") return OPC_MOD;
+        if (op == "<") return OPC_LT;
+        if (op == ">") return OPC_GT;
+        if (op == "<=") return OPC_LE;
+        if (op == ">=") return OPC_GE;
+        if (op == "==") return OPC_EQ;
+        if (op == "!=") return OPC_NE;
+        if (op == "&&") return OPC_AND;
+        if (op == "||") return OPC_OR;
+        return -1;
+    }
+
+    static int encodeUnaryOpc(const string &op) {
+        if (op == "+") return OPC_PLUS;
+        if (op == "-") return OPC_NEG;
+        if (op == "!") return OPC_NOT;
+        return -1;
     }
 
     void indexProgram() {
@@ -1663,6 +1733,8 @@ private:
                 resolveFunction(item.func.get());
             }
         }
+        loopStats.assign(static_cast<size_t>(loopCount), LoopStat{});
+        powCache.assign(static_cast<size_t>(loopCount), PowCacheEntry{});
     }
 
     VarRef resolveName(const string &name, const vector<unordered_map<string, int>> &scopes) const {
@@ -1681,7 +1753,7 @@ private:
         int nextLocal = 0;
         for (const string &param : f->params) scopes.back()[param] = nextLocal++;
         resolveStmt(f->body.get(), scopes, nextLocal);
-        localCounts[f] = nextLocal;
+        f->fastLocalCount = nextLocal;
     }
 
     void resolveExpr(Expr *e, vector<unordered_map<string, int>> &scopes) {
@@ -1692,6 +1764,8 @@ private:
             e->fastIndex = ref.index;
             return;
         }
+        if (e->kind == Expr::Kind::Unary) e->opc = encodeUnaryOpc(e->op);
+        else if (e->kind == Expr::Kind::Binary) e->opc = encodeBinaryOpc(e->op);
         resolveExpr(e->lhs.get(), scopes);
         resolveExpr(e->rhs.get(), scopes);
         for (auto &arg : e->args) resolveExpr(arg.get(), scopes);
@@ -1728,6 +1802,7 @@ private:
                 resolveStmt(s->elseStmt.get(), scopes, nextLocal);
                 break;
             case Stmt::Kind::While:
+                s->fastLoopId = loopCount++;
                 resolveExpr(s->expr.get(), scopes);
                 resolveStmt(s->body.get(), scopes, nextLocal);
                 break;
@@ -1740,62 +1815,66 @@ private:
 
     void initGlobals() {
         fill(globals.begin(), globals.end(), 0);
-        vector<int32_t> noLocals;
         for (auto &item : prog.items) {
             if (item.kind != TopItem::Kind::Decl) continue;
-            globals[globalIndex[item.decl->name]] = evalExpr(item.decl->init.get(), noLocals);
+            globals[globalIndex[item.decl->name]] = evalExpr(item.decl->init.get(), nullptr);
         }
     }
 
-    int32_t evalExpr(const Expr *e, vector<int32_t> &locals) {
+    int32_t evalExpr(const Expr *e, const int32_t *frame) {
         tick();
         switch (e->kind) {
             case Expr::Kind::Number:
                 return wrap32(e->value);
             case Expr::Kind::Var:
-                return e->fastGlobal ? globals[e->fastIndex] : locals[e->fastIndex];
+                return e->fastGlobal ? globals[e->fastIndex] : frame[e->fastIndex];
             case Expr::Kind::Call: {
                 auto f = funcs.find(e->name);
                 if (f == funcs.end()) throw TooHard();
                 if (e->args.size() <= 16) {
                     array<int32_t, 16> args{};
-                    for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), locals);
+                    for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), frame);
                     return callFunction(f->second, args.data(), static_cast<int>(e->args.size()));
                 }
                 vector<int32_t> args;
                 args.reserve(e->args.size());
-                for (auto &arg : e->args) args.push_back(evalExpr(arg.get(), locals));
+                for (auto &arg : e->args) args.push_back(evalExpr(arg.get(), frame));
                 return callFunction(f->second, args.data(), static_cast<int>(args.size()));
             }
             case Expr::Kind::Unary: {
-                int32_t v = evalExpr(e->lhs.get(), locals);
-                if (e->op == "+") return v;
-                if (e->op == "-") return sub32(0, v);
-                if (e->op == "!") return !truthy(v);
+                int32_t v = evalExpr(e->lhs.get(), frame);
+                switch (e->opc) {
+                    case OPC_PLUS: return v;
+                    case OPC_NEG: return sub32(0, v);
+                    case OPC_NOT: return !truthy(v);
+                }
                 throw TooHard();
             }
             case Expr::Kind::Binary: {
-                if (e->op == "&&") {
-                    int32_t l = evalExpr(e->lhs.get(), locals);
-                    return truthy(l) && truthy(evalExpr(e->rhs.get(), locals));
+                int opc = e->opc;
+                if (opc == OPC_AND) {
+                    int32_t l = evalExpr(e->lhs.get(), frame);
+                    return truthy(l) && truthy(evalExpr(e->rhs.get(), frame));
                 }
-                if (e->op == "||") {
-                    int32_t l = evalExpr(e->lhs.get(), locals);
-                    return truthy(l) || truthy(evalExpr(e->rhs.get(), locals));
+                if (opc == OPC_OR) {
+                    int32_t l = evalExpr(e->lhs.get(), frame);
+                    return truthy(l) || truthy(evalExpr(e->rhs.get(), frame));
                 }
-                int32_t l = evalExpr(e->lhs.get(), locals);
-                int32_t r = evalExpr(e->rhs.get(), locals);
-                if (e->op == "+") return add32(l, r);
-                if (e->op == "-") return sub32(l, r);
-                if (e->op == "*") return mul32(l, r);
-                if (e->op == "/") return div32(l, r);
-                if (e->op == "%") return mod32(l, r);
-                if (e->op == "<") return l < r;
-                if (e->op == ">") return l > r;
-                if (e->op == "<=") return l <= r;
-                if (e->op == ">=") return l >= r;
-                if (e->op == "==") return l == r;
-                if (e->op == "!=") return l != r;
+                int32_t l = evalExpr(e->lhs.get(), frame);
+                int32_t r = evalExpr(e->rhs.get(), frame);
+                switch (opc) {
+                    case OPC_ADD: return add32(l, r);
+                    case OPC_SUB: return sub32(l, r);
+                    case OPC_MUL: return mul32(l, r);
+                    case OPC_DIV: return div32(l, r);
+                    case OPC_MOD: return mod32(l, r);
+                    case OPC_LT: return l < r;
+                    case OPC_GT: return l > r;
+                    case OPC_LE: return l <= r;
+                    case OPC_GE: return l >= r;
+                    case OPC_EQ: return l == r;
+                    case OPC_NE: return l != r;
+                }
                 throw TooHard();
             }
         }
@@ -1804,42 +1883,51 @@ private:
 
     int32_t callFunction(Function *f, const int32_t *args, int argCount) {
         tick(4);
-        if (++callDepth > 1024) throw TooHard();
-        vector<int32_t> locals(localCounts[f], 0);
-        for (size_t i = 0; i < f->params.size(); ++i) locals[i] = static_cast<int>(i) < argCount ? args[i] : 0;
-        Flow flow = execStmt(f->body.get(), locals);
+        int nloc = f->fastLocalCount;
+        if (nloc < 0) throw TooHard();
+        if (callDepth >= 4096 || stackTop + static_cast<size_t>(nloc) > stack.size()) throw TooHard();
+        ++callDepth;
+        int32_t *frame = stack.data() + stackTop;
+        size_t savedTop = stackTop;
+        stackTop += static_cast<size_t>(nloc);
+        for (int i = 0; i < nloc; ++i) frame[i] = 0;
+        int np = static_cast<int>(f->params.size());
+        for (int i = 0; i < np; ++i) frame[i] = i < argCount ? args[i] : 0;
+        Flow flow = execStmt(f->body.get(), frame);
+        stackTop = savedTop;
         --callDepth;
         return flow.kind == Flow::Kind::Return ? flow.value : 0;
     }
 
-    Flow execStmt(const Stmt *s, vector<int32_t> &locals) {
+    Flow execStmt(const Stmt *s, int32_t *frame) {
         tick();
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
-                    Flow f = execStmt(child.get(), locals);
+                    Flow f = execStmt(child.get(), frame);
                     if (f.kind != Flow::Kind::Normal) return f;
                 }
                 return {};
             case Stmt::Kind::Empty:
                 return {};
             case Stmt::Kind::ExprStmt:
-                evalExpr(s->expr.get(), locals);
+                evalExpr(s->expr.get(), frame);
                 return {};
             case Stmt::Kind::Assign:
-                if (s->fastAssignGlobal) globals[s->fastAssignIndex] = evalExpr(s->expr.get(), locals);
-                else locals[s->fastAssignIndex] = evalExpr(s->expr.get(), locals);
+                if (s->fastAssignGlobal) globals[s->fastAssignIndex] = evalExpr(s->expr.get(), frame);
+                else frame[s->fastAssignIndex] = evalExpr(s->expr.get(), frame);
                 return {};
             case Stmt::Kind::DeclStmt:
-                locals[s->decl->fastSlot] = evalExpr(s->decl->init.get(), locals);
+                frame[s->decl->fastSlot] = evalExpr(s->decl->init.get(), frame);
                 return {};
             case Stmt::Kind::If:
-                if (truthy(evalExpr(s->expr.get(), locals))) return execStmt(s->thenStmt.get(), locals);
-                if (s->elseStmt) return execStmt(s->elseStmt.get(), locals);
+                if (truthy(evalExpr(s->expr.get(), frame))) return execStmt(s->thenStmt.get(), frame);
+                if (s->elseStmt) return execStmt(s->elseStmt.get(), frame);
                 return {};
             case Stmt::Kind::While:
-                while (truthy(evalExpr(s->expr.get(), locals))) {
-                    Flow f = execStmt(s->body.get(), locals);
+                if (tryFoldWhile(s, frame)) return {};
+                while (truthy(evalExpr(s->expr.get(), frame))) {
+                    Flow f = execStmt(s->body.get(), frame);
                     if (f.kind == Flow::Kind::Break) return {};
                     if (f.kind == Flow::Kind::Continue) continue;
                     if (f.kind == Flow::Kind::Return) return f;
@@ -1850,9 +1938,973 @@ private:
             case Stmt::Kind::Continue:
                 return Flow{Flow::Kind::Continue, 0};
             case Stmt::Kind::Return:
-                return Flow{Flow::Kind::Return, s->expr ? evalExpr(s->expr.get(), locals) : 0};
+                return Flow{Flow::Kind::Return, s->expr ? evalExpr(s->expr.get(), frame) : 0};
         }
         throw TooHard();
+    }
+
+    // ---- slot helpers ----
+
+    int32_t readSlot(int key, const int32_t *frame) const {
+        return (key & kGlobalBit) ? globals[key & ~kGlobalBit] : frame[key];
+    }
+
+    void writeSlot(int key, int32_t value, int32_t *frame) {
+        if (key & kGlobalBit) globals[key & ~kGlobalBit] = value;
+        else frame[key] = value;
+    }
+
+    static int exprSlotKey(const Expr *e) {
+        return e->fastGlobal ? (e->fastIndex | kGlobalBit) : e->fastIndex;
+    }
+
+    static int assignSlotKey(const Stmt *s) {
+        return s->fastAssignGlobal ? (s->fastAssignIndex | kGlobalBit) : s->fastAssignIndex;
+    }
+
+    // ---- shared math helpers ----
+
+    static uint64_t gcd64(uint64_t a, uint64_t b) {
+        while (b) {
+            uint64_t t = a % b;
+            a = b;
+            b = t;
+        }
+        return a;
+    }
+
+    static uint64_t lcmCapped(uint64_t a, uint64_t b, uint64_t cap) {
+        if (a == 0 || b == 0) return 0;
+        uint64_t g = gcd64(a, b);
+        if (a / g > cap / b) return cap + 1;
+        return a / g * b;
+    }
+
+    static uint64_t ceilDivPositive(int64_t a, int64_t b) {
+        if (a <= 0) return 0;
+        return static_cast<uint64_t>((a + b - 1) / b);
+    }
+
+    static uint64_t countIterations(int cmp, int32_t step, int32_t iv, int32_t bound) {
+        int64_t i = iv;
+        int64_t b = bound;
+        int64_t s = step;
+        switch (cmp) {
+            case CMP_LT: return (s > 0 && i < b) ? ceilDivPositive(b - i, s) : 0;
+            case CMP_LE: return (s > 0 && i <= b) ? static_cast<uint64_t>((b - i) / s + 1) : 0;
+            case CMP_GT: return (s < 0 && i > b) ? ceilDivPositive(i - b, -s) : 0;
+            case CMP_GE: return (s < 0 && i >= b) ? static_cast<uint64_t>((i - b) / (-s) + 1) : 0;
+        }
+        return 0;
+    }
+
+    static vector<uint32_t> matVec(const vector<vector<uint32_t>> &m, const vector<uint32_t> &v) {
+        int n = static_cast<int>(v.size());
+        vector<uint32_t> out(n, 0);
+        for (int i = 0; i < n; ++i) {
+            uint64_t acc = 0;
+            for (int j = 0; j < n; ++j) acc += static_cast<uint64_t>(m[i][j]) * v[j];
+            out[i] = static_cast<uint32_t>(acc);
+        }
+        return out;
+    }
+
+    static vector<vector<uint32_t>> matMul(const vector<vector<uint32_t>> &a, const vector<vector<uint32_t>> &b) {
+        int n = static_cast<int>(a.size());
+        vector<vector<uint32_t>> c(n, vector<uint32_t>(n, 0));
+        for (int i = 0; i < n; ++i) {
+            for (int k = 0; k < n; ++k) {
+                if (!a[i][k]) continue;
+                uint64_t aik = a[i][k];
+                for (int j = 0; j < n; ++j) {
+                    c[i][j] = static_cast<uint32_t>(c[i][j] + aik * b[k][j]);
+                }
+            }
+        }
+        return c;
+    }
+
+    static bool constRow(const vector<uint32_t> &row) {
+        for (size_t i = 0; i + 1 < row.size(); ++i) {
+            if (row[i] != 0) return false;
+        }
+        return true;
+    }
+
+    static optional<int32_t> constRowValue(const vector<uint32_t> &row) {
+        if (!constRow(row)) return nullopt;
+        return static_cast<int32_t>(row.back());
+    }
+
+    const vector<vector<uint32_t>> &cachedMatPow(int loopId, const vector<vector<uint32_t>> &mat, uint64_t n) {
+        if (loopId < 0 || loopId >= static_cast<int>(powCache.size())) throw TooHard();
+        PowCacheEntry &entry = powCache[loopId];
+        if (entry.valid && entry.n == n && entry.mat == mat) return entry.pw;
+        int d = static_cast<int>(mat.size());
+        vector<vector<uint32_t>> result(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) result[i][i] = 1;
+        vector<vector<uint32_t>> p = mat;
+        uint64_t m = n;
+        while (m) {
+            tick(10);
+            if (m & 1) result = matMul(result, p);
+            m >>= 1;
+            if (m) p = matMul(p, p);
+        }
+        entry.mat = mat;
+        entry.n = n;
+        entry.pw = std::move(result);
+        entry.valid = true;
+        return entry.pw;
+    }
+
+    // ---- static expression helpers ----
+
+    static bool exprHasCallS(const Expr *e) {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Call) return true;
+        if (exprHasCallS(e->lhs.get()) || exprHasCallS(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (exprHasCallS(arg.get())) return true;
+        }
+        return false;
+    }
+
+    static optional<int32_t> staticConstS(const Expr *e) {
+        if (!e) return nullopt;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var:
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto v = staticConstS(e->lhs.get());
+                if (!v) return nullopt;
+                if (e->opc == OPC_PLUS) return *v;
+                if (e->opc == OPC_NEG) return sub32(0, *v);
+                if (e->opc == OPC_NOT) return !truthy(*v);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->opc == OPC_AND) {
+                    auto l = staticConstS(e->lhs.get());
+                    if (!l) return nullopt;
+                    if (!truthy(*l)) return 0;
+                    auto r = staticConstS(e->rhs.get());
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                if (e->opc == OPC_OR) {
+                    auto l = staticConstS(e->lhs.get());
+                    if (!l) return nullopt;
+                    if (truthy(*l)) return 1;
+                    auto r = staticConstS(e->rhs.get());
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                auto l = staticConstS(e->lhs.get());
+                auto r = staticConstS(e->rhs.get());
+                if (!l || !r) return nullopt;
+                switch (e->opc) {
+                    case OPC_ADD: return add32(*l, *r);
+                    case OPC_SUB: return sub32(*l, *r);
+                    case OPC_MUL: return mul32(*l, *r);
+                    case OPC_DIV: return *r != 0 ? optional<int32_t>(div32(*l, *r)) : nullopt;
+                    case OPC_MOD: return *r != 0 ? optional<int32_t>(mod32(*l, *r)) : nullopt;
+                    case OPC_LT: return *l < *r;
+                    case OPC_GT: return *l > *r;
+                    case OPC_LE: return *l <= *r;
+                    case OPC_GE: return *l >= *r;
+                    case OPC_EQ: return *l == *r;
+                    case OPC_NE: return *l != *r;
+                }
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
+    // ---- affine loop analysis (slot-based) ----
+
+    static bool isRelOpc(int opc) {
+        return opc == OPC_LT || opc == OPC_LE || opc == OPC_GT || opc == OPC_GE;
+    }
+
+    bool extractLoopCondition(const Expr *e, int &indKey, int &cmp, const Expr *&bound) const {
+        if (!e || e->kind != Expr::Kind::Binary || !isRelOpc(e->opc)) return false;
+        if (e->lhs && e->lhs->kind == Expr::Kind::Var) {
+            indKey = exprSlotKey(e->lhs.get());
+            switch (e->opc) {
+                case OPC_LT: cmp = CMP_LT; break;
+                case OPC_LE: cmp = CMP_LE; break;
+                case OPC_GT: cmp = CMP_GT; break;
+                default: cmp = CMP_GE; break;
+            }
+            bound = e->rhs.get();
+            return true;
+        }
+        if (e->rhs && e->rhs->kind == Expr::Kind::Var) {
+            indKey = exprSlotKey(e->rhs.get());
+            bound = e->lhs.get();
+            switch (e->opc) {
+                case OPC_LT: cmp = CMP_GT; break;
+                case OPC_LE: cmp = CMP_GE; break;
+                case OPC_GT: cmp = CMP_LT; break;
+                default: cmp = CMP_LE; break;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool collectAssignments(const Stmt *s, vector<pair<int, const Expr *>> &assigns,
+                            vector<int> &vars, unordered_set<int> &seen,
+                            unordered_set<int> &transient) const {
+        if (!s) return true;
+        if (s->kind == Stmt::Kind::Block) {
+            for (auto &child : s->stmts) {
+                if (!collectAssignments(child.get(), assigns, vars, seen, transient)) return false;
+            }
+            return true;
+        }
+        if (s->kind == Stmt::Kind::DeclStmt) {
+            if (!s->decl || !s->decl->init) return false;
+            int key = s->decl->fastSlot;
+            if (key < 0 || seen.count(key)) return false;
+            seen.insert(key);
+            vars.push_back(key);
+            transient.insert(key);
+            assigns.push_back({key, s->decl->init.get()});
+            return true;
+        }
+        if (s->kind != Stmt::Kind::Assign) return false;
+        int key = assignSlotKey(s);
+        if (!seen.count(key)) {
+            seen.insert(key);
+            vars.push_back(key);
+        }
+        assigns.push_back({key, s->expr.get()});
+        return true;
+    }
+
+    bool collectAffineNames(const Stmt *s, vector<int> &vars, unordered_set<int> &seen,
+                            unordered_set<int> &transient) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectAffineNames(child.get(), vars, seen, transient)) return false;
+                }
+                return true;
+            case Stmt::Kind::Assign: {
+                int key = assignSlotKey(s);
+                if (!seen.count(key)) {
+                    seen.insert(key);
+                    vars.push_back(key);
+                }
+                return true;
+            }
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return false;
+                int key = s->decl->fastSlot;
+                if (key < 0 || seen.count(key)) return false;
+                seen.insert(key);
+                vars.push_back(key);
+                transient.insert(key);
+                return true;
+            }
+            case Stmt::Kind::While:
+                return collectAffineNames(s->body.get(), vars, seen, transient);
+            case Stmt::Kind::Empty:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    static bool returnedExprS(const Stmt *s, const Expr *&expr) {
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::Return) {
+            expr = s->expr.get();
+            return true;
+        }
+        if (s->kind == Stmt::Kind::Block && s->stmts.size() == 1) {
+            return returnedExprS(s->stmts[0].get(), expr);
+        }
+        return false;
+    }
+
+    const Expr *pureReturnExpr(const Function *f) const {
+        if (!f || f->returnsVoid) return nullptr;
+        const Expr *expr = nullptr;
+        if (!returnedExprS(f->body.get(), expr) || !expr || exprHasCallS(expr)) return nullptr;
+        return expr;
+    }
+
+    bool affineExprAliases(const Expr *e, const unordered_map<int, vector<uint32_t>> &aliases,
+                           int d, vector<uint32_t> &out) const {
+        out.assign(d, 0);
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out[d - 1] = static_cast<uint32_t>(wrap32(e->value));
+                return true;
+            case Expr::Kind::Var: {
+                if (e->fastGlobal) {
+                    out[d - 1] = static_cast<uint32_t>(globals[e->fastIndex]);
+                    return true;
+                }
+                auto alias = aliases.find(e->fastIndex);
+                if (alias == aliases.end()) return false;
+                out = alias->second;
+                return true;
+            }
+            case Expr::Kind::Unary: {
+                vector<uint32_t> a;
+                if (!affineExprAliases(e->lhs.get(), aliases, d, a)) return false;
+                if (e->opc == OPC_PLUS) {
+                    out = std::move(a);
+                    return true;
+                }
+                if (e->opc == OPC_NEG) {
+                    for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                vector<uint32_t> a, b;
+                if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
+                    if (!affineExprAliases(e->lhs.get(), aliases, d, a) ||
+                        !affineExprAliases(e->rhs.get(), aliases, d, b)) return false;
+                    for (int i = 0; i < d; ++i) out[i] = e->opc == OPC_ADD ? a[i] + b[i] : a[i] - b[i];
+                    return true;
+                }
+                if (e->opc == OPC_MUL) {
+                    if (!affineExprAliases(e->lhs.get(), aliases, d, a) ||
+                        !affineExprAliases(e->rhs.get(), aliases, d, b)) return false;
+                    if (constRow(a)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
+                        return true;
+                    }
+                    if (constRow(b)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            case Expr::Kind::Call:
+                return false;
+        }
+        return false;
+    }
+
+    bool affineExpr(const Expr *e, const unordered_map<int, int> &idx,
+                    const vector<vector<uint32_t>> &cur, vector<uint32_t> &out,
+                    const int32_t *frame) const {
+        int d = static_cast<int>(cur.size());
+        out.assign(d, 0);
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out[d - 1] = static_cast<uint32_t>(wrap32(e->value));
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                auto it = idx.find(key);
+                if (it == idx.end()) {
+                    out[d - 1] = static_cast<uint32_t>(readSlot(key, frame));
+                    return true;
+                }
+                out = cur[it->second];
+                return true;
+            }
+            case Expr::Kind::Unary: {
+                vector<uint32_t> a;
+                if (!affineExpr(e->lhs.get(), idx, cur, a, frame)) return false;
+                if (e->opc == OPC_PLUS) {
+                    out = std::move(a);
+                    return true;
+                }
+                if (e->opc == OPC_NEG) {
+                    for (int i = 0; i < d; ++i) out[i] = 0u - a[i];
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                vector<uint32_t> a, b;
+                if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
+                    if (!affineExpr(e->lhs.get(), idx, cur, a, frame) ||
+                        !affineExpr(e->rhs.get(), idx, cur, b, frame)) return false;
+                    for (int i = 0; i < d; ++i) out[i] = e->opc == OPC_ADD ? a[i] + b[i] : a[i] - b[i];
+                    return true;
+                }
+                if (e->opc == OPC_MUL) {
+                    if (!affineExpr(e->lhs.get(), idx, cur, a, frame) ||
+                        !affineExpr(e->rhs.get(), idx, cur, b, frame)) return false;
+                    if (constRow(a)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(b[i]) * a[d - 1]);
+                        return true;
+                    }
+                    if (constRow(b)) {
+                        for (int i = 0; i < d; ++i) out[i] = static_cast<uint32_t>(static_cast<uint64_t>(a[i]) * b[d - 1]);
+                        return true;
+                    }
+                }
+                return false;
+            }
+            case Expr::Kind::Call: {
+                auto found = funcs.find(e->name);
+                if (found == funcs.end()) return false;
+                const Expr *ret = pureReturnExpr(found->second);
+                if (!ret || e->args.size() != found->second->params.size()) return false;
+                unordered_map<int, vector<uint32_t>> aliases;
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    vector<uint32_t> row;
+                    if (!affineExpr(e->args[i].get(), idx, cur, row, frame)) return false;
+                    aliases[static_cast<int>(i)] = std::move(row);
+                }
+                return affineExprAliases(ret, aliases, d, out);
+            }
+        }
+        return false;
+    }
+
+    FoldRes buildAffineLoop(const Stmt *s, AffineLoopS &loop, const int32_t *frame) const {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+
+        vector<int> vars;
+        unordered_set<int> seen;
+        seen.insert(indKey);
+        vars.push_back(indKey);
+
+        vector<pair<int, const Expr *>> assigns;
+        unordered_set<int> transient;
+        if (!collectAssignments(s->body.get(), assigns, vars, seen, transient)) return FoldStructFail;
+        bool updatesInd = false;
+        unordered_set<int> updated;
+        for (auto &as : assigns) {
+            updated.insert(as.first);
+            if (as.first == indKey) updatesInd = true;
+        }
+        if (!updatesInd) return FoldStructFail;
+
+        unordered_map<int, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+        vector<vector<uint32_t>> cur(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) cur[i][i] = 1;
+
+        for (auto &as : assigns) {
+            vector<uint32_t> row;
+            if (!affineExpr(as.second, idx, cur, row, frame)) return FoldStructFail;
+            cur[idx[as.first]] = std::move(row);
+        }
+
+        int indIdx = idx[indKey];
+        const auto &ir = cur[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return FoldValueFail;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return FoldValueFail;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound, frame)) return FoldStructFail;
+        for (int key : updated) {
+            if (bound[idx[key]] != 0) return FoldValueFail;
+        }
+
+        loop.vars = std::move(vars);
+        loop.mat = std::move(cur);
+        loop.bound = std::move(bound);
+        loop.transient = std::move(transient);
+        loop.induction = indIdx;
+        loop.cmp = cmp;
+        loop.step = step;
+        return FoldOk;
+    }
+
+    bool processAffineTransformStmt(const Stmt *s, const unordered_map<int, int> &idx,
+                                    vector<vector<uint32_t>> &cur, const int32_t *frame) {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!processAffineTransformStmt(child.get(), idx, cur, frame)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return false;
+                auto it = idx.find(s->decl->fastSlot);
+                if (it == idx.end()) return false;
+                vector<uint32_t> row;
+                if (!affineExpr(s->decl->init.get(), idx, cur, row, frame)) return false;
+                cur[it->second] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                auto it = idx.find(assignSlotKey(s));
+                if (it == idx.end()) return false;
+                vector<uint32_t> row;
+                if (!affineExpr(s->expr.get(), idx, cur, row, frame)) return false;
+                cur[it->second] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::While:
+                return processNestedAffineWhile(s, idx, cur, frame);
+            default:
+                return false;
+        }
+    }
+
+    bool processNestedAffineWhile(const Stmt *s, const unordered_map<int, int> &idx,
+                                  vector<vector<uint32_t>> &cur, const int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return false;
+        auto indIt = idx.find(indKey);
+        if (indIt == idx.end()) return false;
+        int indIdx = indIt->second;
+
+        int d = static_cast<int>(cur.size());
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+
+        vector<vector<uint32_t>> bodyMat = idmat;
+        if (!processAffineTransformStmt(s->body.get(), idx, bodyMat, frame)) return false;
+
+        const auto &ir = bodyMat[indIdx];
+        for (int j = 0; j + 1 < d; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return false;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return false;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return false;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return false;
+
+        vector<uint32_t> boundRow;
+        if (!affineExpr(boundExpr, idx, cur, boundRow, frame)) return false;
+        auto iv = constRowValue(cur[indIdx]);
+        auto bound = constRowValue(boundRow);
+        if (!iv || !bound) return false;
+
+        uint64_t niter = countIterations(cmp, step, *iv, *bound);
+        if (niter == 0) return true;
+
+        const vector<vector<uint32_t>> &combined = cachedMatPow(s->fastLoopId, bodyMat, niter);
+        cur = matMul(combined, cur);
+        return true;
+    }
+
+    FoldRes buildNestedAffineLoop(const Stmt *s, AffineLoopS &loop, const int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+
+        vector<int> vars;
+        unordered_set<int> seen;
+        unordered_set<int> transient;
+        seen.insert(indKey);
+        vars.push_back(indKey);
+        if (!collectAffineNames(s->body.get(), vars, seen, transient)) return FoldStructFail;
+        if (vars.size() <= 1) return FoldStructFail;
+
+        unordered_map<int, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+        vector<vector<uint32_t>> cur(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) cur[i][i] = 1;
+
+        if (!processAffineTransformStmt(s->body.get(), idx, cur, frame)) return FoldValueFail;
+
+        int indIdx = idx[indKey];
+        const auto &ir = cur[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return FoldValueFail;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return FoldValueFail;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound, frame)) return FoldStructFail;
+        for (int i = 0; i < k; ++i) {
+            if (bound[i] != 0) return FoldValueFail;
+        }
+
+        loop.vars = std::move(vars);
+        loop.mat = std::move(cur);
+        loop.bound = std::move(bound);
+        loop.transient = std::move(transient);
+        loop.induction = indIdx;
+        loop.cmp = cmp;
+        loop.step = step;
+        return FoldOk;
+    }
+
+    // ---- periodic loop analysis (slot-based) ----
+
+    void collectExprVarKeys(const Expr *e, unordered_set<int> &out) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            out.insert(exprSlotKey(e));
+            return;
+        }
+        collectExprVarKeys(e->lhs.get(), out);
+        collectExprVarKeys(e->rhs.get(), out);
+        for (auto &arg : e->args) collectExprVarKeys(arg.get(), out);
+    }
+
+    void collectAssignedKeys(const Stmt *s, unordered_set<int> &out) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign) out.insert(assignSlotKey(s));
+        for (auto &child : s->stmts) collectAssignedKeys(child.get(), out);
+        collectAssignedKeys(s->thenStmt.get(), out);
+        collectAssignedKeys(s->elseStmt.get(), out);
+        collectAssignedKeys(s->body.get(), out);
+    }
+
+    bool collectPeriodicModuli(const Expr *e, int indKey, vector<int32_t> &mods) const {
+        if (!e) return true;
+        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Binary && e->opc == OPC_MOD) {
+            if (e->lhs && e->lhs->kind == Expr::Kind::Var && exprSlotKey(e->lhs.get()) == indKey) {
+                if (auto m = staticConstS(e->rhs.get())) {
+                    int32_t mod = *m < 0 ? -*m : *m;
+                    if (mod > 1) mods.push_back(mod);
+                    return true;
+                }
+            }
+            return false;
+        }
+        return collectPeriodicModuli(e->lhs.get(), indKey, mods) &&
+               collectPeriodicModuli(e->rhs.get(), indKey, mods) &&
+               all_of(e->args.begin(), e->args.end(), [&](const unique_ptr<Expr> &arg) {
+                   return collectPeriodicModuli(arg.get(), indKey, mods);
+               });
+    }
+
+    bool collectPeriodicInfo(const Stmt *s, int indKey, const unordered_set<int> &assigned,
+                             vector<int32_t> &mods, bool &sawIf) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectPeriodicInfo(child.get(), indKey, assigned, mods, sawIf)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Assign:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::If: {
+                sawIf = true;
+                unordered_set<int> vars;
+                collectExprVarKeys(s->expr.get(), vars);
+                bool usesInduction = vars.count(indKey) != 0;
+                for (int key : vars) {
+                    if (key != indKey && assigned.count(key)) return false;
+                }
+                if (usesInduction) {
+                    size_t before = mods.size();
+                    if (!collectPeriodicModuli(s->expr.get(), indKey, mods)) return false;
+                    if (mods.size() == before) return false;
+                }
+                return collectPeriodicInfo(s->thenStmt.get(), indKey, assigned, mods, sawIf) &&
+                       collectPeriodicInfo(s->elseStmt.get(), indKey, assigned, mods, sawIf);
+            }
+            default:
+                return false;
+        }
+    }
+
+    optional<int32_t> evalExprWithRows(const Expr *e, const unordered_map<int, int> &idx,
+                                       const vector<vector<uint32_t>> &cur,
+                                       const vector<uint32_t> &base, const int32_t *frame) const {
+        if (!e) return nullopt;
+        auto rowValue = [&](const vector<uint32_t> &row) {
+            uint64_t acc = 0;
+            for (size_t i = 0; i < row.size(); ++i) acc += static_cast<uint64_t>(row[i]) * base[i];
+            return static_cast<int32_t>(static_cast<uint32_t>(acc));
+        };
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                auto it = idx.find(key);
+                if (it != idx.end()) return rowValue(cur[it->second]);
+                return readSlot(key, frame);
+            }
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto v = evalExprWithRows(e->lhs.get(), idx, cur, base, frame);
+                if (!v) return nullopt;
+                if (e->opc == OPC_PLUS) return *v;
+                if (e->opc == OPC_NEG) return sub32(0, *v);
+                if (e->opc == OPC_NOT) return !truthy(*v);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->opc == OPC_AND) {
+                    auto l = evalExprWithRows(e->lhs.get(), idx, cur, base, frame);
+                    if (!l) return nullopt;
+                    if (!truthy(*l)) return 0;
+                    auto r = evalExprWithRows(e->rhs.get(), idx, cur, base, frame);
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                if (e->opc == OPC_OR) {
+                    auto l = evalExprWithRows(e->lhs.get(), idx, cur, base, frame);
+                    if (!l) return nullopt;
+                    if (truthy(*l)) return 1;
+                    auto r = evalExprWithRows(e->rhs.get(), idx, cur, base, frame);
+                    if (!r) return nullopt;
+                    return truthy(*r);
+                }
+                auto l = evalExprWithRows(e->lhs.get(), idx, cur, base, frame);
+                auto r = evalExprWithRows(e->rhs.get(), idx, cur, base, frame);
+                if (!l || !r) return nullopt;
+                switch (e->opc) {
+                    case OPC_ADD: return add32(*l, *r);
+                    case OPC_SUB: return sub32(*l, *r);
+                    case OPC_MUL: return mul32(*l, *r);
+                    case OPC_DIV: return *r != 0 ? optional<int32_t>(div32(*l, *r)) : nullopt;
+                    case OPC_MOD: return *r != 0 ? optional<int32_t>(mod32(*l, *r)) : nullopt;
+                    case OPC_LT: return *l < *r;
+                    case OPC_GT: return *l > *r;
+                    case OPC_LE: return *l <= *r;
+                    case OPC_GE: return *l >= *r;
+                    case OPC_EQ: return *l == *r;
+                    case OPC_NE: return *l != *r;
+                }
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
+    bool buildPeriodicTransformStmt(const Stmt *s, const unordered_map<int, int> &idx,
+                                    const vector<uint32_t> &base, vector<vector<uint32_t>> &cur,
+                                    const int32_t *frame) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!buildPeriodicTransformStmt(child.get(), idx, base, cur, frame)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::Assign: {
+                auto it = idx.find(assignSlotKey(s));
+                if (it == idx.end()) return false;
+                vector<uint32_t> row;
+                if (!affineExpr(s->expr.get(), idx, cur, row, frame)) return false;
+                cur[it->second] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::If: {
+                auto cond = evalExprWithRows(s->expr.get(), idx, cur, base, frame);
+                if (!cond) return false;
+                return truthy(*cond)
+                    ? buildPeriodicTransformStmt(s->thenStmt.get(), idx, base, cur, frame)
+                    : buildPeriodicTransformStmt(s->elseStmt.get(), idx, base, cur, frame);
+            }
+            default:
+                return false;
+        }
+    }
+
+    FoldRes tryRunPeriodicAffineLoop(const Stmt *s, int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr)) return FoldStructFail;
+
+        unordered_set<int> assigned;
+        collectAssignedKeys(s->body.get(), assigned);
+        if (!assigned.count(indKey)) return FoldStructFail;
+        vector<int32_t> moduli;
+        bool sawIf = false;
+        if (!collectPeriodicInfo(s->body.get(), indKey, assigned, moduli, sawIf) || !sawIf) return FoldStructFail;
+
+        vector<int> vars;
+        vars.push_back(indKey);
+        for (int key : assigned) {
+            if (key != indKey) vars.push_back(key);
+        }
+        unordered_map<int, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+
+        vector<uint32_t> state(d, 0);
+        for (int i = 0; i < k; ++i) state[i] = static_cast<uint32_t>(readSlot(vars[i], frame));
+        state[d - 1] = 1;
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<vector<uint32_t>> first = idmat;
+        if (!buildPeriodicTransformStmt(s->body.get(), idx, state, first, frame)) return FoldValueFail;
+        int indIdx = idx[indKey];
+        const auto &ir = first[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return FoldValueFail;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return FoldValueFail;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound, frame)) return FoldStructFail;
+        for (int i = 0; i < k; ++i) {
+            if (bound[i] != 0) return FoldValueFail;
+        }
+        uint64_t boundAcc = 0;
+        for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(bound[i]) * state[i];
+        uint64_t niter = countIterations(cmp, step, static_cast<int32_t>(state[indIdx]),
+                                         static_cast<int32_t>(static_cast<uint32_t>(boundAcc)));
+        if (niter == 0) return FoldOk;
+        if (niter < 100000) return FoldValueFail;
+
+        uint64_t period = 1;
+        uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
+        for (int32_t mod : moduli) {
+            uint64_t m = static_cast<uint64_t>(mod);
+            uint64_t reduced = m / gcd64(m, absStep % m);
+            period = lcmCapped(period, reduced, 4096);
+            if (period > 4096) return FoldValueFail;
+        }
+        if (period == 0 || period > 4096) return FoldValueFail;
+
+        vector<vector<vector<uint32_t>>> iterMats;
+        iterMats.reserve(static_cast<size_t>(period));
+        vector<uint32_t> sample = state;
+        for (uint64_t i = 0; i < period; ++i) {
+            tick(4);
+            vector<vector<uint32_t>> mat = idmat;
+            if (!buildPeriodicTransformStmt(s->body.get(), idx, sample, mat, frame)) return FoldValueFail;
+            const auto &row = mat[indIdx];
+            for (int j = 0; j < k; ++j) {
+                uint32_t want = j == indIdx ? 1u : 0u;
+                if (row[j] != want) return FoldValueFail;
+            }
+            if (static_cast<int32_t>(row[d - 1]) != step) return FoldValueFail;
+            iterMats.push_back(mat);
+            sample = matVec(mat, sample);
+        }
+
+        vector<vector<uint32_t>> periodMat = idmat;
+        for (auto &mat : iterMats) periodMat = matMul(mat, periodMat);
+
+        uint64_t whole = niter / period;
+        uint64_t rem = niter % period;
+        if (whole > 0) {
+            state = matVec(cachedMatPow(s->fastLoopId, periodMat, whole), state);
+        }
+        for (uint64_t i = 0; i < rem; ++i) state = matVec(iterMats[static_cast<size_t>(i)], state);
+
+        for (int i = 0; i < k; ++i) writeSlot(vars[i], static_cast<int32_t>(state[i]), frame);
+        return FoldOk;
+    }
+
+    // ---- fold driver ----
+
+    bool applyAffineLoop(const Stmt *s, const AffineLoopS &loop, int32_t *frame) {
+        tick(32);
+        int k = static_cast<int>(loop.vars.size());
+        int d = k + 1;
+        vector<uint32_t> v(d, 0);
+        for (int i = 0; i < k; ++i) {
+            v[i] = loop.transient.count(loop.vars[i]) ? 0u
+                                                      : static_cast<uint32_t>(readSlot(loop.vars[i], frame));
+        }
+        v[d - 1] = 1;
+        uint64_t boundAcc = 0;
+        for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(loop.bound[i]) * v[i];
+        int32_t bound = static_cast<int32_t>(static_cast<uint32_t>(boundAcc));
+        uint64_t niter = countIterations(loop.cmp, loop.step, static_cast<int32_t>(v[loop.induction]), bound);
+        if (niter == 0) return true;
+        v = matVec(cachedMatPow(s->fastLoopId, loop.mat, niter), v);
+        for (int i = 0; i < k; ++i) {
+            if (!loop.transient.count(loop.vars[i])) writeSlot(loop.vars[i], static_cast<int32_t>(v[i]), frame);
+        }
+        return true;
+    }
+
+    bool tryFoldWhile(const Stmt *s, int32_t *frame) {
+        if (s->fastLoopId < 0 || s->fastLoopId >= static_cast<int>(loopStats.size())) return false;
+        LoopStat &st = loopStats[s->fastLoopId];
+        constexpr uint8_t allStruct = NO_PERIODIC | NO_AFFINE | NO_NESTED;
+        if ((st.structFlags & allStruct) == allStruct) return false;
+        if (!st.everFolded && st.failCount >= 8) {
+            ++st.failCount;
+            if ((st.failCount & 255u) != 0u) return false;
+        }
+        tick(16);
+
+        if (!(st.structFlags & NO_PERIODIC)) {
+            FoldRes r = tryRunPeriodicAffineLoop(s, frame);
+            if (r == FoldOk) {
+                st.everFolded = true;
+                return true;
+            }
+            if (r == FoldStructFail) st.structFlags |= NO_PERIODIC;
+        }
+        if (!(st.structFlags & NO_AFFINE)) {
+            AffineLoopS loop;
+            FoldRes r = buildAffineLoop(s, loop, frame);
+            if (r == FoldOk) {
+                if (applyAffineLoop(s, loop, frame)) {
+                    st.everFolded = true;
+                    return true;
+                }
+            } else if (r == FoldStructFail) {
+                st.structFlags |= NO_AFFINE;
+            }
+        }
+        if (!(st.structFlags & NO_NESTED)) {
+            AffineLoopS loop;
+            FoldRes r = buildNestedAffineLoop(s, loop, frame);
+            if (r == FoldOk) {
+                if (applyAffineLoop(s, loop, frame)) {
+                    st.everFolded = true;
+                    return true;
+                }
+            } else if (r == FoldStructFail) {
+                st.structFlags |= NO_NESTED;
+            }
+        }
+        ++st.failCount;
+        return false;
     }
 };
 
