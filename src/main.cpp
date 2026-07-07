@@ -7005,14 +7005,14 @@ int main(int argc, char **argv) {
         // Short time cap: closed-form foldable programs finish in well under a
         // second here, so unfoldable ones only waste ~1.2s before the fast
         // evaluator (which has DCE + JIT the ConstEvaluator lacks) takes over.
-        ConstEvaluator constEval(program, 1000000000LL, 1200);
+        ConstEvaluator constEval(program, 1000000000LL, 1000);
         if (auto value = constEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        long long remaining = 11000 - elapsedMs();
+        long long remaining = 7000 - elapsedMs();
         if (remaining > 1000) {
-            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 8500)));
+            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 4800)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
