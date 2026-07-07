@@ -34,3 +34,6 @@ python3 tools/run_eval.py --help
 
 The script never writes the cookie to git-tracked files. OJ results are appended
 to `tmp/educg_oj_results.jsonl`.
+
+To expose this evaluator as an authenticated HTTP API, see
+`tools/EVAL_API.md`.
