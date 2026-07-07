@@ -1871,6 +1871,8 @@ private:
             case Stmt::Kind::Continue:
                 return;
             case Stmt::Kind::ExprStmt:
+                if (exprHasNonSefCall(s->expr.get())) dsSeedExprReads(s->expr.get(), ord, live);
+                return;
             case Stmt::Kind::Return:
                 dsSeedExprReads(s->expr.get(), ord, live);
                 return;
@@ -2029,8 +2031,10 @@ private:
             case Stmt::Kind::Empty:
                 return;
             case Stmt::Kind::ExprStmt:
+                if (exprHasNonSefCall(s->expr.get())) blExprReads(s->expr.get(), live);
+                return;
             case Stmt::Kind::Return:
-                if (s->kind == Stmt::Kind::Return) live.clear();
+                live.clear();
                 blExprReads(s->expr.get(), live);
                 return;
             case Stmt::Kind::Break:
@@ -6483,14 +6487,16 @@ private:
             case Stmt::Kind::Empty:
                 break;
             case Stmt::Kind::ExprStmt:
+                if (!hasCall(s->expr.get())) break;
                 genExpr(s->expr.get());
                 break;
             case Stmt::Kind::Assign:
+                if (s->fastDeadStore) break;
                 genExpr(s->expr.get());
                 storeVar(s->name);
                 break;
             case Stmt::Kind::DeclStmt:
-                genDecl(*s->decl);
+                genDecl(*s->decl, s->fastDeadStore);
                 break;
             case Stmt::Kind::If:
                 genIf(s);
@@ -6516,16 +6522,17 @@ private:
         }
     }
 
-    void genDecl(const Decl &d) {
+    void genDecl(const Decl &d, bool skipInit = false) {
         if (d.isConst) {
             long long v = evalConst(d.init.get());
             scopes.back()[d.name] = Symbol{true, v, false, "", 0, ""};
             return;
         }
-        genExpr(d.init.get());
         string reg = allocVarReg();
         int off = reg.empty() ? allocSlot() : 0;
         scopes.back()[d.name] = Symbol{false, 0, false, "", off, reg};
+        if (skipInit) return;
+        genExpr(d.init.get());
         if (!reg.empty()) emit("mv " + reg + ", a0");
         else storeMem("a0", "s0", off);
     }
