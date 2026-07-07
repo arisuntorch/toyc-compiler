@@ -3348,7 +3348,7 @@ int main(int argc, char **argv) {
     SafeOptimizer optimizer(program);
     optimizer.run();
     if (optMode) {
-        ConstEvaluator quickConstEval(program, 10000000000LL, 300);
+        ConstEvaluator quickConstEval(program, 1000000LL, 50);
         if (auto value = quickConstEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
