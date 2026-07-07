@@ -12,6 +12,14 @@ Run local checks, then submit to EduCG OJ:
 EDUCG_SESSION=<new_educg_session> python3 tools/run_eval.py --oj --branch main
 ```
 
+Or put the cookie in a local ignored file:
+
+```bash
+cp .env.example .env.local
+# edit .env.local and replace EDUCG_SESSION
+python3 tools/run_eval.py --oj
+```
+
 Submit an experiment branch:
 
 ```bash

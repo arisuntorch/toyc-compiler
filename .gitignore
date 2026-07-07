@@ -4,3 +4,5 @@ tests/*.s
 *.o
 tmp/educg_oj_results*.jsonl
 tmp/educg_oj_debug*
+.env
+.env.local

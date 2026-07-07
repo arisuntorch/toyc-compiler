@@ -79,6 +79,25 @@ def current_branch() -> str | None:
     return branch or None
 
 
+def load_env_file(path: str | None) -> dict[str, str]:
+    if not path:
+        return {}
+    env_path = (ROOT / path).resolve() if not Path(path).is_absolute() else Path(path)
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
 def local_checks(shape_timeout: float) -> None:
     require_ok(run(["make", "clean"]), "make clean")
     require_ok(run(["make"]), "make")
@@ -112,17 +131,19 @@ def local_checks(shape_timeout: float) -> None:
 
 
 def oj_check(args: argparse.Namespace) -> None:
-    session = args.session or os.getenv("EDUCG_SESSION")
+    file_env = load_env_file(args.env_file)
+    session = args.session or os.getenv("EDUCG_SESSION") or file_env.get("EDUCG_SESSION")
     if not session:
-        print("[FAIL] --oj requires EDUCG_SESSION or --session", file=sys.stderr)
+        print("[FAIL] --oj requires EDUCG_SESSION, --session, or .env.local", file=sys.stderr)
         raise SystemExit(2)
 
-    branch = args.branch or current_branch()
+    branch = args.branch or os.getenv("EDUCG_BRANCH") or file_env.get("EDUCG_BRANCH") or current_branch()
+    repo_url = args.repo_url or os.getenv("EDUCG_REPO_URL") or file_env.get("EDUCG_REPO_URL") or DEFAULT_REPO_URL
     cmd = [
         sys.executable,
         str(ROOT / "tools" / "educg_oj_loop.py"),
         "--repo-url",
-        args.repo_url,
+        repo_url,
         "--runs",
         str(args.runs),
         "--out",
@@ -143,7 +164,7 @@ def oj_check(args: argparse.Namespace) -> None:
 
     env = os.environ.copy()
     env["EDUCG_SESSION"] = session
-    print(f"[OJ] repo={args.repo_url} branch={branch or '(default)'}", flush=True)
+    print(f"[OJ] repo={repo_url} branch={branch or '(default)'}", flush=True)
     proc = run(cmd, env=env)
     require_ok(proc, "OJ evaluation")
 
@@ -153,8 +174,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oj", action="store_true", help="submit to OJ after local checks")
     parser.add_argument("--skip-local", action="store_true", help="skip local make and shape checks")
     parser.add_argument("--session", default=None, help="educg_session cookie; prefer EDUCG_SESSION env var")
-    parser.add_argument("--repo-url", default=os.getenv("EDUCG_REPO_URL", DEFAULT_REPO_URL))
-    parser.add_argument("--branch", default=os.getenv("EDUCG_BRANCH"), help="Git branch to submit; defaults to current branch")
+    parser.add_argument("--env-file", default=".env.local", help="local env file for EDUCG_SESSION")
+    parser.add_argument("--repo-url", default=None)
+    parser.add_argument("--branch", default=None, help="Git branch to submit; defaults to current branch")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--until-total", type=float, default=None)
     parser.add_argument("--out", default=DEFAULT_RESULT_LOG)
