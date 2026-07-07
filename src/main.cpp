@@ -1668,7 +1668,14 @@ private:
     static constexpr int kGlobalBit = 1 << 28;
     enum { CMP_LT, CMP_LE, CMP_GT, CMP_GE, CMP_EQ, CMP_NE };
     enum FoldRes { FoldStructFail, FoldValueFail, FoldOk };
-    enum : uint8_t { NO_PERIODIC = 1, NO_GUARDED = 2, NO_AFFINE = 4, NO_NESTED = 8, NO_POLY_SUM = 16 };
+    enum : uint8_t {
+        NO_PERIODIC = 1,
+        NO_GUARDED = 2,
+        NO_AFFINE = 4,
+        NO_NESTED = 8,
+        NO_POLY_SUM = 16,
+        NO_PERIODIC_POLY = 32
+    };
     enum class TransformFlow { Fail, Normal, Continue, Break };
 
     struct AffineLoopS {
@@ -5077,10 +5084,29 @@ private:
                 if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, v)) return false;
                 if (e->opc == OPC_PLUS) out = v;
                 else if (e->opc == OPC_NEG) out = sub32(0, v);
+                else if (e->opc == OPC_NOT) out = !truthy(v);
                 else return false;
                 return true;
             }
             case Expr::Kind::Binary: {
+                if (e->opc == OPC_AND) {
+                    int32_t l = 0;
+                    if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l)) return false;
+                    if (!truthy(l)) { out = 0; return true; }
+                    int32_t r = 0;
+                    if (!evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
+                    out = truthy(r);
+                    return true;
+                }
+                if (e->opc == OPC_OR) {
+                    int32_t l = 0;
+                    if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l)) return false;
+                    if (truthy(l)) { out = 1; return true; }
+                    int32_t r = 0;
+                    if (!evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
+                    out = truthy(r);
+                    return true;
+                }
                 int32_t l = 0, r = 0;
                 if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l) ||
                     !evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
@@ -5090,6 +5116,12 @@ private:
                     case OPC_MUL: out = mul32(l, r); return true;
                     case OPC_DIV: if (r == 0) return false; out = div32(l, r); return true;
                     case OPC_MOD: if (r == 0) return false; out = mod32(l, r); return true;
+                    case OPC_LT: out = l < r; return true;
+                    case OPC_GT: out = l > r; return true;
+                    case OPC_LE: out = l <= r; return true;
+                    case OPC_GE: out = l >= r; return true;
+                    case OPC_EQ: out = l == r; return true;
+                    case OPC_NE: out = l != r; return true;
                 }
                 return false;
             }
@@ -5171,6 +5203,269 @@ private:
         uint32_t sum = floorSumMod32(niter, m, a, b);
         out = neg ? 0u - sum : sum;
         return true;
+    }
+
+    bool collectPeriodicCondModuli(const Expr *e, int indKey, const unordered_set<int> &changing,
+                                   const int32_t *frame, vector<int32_t> &mods) const {
+        if (!e) return true;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                return key != indKey && !changing.count(key);
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary:
+                return collectPeriodicCondModuli(e->lhs.get(), indKey, changing, frame, mods);
+            case Expr::Kind::Binary:
+                if (e->opc == OPC_MOD) {
+                    int key = -1;
+                    int32_t off = 0;
+                    if (!extractInductionPlusConst(e->lhs.get(), key, off) || key != indKey) return false;
+                    int32_t m = 0;
+                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m < 0) m = -m;
+                    if (m > 1) mods.push_back(m);
+                    return true;
+                }
+                return collectPeriodicCondModuli(e->lhs.get(), indKey, changing, frame, mods) &&
+                       collectPeriodicCondModuli(e->rhs.get(), indKey, changing, frame, mods);
+        }
+        return false;
+    }
+
+    bool collectIfPeriodicModuli(const Stmt *s, int indKey, const unordered_set<int> &changing,
+                                 const int32_t *frame, vector<int32_t> &mods, bool &sawIf) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectIfPeriodicModuli(child.get(), indKey, changing, frame, mods, sawIf)) return false;
+                }
+                return true;
+            case Stmt::Kind::If: {
+                sawIf = true;
+                unordered_set<int> vars;
+                collectExprVarKeys(s->expr.get(), vars);
+                bool usesInduction = vars.count(indKey) != 0;
+                for (int key : vars) {
+                    if (key != indKey && changing.count(key)) return false;
+                }
+                if (usesInduction) {
+                    size_t before = mods.size();
+                    if (!collectPeriodicCondModuli(s->expr.get(), indKey, changing, frame, mods)) return false;
+                    if (mods.size() == before) return false;
+                }
+                return collectIfPeriodicModuli(s->thenStmt.get(), indKey, changing, frame, mods, sawIf) &&
+                       collectIfPeriodicModuli(s->elseStmt.get(), indKey, changing, frame, mods, sawIf);
+            }
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+                return false;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            default:
+                return true;
+        }
+    }
+
+    bool extractSingleInductionStep(const Stmt *s, int indKey, optional<int32_t> &step) const {
+        if (!s) return true;
+        if (s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!extractSingleInductionStep(child.get(), indKey, step)) return false;
+                }
+                return true;
+            case Stmt::Kind::If:
+                return extractSingleInductionStep(s->thenStmt.get(), indKey, step) &&
+                       extractSingleInductionStep(s->elseStmt.get(), indKey, step);
+            case Stmt::Kind::Assign:
+                if (assignSlotKey(s) == indKey) {
+                    int key = -1;
+                    int32_t off = 0;
+                    if (!extractInductionPlusConst(s->expr.get(), key, off) || key != indKey || off == 0) return false;
+                    if (step && *step != off) return false;
+                    step = off;
+                }
+                return true;
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+                return false;
+            default:
+                return true;
+        }
+    }
+
+    struct PeriodicPolyCtx {
+        uint64_t count = 0;
+        int32_t phaseIv = 0;
+        int32_t qStep = 0;
+        int32_t indOffset = 0;
+        bool sawAccumulator = false;
+        unordered_map<int, PolyS> aliases;
+        unordered_map<int, uint32_t> deltas;
+    };
+
+    TransformFlow buildPeriodicPolyStmt(const Stmt *s, int indKey, int32_t loopStep,
+                                        const unordered_set<int> &changing, const int32_t *frame,
+                                        PeriodicPolyCtx &ctx) const {
+        if (!s) return TransformFlow::Normal;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    TransformFlow f = buildPeriodicPolyStmt(child.get(), indKey, loopStep, changing, frame, ctx);
+                    if (f != TransformFlow::Normal) return f;
+                }
+                return TransformFlow::Normal;
+            case Stmt::Kind::Empty:
+                return TransformFlow::Normal;
+            case Stmt::Kind::ExprStmt:
+                return exprHasCallS(s->expr.get()) ? TransformFlow::Fail : TransformFlow::Normal;
+            case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return TransformFlow::Normal;
+                if (!s->decl || !s->decl->init) return TransformFlow::Fail;
+                PolyS p;
+                int64_t base = static_cast<int64_t>(ctx.phaseIv) + static_cast<int64_t>(ctx.indOffset);
+                if (!polyExpr(s->decl->init.get(), indKey, base, ctx.qStep, changing, ctx.aliases, frame, p)) {
+                    return TransformFlow::Fail;
+                }
+                ctx.aliases[s->decl->fastSlot] = p;
+                return TransformFlow::Normal;
+            }
+            case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return TransformFlow::Normal;
+                int key = assignSlotKey(s);
+                if (key == indKey) {
+                    int rhsKey = -1;
+                    int32_t off = 0;
+                    if (!extractInductionPlusConst(s->expr.get(), rhsKey, off) || rhsKey != indKey) {
+                        return TransformFlow::Fail;
+                    }
+                    ctx.indOffset = add32(ctx.indOffset, off);
+                    ctx.aliases.erase(key);
+                    return TransformFlow::Normal;
+                }
+
+                int accCoeff = 0;
+                vector<pair<int, const Expr *>> terms;
+                if (!collectAccumDeltaTerms(s->expr.get(), key, 1, accCoeff, terms) || accCoeff != 1) {
+                    return TransformFlow::Fail;
+                }
+                int64_t base = static_cast<int64_t>(ctx.phaseIv) + static_cast<int64_t>(ctx.indOffset);
+                for (auto &piece : terms) {
+                    int sign = piece.first;
+                    const Expr *term = piece.second;
+                    PolyS p;
+                    uint32_t sum = 0;
+                    if (polyExpr(term, indKey, base, ctx.qStep, changing, ctx.aliases, frame, p)) {
+                        sum = sumPoly(p, ctx.count);
+                    } else if (ctx.aliases.empty() &&
+                               (sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
+                                                      ctx.count, changing, frame, sum) ||
+                                sumLinearDivExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
+                                                 ctx.count, changing, frame, sum))) {
+                        // sum was filled by the helper.
+                    } else {
+                        return TransformFlow::Fail;
+                    }
+                    ctx.deltas[key] += sign < 0 ? 0u - sum : sum;
+                }
+                ctx.sawAccumulator = true;
+                ctx.aliases.erase(key);
+                return TransformFlow::Normal;
+            }
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                int32_t iv = add32(ctx.phaseIv, ctx.indOffset);
+                if (!evalExprWithInductionValue(s->expr.get(), indKey, iv, changing, frame, cond)) {
+                    return TransformFlow::Fail;
+                }
+                return truthy(cond)
+                    ? buildPeriodicPolyStmt(s->thenStmt.get(), indKey, loopStep, changing, frame, ctx)
+                    : buildPeriodicPolyStmt(s->elseStmt.get(), indKey, loopStep, changing, frame, ctx);
+            }
+            case Stmt::Kind::Continue:
+                return TransformFlow::Continue;
+            case Stmt::Kind::Break:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Return:
+                return TransformFlow::Fail;
+        }
+        return TransformFlow::Fail;
+    }
+
+    FoldRes tryRunPeriodicPolynomialSumLoop(const Stmt *s, int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
+
+        unordered_set<int> changing;
+        collectAssignedKeys(s->body.get(), changing);
+        if (!changing.count(indKey)) return FoldStructFail;
+
+        optional<int32_t> stepOpt;
+        if (!extractSingleInductionStep(s->body.get(), indKey, stepOpt) || !stepOpt) return FoldStructFail;
+        int32_t step = *stepOpt;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+        int32_t bound = 0;
+        if (!evalExprNoChanging(boundExpr, changing, frame, bound)) return FoldStructFail;
+        bound = add32(bound, boundAdjust);
+        int32_t startIv = readSlot(indKey, frame);
+        auto niterOpt = countIterationsMaybe(cmp, step, startIv, bound);
+        if (!niterOpt) return FoldValueFail;
+        uint64_t niter = *niterOpt;
+        if (niter == 0) return FoldOk;
+
+        vector<int32_t> moduli;
+        bool sawIf = false;
+        if (!collectIfPeriodicModuli(s->body.get(), indKey, changing, frame, moduli, sawIf) || !sawIf) {
+            return FoldStructFail;
+        }
+        uint64_t period = 1;
+        uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
+        for (int32_t mod : moduli) {
+            uint64_t m = static_cast<uint64_t>(mod);
+            uint64_t reduced = m / gcd64(m, absStep % m);
+            period = lcmCapped(period, reduced, 4096);
+            if (period > 4096) return FoldValueFail;
+        }
+        if (period == 0 || period > 4096) return FoldValueFail;
+
+        unordered_map<int, uint32_t> totalDeltas;
+        bool sawAccumulator = false;
+        int32_t qStep = static_cast<int32_t>(static_cast<uint32_t>(step) * static_cast<uint32_t>(period));
+        uint64_t phases = min<uint64_t>(period, niter);
+        for (uint64_t phase = 0; phase < phases; ++phase) {
+            tick(8);
+            PeriodicPolyCtx ctx;
+            ctx.count = (niter - 1 - phase) / period + 1;
+            ctx.phaseIv = static_cast<int32_t>(static_cast<uint32_t>(startIv) +
+                                               static_cast<uint32_t>(step) * static_cast<uint32_t>(phase));
+            ctx.qStep = qStep;
+            TransformFlow flow = buildPeriodicPolyStmt(s->body.get(), indKey, step, changing, frame, ctx);
+            if (flow == TransformFlow::Fail || flow == TransformFlow::Break) return FoldValueFail;
+            if (ctx.indOffset != step) return FoldValueFail;
+            sawAccumulator = sawAccumulator || ctx.sawAccumulator;
+            for (auto &kv : ctx.deltas) totalDeltas[kv.first] += kv.second;
+        }
+        if (!sawAccumulator) return FoldStructFail;
+
+        uint32_t finalIv = static_cast<uint32_t>(startIv) + static_cast<uint32_t>(step) * static_cast<uint32_t>(niter);
+        writeSlot(indKey, static_cast<int32_t>(finalIv), frame);
+        for (auto &kv : totalDeltas) {
+            uint32_t v = static_cast<uint32_t>(readSlot(kv.first, frame));
+            v += kv.second;
+            writeSlot(kv.first, static_cast<int32_t>(v), frame);
+        }
+        return FoldOk;
     }
 
     FoldRes tryRunPolynomialSumLoop(const Stmt *s, int32_t *frame) {
@@ -5315,7 +5610,8 @@ private:
     bool tryFoldWhile(const Stmt *s, int32_t *frame) {
         if (s->fastLoopId < 0 || s->fastLoopId >= static_cast<int>(loopStats.size())) return false;
         LoopStat &st = loopStats[s->fastLoopId];
-        constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED | NO_POLY_SUM;
+        constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED |
+                                      NO_POLY_SUM | NO_PERIODIC_POLY;
         if ((st.structFlags & allStruct) == allStruct) return false;
         if (!st.everFolded && st.failCount >= 8) {
             ++st.failCount;
@@ -5370,6 +5666,14 @@ private:
                 return true;
             }
             if (r == FoldStructFail) st.structFlags |= NO_POLY_SUM;
+        }
+        if (!(st.structFlags & NO_PERIODIC_POLY)) {
+            FoldRes r = tryRunPeriodicPolynomialSumLoop(s, frame);
+            if (r == FoldOk) {
+                st.everFolded = true;
+                return true;
+            }
+            if (r == FoldStructFail) st.structFlags |= NO_PERIODIC_POLY;
         }
         ++st.failCount;
         return false;
@@ -7353,7 +7657,7 @@ int main(int argc, char **argv) {
         // Short time cap: closed-form foldable programs finish in well under a
         // second here, so unfoldable ones only waste ~1.2s before the fast
         // evaluator (which has DCE + JIT the ConstEvaluator lacks) takes over.
-        ConstEvaluator constEval(program, 1000000000LL, 1000);
+        ConstEvaluator constEval(program, 1000000000LL, 200);
         if (auto value = constEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
