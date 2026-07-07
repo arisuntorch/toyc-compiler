@@ -7002,7 +7002,10 @@ int main(int argc, char **argv) {
         }
         SafeOptimizer earlyOptimizer(program);
         earlyOptimizer.run();
-        ConstEvaluator constEval(program, 1000000000LL, 2500);
+        // Short time cap: closed-form foldable programs finish in well under a
+        // second here, so unfoldable ones only waste ~1.2s before the fast
+        // evaluator (which has DCE + JIT the ConstEvaluator lacks) takes over.
+        ConstEvaluator constEval(program, 1000000000LL, 1200);
         if (auto value = constEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
