@@ -2893,26 +2893,95 @@ private:
         if (isMod) jStoreEdx(destSlot); else jStoreEax(destSlot);
     }
 
-    // Signed x / 100 and x % 100 without the very slow idiv instruction.
-    // This mirrors gcc -O2 -fwrapv for a positive constant divisor:
-    // q = (((int64)x * 1374389535) >> 37) - (x >> 31), r = x - q * 100.
-    // Dividend is loaded from srcSlot; quotient/remainder is stored to destSlot.
-    void jDivModI100(int destSlot, int srcSlot, bool isMod) {
+    struct JitMagicDiv {
+        int divisor;
+        int32_t magic;
+        int shift;
+        bool addDividend;
+        bool logicalShift;
+    };
+
+    static optional<JitMagicDiv> jitMagicForDivisor(int divisor) {
+        switch (divisor) {
+            case 3: return JitMagicDiv{3, 1431655766, 32, false, true};
+            case 5: return JitMagicDiv{5, 1717986919, 33, false, false};
+            case 7: return JitMagicDiv{7, static_cast<int32_t>(2454267027u), 2, true, true};
+            case 10: return JitMagicDiv{10, 1717986919, 34, false, false};
+            case 11: return JitMagicDiv{11, 780903145, 33, false, false};
+            case 13: return JitMagicDiv{13, 1321528399, 34, false, false};
+            case 31: return JitMagicDiv{31, static_cast<int32_t>(2216757315u), 4, true, true};
+            case 100: return JitMagicDiv{100, 1374389535, 37, false, false};
+            default: return nullopt;
+        }
+    }
+
+    static bool isPow2Positive(int32_t x) {
+        return x > 0 && (static_cast<uint32_t>(x) & (static_cast<uint32_t>(x) - 1u)) == 0;
+    }
+
+    static int log2Positive(int32_t x) {
+        int n = 0;
+        while ((1 << n) != x) ++n;
+        return n;
+    }
+
+    bool jDivModIPow2(int destSlot, int srcSlot, int32_t divisor, bool isMod) {
+        if (!isPow2Positive(divisor)) return false;
+        if (divisor == 1) {
+            if (isMod) jLiSlot(destSlot, 0);
+            else { jLoadEax(srcSlot); jStoreEax(destSlot); }
+            return true;
+        }
+        int shift = log2Positive(divisor);
         jLoadEax(srcSlot);                      // eax = x
+        jb(0x89); jb(0xC1);                     // mov ecx, eax (orig)
         jb(0x89); jb(0xC2);                     // mov edx, eax
+        jb(0xC1); jb(0xFA); jb(31);             // sar edx, 31
+        jb(0x83); jb(0xE2); jb(static_cast<uint8_t>(divisor - 1)); // and edx, divisor-1
+        jb(0x01); jb(0xD0);                     // add eax, edx
+        jb(0xC1); jb(0xF8); jb(static_cast<uint8_t>(shift));       // sar eax, shift
+        if (!isMod) {
+            jStoreEax(destSlot);
+            return true;
+        }
+        jb(0xC1); jb(0xE0); jb(static_cast<uint8_t>(shift));       // shl eax, shift
+        jb(0x29); jb(0xC1);                     // sub ecx, eax
+        jb(0x89); jb(0xC8);                     // mov eax, ecx
+        jStoreEax(destSlot);
+        return true;
+    }
+
+    // Signed x / C and x % C for common positive constants without the very
+    // slow idiv instruction. These are gcc -O2 -fwrapv style magic-multiply
+    // sequences for constants that show up in loop/performance workloads.
+    bool jDivModIConst(int destSlot, int srcSlot, int32_t divisor, bool isMod) {
+        if (jDivModIPow2(destSlot, srcSlot, divisor, isMod)) return true;
+        auto spec = jitMagicForDivisor(divisor);
+        if (!spec) return false;
+        jLoadEax(srcSlot);                      // eax = x
+        jb(0x89); jb(0xC2);                     // mov edx, eax (orig)
         jb(0x48); jb(0x98);                     // cdqe
-        jb(0x48); jb(0x69); jb(0xC0); j32(1374389535); // imul rax, rax, magic
-        jb(0x48); jb(0xC1); jb(0xF8); jb(37);   // sar rax, 37
+        jb(0x48); jb(0x69); jb(0xC0); j32(spec->magic); // imul rax, rax, magic
+        if (spec->logicalShift) {
+            jb(0x48); jb(0xC1); jb(0xE8); jb(32);       // shr rax, 32
+            if (spec->addDividend) {
+                jb(0x01); jb(0xD0);                     // add eax, edx
+                jb(0xC1); jb(0xF8); jb(static_cast<uint8_t>(spec->shift)); // sar eax, shift
+            }
+        } else {
+            jb(0x48); jb(0xC1); jb(0xF8); jb(static_cast<uint8_t>(spec->shift)); // sar rax, shift
+        }
         jb(0x89); jb(0xD1);                     // mov ecx, edx
         jb(0xC1); jb(0xF9); jb(31);             // sar ecx, 31
         jb(0x29); jb(0xC8);                     // sub eax, ecx
         if (!isMod) {
             jStoreEax(destSlot);
-            return;
+            return true;
         }
-        jb(0x69); jb(0xC0); j32(100);           // imul eax, eax, 100
+        jb(0x69); jb(0xC0); j32(divisor);       // imul eax, eax, divisor
         jb(0x29); jb(0xC2);                     // sub edx, eax
         jStoreEdx(destSlot);
+        return true;
     }
 
     void jEmitCallC(uint64_t fnAddr) {
@@ -2972,11 +3041,11 @@ private:
             case VM_MULI: jImulEaxImm(b, c); jStoreEax(a); return;
             case VM_DIVI:
                 if (c == 0) { jLiSlot(a, 0); return; }
-                if (c == 100) { jDivModI100(a, b, false); return; }
+                if (jDivModIConst(a, b, c, false)) return;
                 jLoadEax(b); jb(0xB9); j32(c); jDivSeq(a, false); return;       // mov ecx, imm
             case VM_MODI:
                 if (c == 0) { jLiSlot(a, 0); return; }
-                if (c == 100) { jDivModI100(a, b, true); return; }
+                if (jDivModIConst(a, b, c, true)) return;
                 jLoadEax(b); jb(0xB9); j32(c); jDivSeq(a, true); return;
             case VM_RSUBI: jb(0xB8); j32(c); jAluEax(0x2B, b); jStoreEax(a); return; // mov eax,imm; sub eax,slot b
             case VM_RDIVI: jb(0xB8); j32(c); jLoadEcx(b); jDivSeq(a, false); return;
