@@ -243,6 +243,7 @@ struct Stmt {
     string name;
     bool fastAssignGlobal = false;
     int fastAssignIndex = -1;
+    bool fastDeadStore = false;
     int fastLoopId = -1;
     unique_ptr<Expr> expr;
     unique_ptr<Stmt> thenStmt;
@@ -1766,6 +1767,115 @@ private:
         }
         loopStats.assign(static_cast<size_t>(loopCount), LoopStat{});
         powCache.assign(static_cast<size_t>(loopCount), PowCacheEntry{});
+        computeDeadStores();
+    }
+
+    // ---- dead store analysis ----
+    //
+    // A store is dead when its target can never flow into control flow,
+    // return values, call arguments, or another live store. Dead stores with
+    // call-free right-hand sides are skipped by both the bytecode compiler and
+    // the loop-fold analysis, which keeps non-affine dead updates from
+    // blocking loop folding.
+
+    struct StoreInfo {
+        Stmt *stmt;
+        Decl *decl;
+        long long target;
+        const Expr *rhs;
+        int ord;
+        bool processed = false;
+    };
+
+    unordered_set<const Decl *> deadGlobalInits;
+
+    static long long dsLocalKey(int ord, int slot) {
+        return (static_cast<long long>(ord) << 24) | static_cast<long long>(slot);
+    }
+
+    static long long dsGlobalKey(int gidx) { return -static_cast<long long>(gidx) - 1; }
+
+    void dsSeedExprReads(const Expr *e, int ord, unordered_set<long long> &live) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            live.insert(e->fastGlobal ? dsGlobalKey(e->fastIndex) : dsLocalKey(ord, e->fastIndex));
+            return;
+        }
+        dsSeedExprReads(e->lhs.get(), ord, live);
+        dsSeedExprReads(e->rhs.get(), ord, live);
+        for (auto &arg : e->args) dsSeedExprReads(arg.get(), ord, live);
+    }
+
+    void dsCollect(Stmt *s, int ord, unordered_set<long long> &live, vector<StoreInfo> &stores) const {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) dsCollect(child.get(), ord, live, stores);
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                dsSeedExprReads(s->expr.get(), ord, live);
+                return;
+            case Stmt::Kind::If:
+                dsSeedExprReads(s->expr.get(), ord, live);
+                dsCollect(s->thenStmt.get(), ord, live, stores);
+                dsCollect(s->elseStmt.get(), ord, live, stores);
+                return;
+            case Stmt::Kind::While:
+                dsSeedExprReads(s->expr.get(), ord, live);
+                dsCollect(s->body.get(), ord, live, stores);
+                return;
+            case Stmt::Kind::Assign: {
+                long long tgt = s->fastAssignGlobal ? dsGlobalKey(s->fastAssignIndex)
+                                                    : dsLocalKey(ord, s->fastAssignIndex);
+                if (exprHasCallS(s->expr.get())) dsSeedExprReads(s->expr.get(), ord, live);
+                else stores.push_back(StoreInfo{s, nullptr, tgt, s->expr.get(), ord});
+                return;
+            }
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return;
+                long long tgt = dsLocalKey(ord, s->decl->fastSlot);
+                if (exprHasCallS(s->decl->init.get())) dsSeedExprReads(s->decl->init.get(), ord, live);
+                else stores.push_back(StoreInfo{s, nullptr, tgt, s->decl->init.get(), ord});
+                return;
+            }
+        }
+    }
+
+    void computeDeadStores() {
+        unordered_set<long long> live;
+        vector<StoreInfo> stores;
+        int ord = 0;
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) {
+                long long tgt = dsGlobalKey(globalIndex[item.decl->name]);
+                if (exprHasCallS(item.decl->init.get())) dsSeedExprReads(item.decl->init.get(), 0, live);
+                else stores.push_back(StoreInfo{nullptr, item.decl.get(), tgt, item.decl->init.get(), 0});
+            } else {
+                ++ord;
+                dsCollect(item.func->body.get(), ord, live, stores);
+            }
+        }
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (auto &st : stores) {
+                if (st.processed || !live.count(st.target)) continue;
+                st.processed = true;
+                dsSeedExprReads(st.rhs, st.ord, live);
+                changed = true;
+            }
+        }
+        deadGlobalInits.clear();
+        for (auto &st : stores) {
+            if (live.count(st.target)) continue;
+            if (st.stmt) st.stmt->fastDeadStore = true;
+            else if (st.decl) deadGlobalInits.insert(st.decl);
+        }
     }
 
     VarRef resolveName(const string &name, const vector<unordered_map<string, int>> &scopes) const {
@@ -1894,6 +2004,7 @@ private:
             cContinueTargets.clear();
             for (auto &item : prog.items) {
                 if (item.kind != TopItem::Kind::Decl) continue;
+                if (deadGlobalInits.count(item.decl.get())) continue;
                 int save = cTempTop;
                 int r = compileExpr(item.decl->init.get());
                 emit(VM_GST, 0, r, globalIndex[item.decl->name]);
@@ -2063,6 +2174,7 @@ private:
                 return;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return;
                 int save = cTempTop;
                 if (s->fastAssignGlobal) {
                     int r = compileExpr(s->expr.get());
@@ -2074,6 +2186,7 @@ private:
                 return;
             }
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return;
                 int save = cTempTop;
                 compileExprInto(s->decl->init.get(), s->decl->fastSlot);
                 cTempTop = save;
@@ -2624,6 +2737,7 @@ private:
             return true;
         }
         if (s->kind == Stmt::Kind::DeclStmt) {
+            if (s->fastDeadStore) return true;
             if (!s->decl || !s->decl->init) return false;
             int key = s->decl->fastSlot;
             if (key < 0 || seen.count(key)) return false;
@@ -2634,6 +2748,7 @@ private:
             return true;
         }
         if (s->kind != Stmt::Kind::Assign) return false;
+        if (s->fastDeadStore) return true;
         int key = assignSlotKey(s);
         if (!seen.count(key)) {
             seen.insert(key);
@@ -2653,6 +2768,7 @@ private:
                 }
                 return true;
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
                 int key = assignSlotKey(s);
                 if (!seen.count(key)) {
                     seen.insert(key);
@@ -2661,6 +2777,7 @@ private:
                 return true;
             }
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
                 if (!s->decl || !s->decl->init) return false;
                 int key = s->decl->fastSlot;
                 if (key < 0 || seen.count(key)) return false;
@@ -2768,6 +2885,7 @@ private:
             case Stmt::Kind::Empty:
                 return true;
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
                 if (!s->decl || !s->decl->init) return false;
                 vector<uint32_t> row;
                 if (!affineExprAliases(s->decl->init.get(), aliases, d, row)) return false;
@@ -2775,6 +2893,7 @@ private:
                 return true;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
                 int key = assignSlotKey(s);
                 if (key & kGlobalBit) return false;
                 vector<uint32_t> row;
@@ -3026,6 +3145,7 @@ private:
             case Stmt::Kind::Empty:
                 return true;
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
                 if (!s->decl || !s->decl->init) return false;
                 auto it = idx.find(s->decl->fastSlot);
                 if (it == idx.end()) return false;
@@ -3035,6 +3155,7 @@ private:
                 return true;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
                 auto it = idx.find(assignSlotKey(s));
                 if (it == idx.end()) return false;
                 vector<uint32_t> row;
@@ -3163,6 +3284,7 @@ private:
 
     void collectAssignedKeys(const Stmt *s, unordered_set<int> &out) const {
         if (!s) return;
+        if (s->fastDeadStore) return;
         if (s->kind == Stmt::Kind::Assign) out.insert(assignSlotKey(s));
         if (s->kind == Stmt::Kind::DeclStmt && s->decl) out.insert(s->decl->fastSlot);
         for (auto &child : s->stmts) collectAssignedKeys(child.get(), out);
@@ -3311,6 +3433,7 @@ private:
             case Stmt::Kind::ExprStmt:
                 return exprHasCallS(s->expr.get()) ? TransformFlow::Fail : TransformFlow::Normal;
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return TransformFlow::Normal;
                 if (!s->decl || !s->decl->init) return TransformFlow::Fail;
                 auto it = idx.find(s->decl->fastSlot);
                 if (it == idx.end()) return TransformFlow::Fail;
@@ -3320,6 +3443,7 @@ private:
                 return TransformFlow::Normal;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return TransformFlow::Normal;
                 auto it = idx.find(assignSlotKey(s));
                 if (it == idx.end()) return TransformFlow::Fail;
                 vector<uint32_t> row;
@@ -3357,6 +3481,7 @@ private:
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
                 if (!s->decl || !s->decl->init) return false;
                 int key = s->decl->fastSlot;
                 if (key < 0 || seen.count(key)) return false;
@@ -3366,6 +3491,7 @@ private:
                 return true;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
                 int key = assignSlotKey(s);
                 if (!seen.count(key)) {
                     seen.insert(key);
@@ -3475,6 +3601,7 @@ private:
             case Stmt::Kind::ExprStmt:
                 return exprHasCallS(s->expr.get()) ? TransformFlow::Fail : TransformFlow::Normal;
             case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return TransformFlow::Normal;
                 if (!s->decl || !s->decl->init) return TransformFlow::Fail;
                 auto it = idx.find(s->decl->fastSlot);
                 if (it == idx.end()) return TransformFlow::Fail;
@@ -3484,6 +3611,7 @@ private:
                 return TransformFlow::Normal;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return TransformFlow::Normal;
                 auto it = idx.find(assignSlotKey(s));
                 if (it == idx.end()) return TransformFlow::Fail;
                 vector<uint32_t> row;
@@ -3800,9 +3928,11 @@ private:
                 }
                 return true;
             case Stmt::Kind::Empty:
+                out.push_back(s);
+                return true;
             case Stmt::Kind::Assign:
             case Stmt::Kind::DeclStmt:
-                out.push_back(s);
+                if (!s->fastDeadStore) out.push_back(s);
                 return true;
             case Stmt::Kind::ExprStmt:
                 if (exprHasCallS(s->expr.get())) return false;
