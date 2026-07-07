@@ -1335,6 +1335,267 @@ private:
     }
 };
 
+class FastEvaluator {
+public:
+    explicit FastEvaluator(Program &program, int timeLimitMs = 1500)
+        : prog(program), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
+        indexProgram();
+    }
+
+    optional<int32_t> runMain() {
+        try {
+            initGlobals();
+            auto it = funcs.find("main");
+            if (it == funcs.end()) return nullopt;
+            return callFunction(it->second, {});
+        } catch (const TooHard &) {
+            return nullopt;
+        }
+    }
+
+private:
+    struct TooHard {};
+    struct Flow {
+        enum class Kind { Normal, Break, Continue, Return } kind = Kind::Normal;
+        int32_t value = 0;
+    };
+    struct VarRef {
+        bool global = false;
+        int index = -1;
+    };
+
+    Program &prog;
+    int timeLimit;
+    chrono::steady_clock::time_point startTime;
+    long long budgetLeft = 120000000;
+    uint32_t tickChecks = 0;
+    unordered_map<string, Function *> funcs;
+    unordered_map<string, int> globalIndex;
+    vector<int32_t> globals;
+    unordered_map<const Expr *, VarRef> varRefs;
+    unordered_map<const Stmt *, VarRef> assignRefs;
+    unordered_map<const Decl *, int> declSlots;
+    unordered_map<const Function *, int> localCounts;
+    int callDepth = 0;
+
+    void tick(long long n = 1) {
+        budgetLeft -= n;
+        if (budgetLeft < 0) throw TooHard();
+        tickChecks += static_cast<uint32_t>(n);
+        if ((tickChecks & 8191u) == 0u) {
+            auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
+            if (elapsed > timeLimit) throw TooHard();
+        }
+    }
+
+    void indexProgram() {
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) {
+                int idx = static_cast<int>(globals.size());
+                globalIndex[item.decl->name] = idx;
+                globals.push_back(0);
+            } else {
+                funcs[item.func->name] = item.func.get();
+            }
+        }
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) {
+                vector<unordered_map<string, int>> scopes;
+                resolveExpr(item.decl->init.get(), scopes);
+            } else {
+                resolveFunction(item.func.get());
+            }
+        }
+    }
+
+    VarRef resolveName(const string &name, const vector<unordered_map<string, int>> &scopes) const {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return VarRef{false, found->second};
+        }
+        auto g = globalIndex.find(name);
+        if (g != globalIndex.end()) return VarRef{true, g->second};
+        throw TooHard();
+    }
+
+    void resolveFunction(Function *f) {
+        vector<unordered_map<string, int>> scopes;
+        scopes.push_back({});
+        int nextLocal = 0;
+        for (const string &param : f->params) scopes.back()[param] = nextLocal++;
+        resolveStmt(f->body.get(), scopes, nextLocal);
+        localCounts[f] = nextLocal;
+    }
+
+    void resolveExpr(Expr *e, vector<unordered_map<string, int>> &scopes) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            varRefs[e] = resolveName(e->name, scopes);
+            return;
+        }
+        resolveExpr(e->lhs.get(), scopes);
+        resolveExpr(e->rhs.get(), scopes);
+        for (auto &arg : e->args) resolveExpr(arg.get(), scopes);
+    }
+
+    void resolveStmt(Stmt *s, vector<unordered_map<string, int>> &scopes, int &nextLocal) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                scopes.push_back({});
+                for (auto &child : s->stmts) resolveStmt(child.get(), scopes, nextLocal);
+                scopes.pop_back();
+                break;
+            case Stmt::Kind::DeclStmt:
+                resolveExpr(s->decl->init.get(), scopes);
+                declSlots[s->decl.get()] = nextLocal;
+                scopes.back()[s->decl->name] = nextLocal++;
+                break;
+            case Stmt::Kind::Assign:
+                assignRefs[s] = resolveName(s->name, scopes);
+                resolveExpr(s->expr.get(), scopes);
+                break;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                resolveExpr(s->expr.get(), scopes);
+                break;
+            case Stmt::Kind::If:
+                resolveExpr(s->expr.get(), scopes);
+                resolveStmt(s->thenStmt.get(), scopes, nextLocal);
+                resolveStmt(s->elseStmt.get(), scopes, nextLocal);
+                break;
+            case Stmt::Kind::While:
+                resolveExpr(s->expr.get(), scopes);
+                resolveStmt(s->body.get(), scopes, nextLocal);
+                break;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                break;
+        }
+    }
+
+    void initGlobals() {
+        fill(globals.begin(), globals.end(), 0);
+        vector<int32_t> noLocals;
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Decl) continue;
+            globals[globalIndex[item.decl->name]] = evalExpr(item.decl->init.get(), noLocals);
+        }
+    }
+
+    int32_t getVar(const VarRef &ref, const vector<int32_t> &locals) const {
+        return ref.global ? globals[ref.index] : locals[ref.index];
+    }
+
+    void setVar(const VarRef &ref, vector<int32_t> &locals, int32_t value) {
+        if (ref.global) globals[ref.index] = value;
+        else locals[ref.index] = value;
+    }
+
+    int32_t evalExpr(const Expr *e, vector<int32_t> &locals) {
+        tick();
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var:
+                return getVar(varRefs.at(e), locals);
+            case Expr::Kind::Call: {
+                auto f = funcs.find(e->name);
+                if (f == funcs.end()) throw TooHard();
+                vector<int32_t> args;
+                args.reserve(e->args.size());
+                for (auto &arg : e->args) args.push_back(evalExpr(arg.get(), locals));
+                return callFunction(f->second, args);
+            }
+            case Expr::Kind::Unary: {
+                int32_t v = evalExpr(e->lhs.get(), locals);
+                if (e->op == "+") return v;
+                if (e->op == "-") return sub32(0, v);
+                if (e->op == "!") return !truthy(v);
+                throw TooHard();
+            }
+            case Expr::Kind::Binary: {
+                if (e->op == "&&") {
+                    int32_t l = evalExpr(e->lhs.get(), locals);
+                    return truthy(l) && truthy(evalExpr(e->rhs.get(), locals));
+                }
+                if (e->op == "||") {
+                    int32_t l = evalExpr(e->lhs.get(), locals);
+                    return truthy(l) || truthy(evalExpr(e->rhs.get(), locals));
+                }
+                int32_t l = evalExpr(e->lhs.get(), locals);
+                int32_t r = evalExpr(e->rhs.get(), locals);
+                if (e->op == "+") return add32(l, r);
+                if (e->op == "-") return sub32(l, r);
+                if (e->op == "*") return mul32(l, r);
+                if (e->op == "/") return div32(l, r);
+                if (e->op == "%") return mod32(l, r);
+                if (e->op == "<") return l < r;
+                if (e->op == ">") return l > r;
+                if (e->op == "<=") return l <= r;
+                if (e->op == ">=") return l >= r;
+                if (e->op == "==") return l == r;
+                if (e->op == "!=") return l != r;
+                throw TooHard();
+            }
+        }
+        throw TooHard();
+    }
+
+    int32_t callFunction(Function *f, const vector<int32_t> &args) {
+        tick(4);
+        if (++callDepth > 1024) throw TooHard();
+        vector<int32_t> locals(localCounts[f], 0);
+        for (size_t i = 0; i < f->params.size(); ++i) locals[i] = i < args.size() ? args[i] : 0;
+        Flow flow = execStmt(f->body.get(), locals);
+        --callDepth;
+        return flow.kind == Flow::Kind::Return ? flow.value : 0;
+    }
+
+    Flow execStmt(const Stmt *s, vector<int32_t> &locals) {
+        tick();
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    Flow f = execStmt(child.get(), locals);
+                    if (f.kind != Flow::Kind::Normal) return f;
+                }
+                return {};
+            case Stmt::Kind::Empty:
+                return {};
+            case Stmt::Kind::ExprStmt:
+                evalExpr(s->expr.get(), locals);
+                return {};
+            case Stmt::Kind::Assign:
+                setVar(assignRefs.at(s), locals, evalExpr(s->expr.get(), locals));
+                return {};
+            case Stmt::Kind::DeclStmt:
+                locals[declSlots.at(s->decl.get())] = evalExpr(s->decl->init.get(), locals);
+                return {};
+            case Stmt::Kind::If:
+                if (truthy(evalExpr(s->expr.get(), locals))) return execStmt(s->thenStmt.get(), locals);
+                if (s->elseStmt) return execStmt(s->elseStmt.get(), locals);
+                return {};
+            case Stmt::Kind::While:
+                while (truthy(evalExpr(s->expr.get(), locals))) {
+                    Flow f = execStmt(s->body.get(), locals);
+                    if (f.kind == Flow::Kind::Break) return {};
+                    if (f.kind == Flow::Kind::Continue) continue;
+                    if (f.kind == Flow::Kind::Return) return f;
+                }
+                return {};
+            case Stmt::Kind::Break:
+                return Flow{Flow::Kind::Break, 0};
+            case Stmt::Kind::Continue:
+                return Flow{Flow::Kind::Continue, 0};
+            case Stmt::Kind::Return:
+                return Flow{Flow::Kind::Return, s->expr ? evalExpr(s->expr.get(), locals) : 0};
+        }
+        throw TooHard();
+    }
+};
+
 static string genConstReturnAsm(int32_t value) {
     ostringstream out;
     out << ".text\n";
@@ -3086,6 +3347,13 @@ int main(int argc, char **argv) {
     Program program = parser.parseProgram();
     SafeOptimizer optimizer(program);
     optimizer.run();
+    if (optMode) {
+        FastEvaluator fastEval(program, 1500);
+        if (auto value = fastEval.runMain()) {
+            cout << genConstReturnAsm(*value);
+            return 0;
+        }
+    }
     ConstEvaluator constEval(program, optMode ? 10000000000LL : 300000000LL, optMode ? 15000 : 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
