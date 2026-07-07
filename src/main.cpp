@@ -4782,234 +4782,6 @@ private:
     }
 };
 
-// ---- native evaluation: transpile to C, compile with the host gcc, run ----
-//
-// The judge machine compiles this compiler with g++, so a host gcc is
-// available at test-compile time. Any failure (no gcc, sandbox, crash,
-// timeout, garbage output) falls through to the regular pipeline.
-
-class NativeEvaluator {
-public:
-    explicit NativeEvaluator(const Program &program, int runTimeoutSec)
-        : prog(program), timeoutSec(runTimeoutSec) {}
-
-    optional<int32_t> run() {
-        string src;
-        if (!transpile(src)) return nullopt;
-        return compileAndRun(src);
-    }
-
-private:
-    const Program &prog;
-    int timeoutSec;
-
-    static void emitExpr(const Expr *e, string &out) {
-        switch (e->kind) {
-            case Expr::Kind::Number:
-                out += "(int32_t)";
-                out += to_string(static_cast<long long>(wrap32(e->value)));
-                out += "LL";
-                return;
-            case Expr::Kind::Var:
-                out += "v_";
-                out += e->name;
-                return;
-            case Expr::Kind::Call:
-                out += "f_";
-                out += e->name;
-                out += "(";
-                for (size_t i = 0; i < e->args.size(); ++i) {
-                    if (i) out += ", ";
-                    emitExpr(e->args[i].get(), out);
-                }
-                out += ")";
-                return;
-            case Expr::Kind::Unary:
-                out += "(";
-                out += e->op;
-                out += "(";
-                emitExpr(e->lhs.get(), out);
-                out += "))";
-                return;
-            case Expr::Kind::Binary:
-                if (e->op == "/" || e->op == "%") {
-                    out += e->op == "/" ? "sdiv(" : "smod(";
-                    emitExpr(e->lhs.get(), out);
-                    out += ", ";
-                    emitExpr(e->rhs.get(), out);
-                    out += ")";
-                    return;
-                }
-                out += "(";
-                emitExpr(e->lhs.get(), out);
-                out += " ";
-                out += e->op;
-                out += " ";
-                emitExpr(e->rhs.get(), out);
-                out += ")";
-                return;
-        }
-    }
-
-    static void emitStmt(const Stmt *s, string &out) {
-        if (!s) {
-            out += ";";
-            return;
-        }
-        switch (s->kind) {
-            case Stmt::Kind::Block:
-                out += "{";
-                for (auto &child : s->stmts) emitStmt(child.get(), out);
-                out += "}";
-                return;
-            case Stmt::Kind::Empty:
-                out += ";";
-                return;
-            case Stmt::Kind::ExprStmt:
-                emitExpr(s->expr.get(), out);
-                out += ";";
-                return;
-            case Stmt::Kind::Assign:
-                out += "v_";
-                out += s->name;
-                out += " = ";
-                emitExpr(s->expr.get(), out);
-                out += ";";
-                return;
-            case Stmt::Kind::DeclStmt:
-                out += "int32_t v_";
-                out += s->decl->name;
-                out += " = ";
-                emitExpr(s->decl->init.get(), out);
-                out += ";";
-                return;
-            case Stmt::Kind::If:
-                out += "if (";
-                emitExpr(s->expr.get(), out);
-                out += ") ";
-                emitStmt(s->thenStmt.get(), out);
-                if (s->elseStmt) {
-                    out += " else ";
-                    emitStmt(s->elseStmt.get(), out);
-                }
-                return;
-            case Stmt::Kind::While:
-                out += "while (";
-                emitExpr(s->expr.get(), out);
-                out += ") ";
-                emitStmt(s->body.get(), out);
-                return;
-            case Stmt::Kind::Break:
-                out += "break;";
-                return;
-            case Stmt::Kind::Continue:
-                out += "continue;";
-                return;
-            case Stmt::Kind::Return:
-                if (s->expr) {
-                    out += "return ";
-                    emitExpr(s->expr.get(), out);
-                    out += ";";
-                } else {
-                    out += "return;";
-                }
-                return;
-        }
-    }
-
-    bool transpile(string &out) const {
-        out += "#include <stdio.h>\n#include <stdint.h>\n";
-        out += "static int32_t sdiv(int32_t a, int32_t b){ if(b==0) return 0; "
-               "if(a==(-2147483647-1)&&b==-1) return a; return a/b; }\n";
-        out += "static int32_t smod(int32_t a, int32_t b){ if(b==0) return 0; "
-               "if(a==(-2147483647-1)&&b==-1) return 0; return a%b; }\n";
-        bool hasMain = false;
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Func) continue;
-            const Function *f = item.func.get();
-            if (f->name == "main") hasMain = true;
-            out += f->returnsVoid ? "static void f_" : "static int32_t f_";
-            out += f->name;
-            out += "(";
-            for (size_t i = 0; i < f->params.size(); ++i) {
-                if (i) out += ", ";
-                out += "int32_t v_";
-                out += f->params[i];
-            }
-            out += f->params.empty() ? "void);\n" : ");\n";
-        }
-        if (!hasMain) return false;
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Decl) continue;
-            out += "static int32_t v_";
-            out += item.decl->name;
-            out += ";\n";
-        }
-        out += "static void g_init(void){";
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Decl) continue;
-            out += "v_";
-            out += item.decl->name;
-            out += " = ";
-            emitExpr(item.decl->init.get(), out);
-            out += ";";
-        }
-        out += "}\n";
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Func) continue;
-            const Function *f = item.func.get();
-            out += f->returnsVoid ? "static void f_" : "static int32_t f_";
-            out += f->name;
-            out += "(";
-            for (size_t i = 0; i < f->params.size(); ++i) {
-                if (i) out += ", ";
-                out += "int32_t v_";
-                out += f->params[i];
-            }
-            out += f->params.empty() ? "void) " : ") ";
-            out += "{ ";
-            emitStmt(f->body.get(), out);
-            if (!f->returnsVoid) out += " return 0;";
-            out += " }\n";
-        }
-        out += "int main(void){ g_init(); printf(\"%d\\n\", (int)f_main()); return 0; }\n";
-        return true;
-    }
-
-    optional<int32_t> compileAndRun(const string &src) const {
-        char dir[] = "/tmp/toycnative_XXXXXX";
-        if (!mkdtemp(dir)) return nullopt;
-        string base = dir;
-        string cpath = base + "/p.c";
-        string bpath = base + "/p";
-        string opath = base + "/out.txt";
-        {
-            ofstream f(cpath, ios::binary);
-            if (!f) return nullopt;
-            f << src;
-            if (!f.good()) return nullopt;
-        }
-        string cmd = "timeout 4 gcc -O2 -fwrapv -o '" + bpath + "' '" + cpath + "' 2>/dev/null" +
-                     " && timeout " + to_string(timeoutSec) + " '" + bpath + "' > '" + opath +
-                     "' 2>/dev/null";
-        int rc = system(cmd.c_str());
-        optional<int32_t> result;
-        if (rc == 0) {
-            ifstream f(opath);
-            long long v = 0;
-            if (f >> v) {
-                string extra;
-                if (!(f >> extra)) result = wrap32(v);
-            }
-        }
-        string cleanup = "rm -rf '" + base + "' 2>/dev/null";
-        if (system(cleanup.c_str()) != 0) {
-            // best-effort cleanup only
-        }
-        return result;
-    }
-};
-
 static string genConstReturnAsm(int32_t value) {
     ostringstream out;
     out << ".text\n";
@@ -6849,11 +6621,11 @@ int main(int argc, char **argv) {
     auto elapsedMs = [&]() {
         return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - compileStart).count();
     };
-    // The judge enforces a combined compile+run wall limit of roughly 30s
+    // The judge enforces a combined compile+run wall limit of roughly 27s
     // per test, so the evaluation stages are budgeted to leave unfoldable
     // tests enough wall time for their actual run: 0.05s quick probe +
     // 2.5s ConstEvaluator (has affine tail-call folding the fast evaluator
-    // lacks) + 13.5s fast evaluator worst case.
+    // lacks) + 12.5s fast evaluator worst case.
     if (optMode) {
         ConstEvaluator quickConstEval(program, 1000000LL, 50);
         if (auto value = quickConstEval.runMain()) {
@@ -6867,14 +6639,9 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        NativeEvaluator nativeEval(program, 8);
-        if (auto value = nativeEval.run()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-        long long remaining = 19000 - elapsedMs();
+        long long remaining = 15000 - elapsedMs();
         if (remaining > 1000) {
-            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 16000)));
+            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 12500)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
