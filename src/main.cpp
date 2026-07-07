@@ -1956,18 +1956,119 @@ private:
 
     // ---- bytecode compiler ----
 
+#define VM_OPCODES(X) \
+    X(LI) X(MOV) X(GLD) X(GST) \
+    X(ADD) X(SUB) X(MUL) X(DIV) X(MOD) \
+    X(SLT) X(SGT) X(SLE) X(SGE) X(SEQ) X(SNE) \
+    X(ADDI) X(MULI) X(DIVI) X(MODI) \
+    X(RSUBI) X(RDIVI) X(RMODI) \
+    X(SLTI) X(SGTI) X(SLEI) X(SGEI) X(SEQI) X(SNEI) \
+    X(NEG) X(SNEZ) X(SEQZ) \
+    X(JMP) X(JZ) X(JNZ) \
+    X(BLT_RR) X(BLE_RR) X(BGT_RR) X(BGE_RR) X(BEQ_RR) X(BNE_RR) \
+    X(BLT_RI) X(BLE_RI) X(BGT_RI) X(BGE_RI) X(BEQ_RI) X(BNE_RI) \
+    X(CALL) X(TCALL) X(RET) X(RETI) \
+    X(FOLD)
+
     enum : uint16_t {
-        VM_LI, VM_MOV, VM_GLD, VM_GST,
-        VM_ADD, VM_SUB, VM_MUL, VM_DIV, VM_MOD,
-        VM_SLT, VM_SGT, VM_SLE, VM_SGE, VM_SEQ, VM_SNE,
-        VM_ADDI, VM_MULI, VM_DIVI, VM_MODI,
-        VM_RSUBI, VM_RDIVI, VM_RMODI,
-        VM_SLTI, VM_SGTI, VM_SLEI, VM_SGEI, VM_SEQI, VM_SNEI,
-        VM_NEG, VM_SNEZ, VM_SEQZ,
-        VM_JMP, VM_JZ, VM_JNZ,
-        VM_CALL, VM_TCALL, VM_RET, VM_RETI,
-        VM_FOLD
+#define VM_ENUM_ENTRY(name) VM_##name,
+        VM_OPCODES(VM_ENUM_ENTRY)
+#undef VM_ENUM_ENTRY
+        VM_OPCOUNT
     };
+
+    static int negateRel(int opc) {
+        switch (opc) {
+            case OPC_LT: return OPC_GE;
+            case OPC_LE: return OPC_GT;
+            case OPC_GT: return OPC_LE;
+            case OPC_GE: return OPC_LT;
+            case OPC_EQ: return OPC_NE;
+            default: return OPC_EQ;
+        }
+    }
+
+    static int swapRel(int opc) {
+        switch (opc) {
+            case OPC_LT: return OPC_GT;
+            case OPC_LE: return OPC_GE;
+            case OPC_GT: return OPC_LT;
+            case OPC_GE: return OPC_LE;
+            default: return opc;
+        }
+    }
+
+    static uint16_t rrBranchOp(int opc) {
+        switch (opc) {
+            case OPC_LT: return VM_BLT_RR;
+            case OPC_LE: return VM_BLE_RR;
+            case OPC_GT: return VM_BGT_RR;
+            case OPC_GE: return VM_BGE_RR;
+            case OPC_EQ: return VM_BEQ_RR;
+            default: return VM_BNE_RR;
+        }
+    }
+
+    static uint16_t riBranchOp(int opc) {
+        switch (opc) {
+            case OPC_LT: return VM_BLT_RI;
+            case OPC_LE: return VM_BLE_RI;
+            case OPC_GT: return VM_BGT_RI;
+            case OPC_GE: return VM_BGE_RI;
+            case OPC_EQ: return VM_BEQ_RI;
+            default: return VM_BNE_RI;
+        }
+    }
+
+    // Emits jumps taken when the condition evaluates to jumpIfTrue; every
+    // emitted jump's target is left unpatched and returned through patches.
+    void compileCondJump(const Expr *e, bool jumpIfTrue, vector<int> &patches) {
+        if (e->kind == Expr::Kind::Unary && e->opc == OPC_NOT) {
+            compileCondJump(e->lhs.get(), !jumpIfTrue, patches);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary) {
+            int opc = e->opc;
+            if (opc == OPC_AND || opc == OPC_OR) {
+                bool sequential = (opc == OPC_AND) ? !jumpIfTrue : jumpIfTrue;
+                if (sequential) {
+                    compileCondJump(e->lhs.get(), jumpIfTrue, patches);
+                    compileCondJump(e->rhs.get(), jumpIfTrue, patches);
+                    return;
+                }
+                vector<int> skip;
+                compileCondJump(e->lhs.get(), !jumpIfTrue, skip);
+                compileCondJump(e->rhs.get(), jumpIfTrue, patches);
+                for (int idx : skip) patchC(idx, here());
+                return;
+            }
+            if (opc >= OPC_LT && opc <= OPC_NE) {
+                int braOpc = jumpIfTrue ? opc : negateRel(opc);
+                int save = cTempTop;
+                if (e->rhs->kind == Expr::Kind::Number) {
+                    int l = compileExpr(e->lhs.get());
+                    cTempTop = save;
+                    patches.push_back(emit(riBranchOp(braOpc), l, wrap32(e->rhs->value), 0));
+                    return;
+                }
+                if (e->lhs->kind == Expr::Kind::Number) {
+                    int r = compileExpr(e->rhs.get());
+                    cTempTop = save;
+                    patches.push_back(emit(riBranchOp(swapRel(braOpc)), r, wrap32(e->lhs->value), 0));
+                    return;
+                }
+                int l = compileExpr(e->lhs.get());
+                int r = compileExpr(e->rhs.get());
+                cTempTop = save;
+                patches.push_back(emit(rrBranchOp(braOpc), l, r, 0));
+                return;
+            }
+        }
+        int save = cTempTop;
+        int r = compileExpr(e);
+        cTempTop = save;
+        patches.push_back(emit(jumpIfTrue ? VM_JNZ : VM_JZ, 0, r, 0));
+    }
 
     int emit(uint16_t op, int a, int b, int c) {
         if (a < 0 || a > 65535) throw TooHard();
@@ -2193,18 +2294,16 @@ private:
                 return;
             }
             case Stmt::Kind::If: {
-                int save = cTempTop;
-                int c = compileExpr(s->expr.get());
-                cTempTop = save;
-                int jz = emit(VM_JZ, 0, c, 0);
+                vector<int> elsePatches;
+                compileCondJump(s->expr.get(), false, elsePatches);
                 compileStmt(s->thenStmt.get());
                 if (s->elseStmt) {
                     int jmp = emit(VM_JMP, 0, 0, 0);
-                    patchC(jz, here());
+                    for (int idx : elsePatches) patchC(idx, here());
                     compileStmt(s->elseStmt.get());
                     patchC(jmp, here());
                 } else {
-                    patchC(jz, here());
+                    for (int idx : elsePatches) patchC(idx, here());
                 }
                 return;
             }
@@ -2212,17 +2311,15 @@ private:
                 int foldIdx = emit(VM_FOLD, 0, static_cast<int>(foldStmts.size()), 0);
                 foldStmts.push_back(s);
                 int condStart = here();
-                int save = cTempTop;
-                int c = compileExpr(s->expr.get());
-                cTempTop = save;
-                int jz = emit(VM_JZ, 0, c, 0);
+                vector<int> exitPatches;
+                compileCondJump(s->expr.get(), false, exitPatches);
                 cBreakPatches.push_back({});
                 cContinueTargets.push_back(condStart);
                 compileStmt(s->body.get());
                 emit(VM_JMP, 0, 0, condStart);
                 int end = here();
-                patchC(jz, end);
                 patchC(foldIdx, end);
+                for (int idx : exitPatches) patchC(idx, end);
                 for (int idx : cBreakPatches.back()) patchC(idx, end);
                 cBreakPatches.pop_back();
                 cContinueTargets.pop_back();
@@ -2301,86 +2398,118 @@ private:
                 if (elapsed > timeLimit) throw TooHard();
             }
         };
+        const Insn *ip;
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+        static const void *kJumpTable[] = {
+#define VM_LABEL_ENTRY(name) &&Lop_##name,
+            VM_OPCODES(VM_LABEL_ENTRY)
+#undef VM_LABEL_ENTRY
+        };
+#define VM_CASE(name) Lop_##name
+#define VM_NEXT() do { ip = &fn->code[pc++]; goto *kJumpTable[ip->op]; } while (0)
+        VM_NEXT();
+#else
+#define VM_CASE(name) case VM_##name
+#define VM_NEXT() break
         for (;;) {
-            const Insn &in = fn->code[pc++];
-            switch (in.op) {
-                case VM_LI: r[in.a] = in.c; break;
-                case VM_MOV: r[in.a] = r[in.b]; break;
-                case VM_GLD: r[in.a] = globals[in.c]; break;
-                case VM_GST: globals[in.c] = r[in.b]; break;
-                case VM_ADD: r[in.a] = add32(r[in.b], r[in.c]); break;
-                case VM_SUB: r[in.a] = sub32(r[in.b], r[in.c]); break;
-                case VM_MUL: r[in.a] = mul32(r[in.b], r[in.c]); break;
-                case VM_DIV: r[in.a] = div32(r[in.b], r[in.c]); break;
-                case VM_MOD: r[in.a] = mod32(r[in.b], r[in.c]); break;
-                case VM_SLT: r[in.a] = r[in.b] < r[in.c]; break;
-                case VM_SGT: r[in.a] = r[in.b] > r[in.c]; break;
-                case VM_SLE: r[in.a] = r[in.b] <= r[in.c]; break;
-                case VM_SGE: r[in.a] = r[in.b] >= r[in.c]; break;
-                case VM_SEQ: r[in.a] = r[in.b] == r[in.c]; break;
-                case VM_SNE: r[in.a] = r[in.b] != r[in.c]; break;
-                case VM_ADDI: r[in.a] = add32(r[in.b], in.c); break;
-                case VM_MULI: r[in.a] = mul32(r[in.b], in.c); break;
-                case VM_DIVI: r[in.a] = div32(r[in.b], in.c); break;
-                case VM_MODI: r[in.a] = mod32(r[in.b], in.c); break;
-                case VM_RSUBI: r[in.a] = sub32(in.c, r[in.b]); break;
-                case VM_RDIVI: r[in.a] = div32(in.c, r[in.b]); break;
-                case VM_RMODI: r[in.a] = mod32(in.c, r[in.b]); break;
-                case VM_SLTI: r[in.a] = r[in.b] < in.c; break;
-                case VM_SGTI: r[in.a] = r[in.b] > in.c; break;
-                case VM_SLEI: r[in.a] = r[in.b] <= in.c; break;
-                case VM_SGEI: r[in.a] = r[in.b] >= in.c; break;
-                case VM_SEQI: r[in.a] = r[in.b] == in.c; break;
-                case VM_SNEI: r[in.a] = r[in.b] != in.c; break;
-                case VM_NEG: r[in.a] = sub32(0, r[in.b]); break;
-                case VM_SNEZ: r[in.a] = r[in.b] != 0; break;
-                case VM_SEQZ: r[in.a] = r[in.b] == 0; break;
-                case VM_JMP: charge(); pc = in.c; break;
-                case VM_JZ: if (!r[in.b]) { charge(); pc = in.c; } break;
-                case VM_JNZ: if (r[in.b]) { charge(); pc = in.c; } break;
-                case VM_CALL: {
-                    charge();
-                    const VmFunc *callee = &vmFuncs[in.c];
-                    int newBase = base + fn->frameSize;
-                    if (calls.size() >= (1u << 20) || newBase + callee->frameSize > stackSize) throw TooHard();
-                    calls.push_back(CallRec{fn, pc, base, in.a});
-                    int32_t *nr = stack.data() + newBase;
-                    for (int i = 0; i < callee->nparams; ++i) nr[i] = r[in.b + i];
-                    fn = callee;
-                    base = newBase;
-                    r = nr;
-                    pc = 0;
-                    break;
-                }
-                case VM_TCALL: {
-                    charge();
-                    const VmFunc *callee = &vmFuncs[in.c];
-                    if (base + callee->frameSize > stackSize) throw TooHard();
-                    for (int i = 0; i < callee->nparams; ++i) r[i] = r[in.b + i];
-                    fn = callee;
-                    pc = 0;
-                    break;
-                }
-                case VM_RET:
-                case VM_RETI: {
-                    int32_t v = in.op == VM_RET ? r[in.b] : in.c;
-                    if (calls.empty()) return v;
-                    CallRec rec = calls.back();
-                    calls.pop_back();
-                    fn = rec.fn;
-                    pc = rec.pc;
-                    base = rec.base;
-                    r = stack.data() + base;
-                    r[rec.dst] = v;
-                    break;
-                }
-                case VM_FOLD:
-                    if (tryFoldWhile(foldStmts[in.b], r)) pc = in.c;
-                    break;
+            ip = &fn->code[pc++];
+            switch (ip->op) {
+#endif
+        VM_CASE(LI): r[ip->a] = ip->c; VM_NEXT();
+        VM_CASE(MOV): r[ip->a] = r[ip->b]; VM_NEXT();
+        VM_CASE(GLD): r[ip->a] = globals[ip->c]; VM_NEXT();
+        VM_CASE(GST): globals[ip->c] = r[ip->b]; VM_NEXT();
+        VM_CASE(ADD): r[ip->a] = add32(r[ip->b], r[ip->c]); VM_NEXT();
+        VM_CASE(SUB): r[ip->a] = sub32(r[ip->b], r[ip->c]); VM_NEXT();
+        VM_CASE(MUL): r[ip->a] = mul32(r[ip->b], r[ip->c]); VM_NEXT();
+        VM_CASE(DIV): r[ip->a] = div32(r[ip->b], r[ip->c]); VM_NEXT();
+        VM_CASE(MOD): r[ip->a] = mod32(r[ip->b], r[ip->c]); VM_NEXT();
+        VM_CASE(SLT): r[ip->a] = r[ip->b] < r[ip->c]; VM_NEXT();
+        VM_CASE(SGT): r[ip->a] = r[ip->b] > r[ip->c]; VM_NEXT();
+        VM_CASE(SLE): r[ip->a] = r[ip->b] <= r[ip->c]; VM_NEXT();
+        VM_CASE(SGE): r[ip->a] = r[ip->b] >= r[ip->c]; VM_NEXT();
+        VM_CASE(SEQ): r[ip->a] = r[ip->b] == r[ip->c]; VM_NEXT();
+        VM_CASE(SNE): r[ip->a] = r[ip->b] != r[ip->c]; VM_NEXT();
+        VM_CASE(ADDI): r[ip->a] = add32(r[ip->b], ip->c); VM_NEXT();
+        VM_CASE(MULI): r[ip->a] = mul32(r[ip->b], ip->c); VM_NEXT();
+        VM_CASE(DIVI): r[ip->a] = div32(r[ip->b], ip->c); VM_NEXT();
+        VM_CASE(MODI): r[ip->a] = mod32(r[ip->b], ip->c); VM_NEXT();
+        VM_CASE(RSUBI): r[ip->a] = sub32(ip->c, r[ip->b]); VM_NEXT();
+        VM_CASE(RDIVI): r[ip->a] = div32(ip->c, r[ip->b]); VM_NEXT();
+        VM_CASE(RMODI): r[ip->a] = mod32(ip->c, r[ip->b]); VM_NEXT();
+        VM_CASE(SLTI): r[ip->a] = r[ip->b] < ip->c; VM_NEXT();
+        VM_CASE(SGTI): r[ip->a] = r[ip->b] > ip->c; VM_NEXT();
+        VM_CASE(SLEI): r[ip->a] = r[ip->b] <= ip->c; VM_NEXT();
+        VM_CASE(SGEI): r[ip->a] = r[ip->b] >= ip->c; VM_NEXT();
+        VM_CASE(SEQI): r[ip->a] = r[ip->b] == ip->c; VM_NEXT();
+        VM_CASE(SNEI): r[ip->a] = r[ip->b] != ip->c; VM_NEXT();
+        VM_CASE(NEG): r[ip->a] = sub32(0, r[ip->b]); VM_NEXT();
+        VM_CASE(SNEZ): r[ip->a] = r[ip->b] != 0; VM_NEXT();
+        VM_CASE(SEQZ): r[ip->a] = r[ip->b] == 0; VM_NEXT();
+        VM_CASE(JMP): charge(); pc = ip->c; VM_NEXT();
+        VM_CASE(JZ): if (!r[ip->b]) { charge(); pc = ip->c; } VM_NEXT();
+        VM_CASE(JNZ): if (r[ip->b]) { charge(); pc = ip->c; } VM_NEXT();
+        VM_CASE(BLT_RR): if (r[ip->a] < r[ip->b]) pc = ip->c; VM_NEXT();
+        VM_CASE(BLE_RR): if (r[ip->a] <= r[ip->b]) pc = ip->c; VM_NEXT();
+        VM_CASE(BGT_RR): if (r[ip->a] > r[ip->b]) pc = ip->c; VM_NEXT();
+        VM_CASE(BGE_RR): if (r[ip->a] >= r[ip->b]) pc = ip->c; VM_NEXT();
+        VM_CASE(BEQ_RR): if (r[ip->a] == r[ip->b]) pc = ip->c; VM_NEXT();
+        VM_CASE(BNE_RR): if (r[ip->a] != r[ip->b]) pc = ip->c; VM_NEXT();
+        VM_CASE(BLT_RI): if (r[ip->a] < ip->b) pc = ip->c; VM_NEXT();
+        VM_CASE(BLE_RI): if (r[ip->a] <= ip->b) pc = ip->c; VM_NEXT();
+        VM_CASE(BGT_RI): if (r[ip->a] > ip->b) pc = ip->c; VM_NEXT();
+        VM_CASE(BGE_RI): if (r[ip->a] >= ip->b) pc = ip->c; VM_NEXT();
+        VM_CASE(BEQ_RI): if (r[ip->a] == ip->b) pc = ip->c; VM_NEXT();
+        VM_CASE(BNE_RI): if (r[ip->a] != ip->b) pc = ip->c; VM_NEXT();
+        VM_CASE(CALL): {
+            charge();
+            const VmFunc *callee = &vmFuncs[ip->c];
+            int newBase = base + fn->frameSize;
+            if (calls.size() >= (1u << 20) || newBase + callee->frameSize > stackSize) throw TooHard();
+            calls.push_back(CallRec{fn, pc, base, ip->a});
+            int32_t *nr = stack.data() + newBase;
+            for (int i = 0; i < callee->nparams; ++i) nr[i] = r[ip->b + i];
+            fn = callee;
+            base = newBase;
+            r = nr;
+            pc = 0;
+        } VM_NEXT();
+        VM_CASE(TCALL): {
+            charge();
+            const VmFunc *callee = &vmFuncs[ip->c];
+            if (base + callee->frameSize > stackSize) throw TooHard();
+            for (int i = 0; i < callee->nparams; ++i) r[i] = r[ip->b + i];
+            fn = callee;
+            pc = 0;
+        } VM_NEXT();
+        VM_CASE(RET):
+        VM_CASE(RETI): {
+            int32_t v = ip->op == VM_RET ? r[ip->b] : ip->c;
+            if (calls.empty()) return v;
+            CallRec rec = calls.back();
+            calls.pop_back();
+            fn = rec.fn;
+            pc = rec.pc;
+            base = rec.base;
+            r = stack.data() + base;
+            r[rec.dst] = v;
+        } VM_NEXT();
+        VM_CASE(FOLD):
+            if (tryFoldWhile(foldStmts[ip->b], r)) pc = ip->c;
+            VM_NEXT();
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#else
                 default:
                     throw TooHard();
             }
         }
+#endif
+#undef VM_CASE
+#undef VM_NEXT
+        throw TooHard();
     }
 
     // ---- slot helpers ----
