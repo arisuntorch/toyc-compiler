@@ -1610,19 +1610,20 @@ public:
         : prog(program), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
         try {
             indexProgram();
+            compileAll();
         } catch (const TooHard &) {
             broken = true;
         }
-        stack.resize(1 << 20);
+        stack.resize(1 << 22);
     }
 
     optional<int32_t> runMain() {
         if (broken) return nullopt;
         try {
-            initGlobals();
-            auto it = funcs.find("main");
-            if (it == funcs.end()) return nullopt;
-            return callFunction(it->second, nullptr, 0);
+            fill(globals.begin(), globals.end(), 0);
+            runVm(initFuncIdx, nullptr, 0);
+            if (mainFuncIdx < 0) return nullopt;
+            return runVm(mainFuncIdx, nullptr, 0);
         } catch (const TooHard &) {
             return nullopt;
         }
@@ -1680,6 +1681,30 @@ private:
     int loopCount = 0;
     vector<LoopStat> loopStats;
     vector<PowCacheEntry> powCache;
+
+    struct Insn {
+        uint16_t op;
+        uint16_t a;
+        int32_t b;
+        int32_t c;
+    };
+    struct VmFunc {
+        vector<Insn> code;
+        int frameSize = 0;
+        int nparams = 0;
+    };
+
+    unordered_map<string, int> funcIndex;
+    vector<VmFunc> vmFuncs;
+    vector<const Stmt *> foldStmts;
+    int initFuncIdx = -1;
+    int mainFuncIdx = -1;
+
+    VmFunc *cf = nullptr;
+    int cTempTop = 0;
+    int cMaxTemp = 0;
+    vector<vector<int>> cBreakPatches;
+    vector<int> cContinueTargets;
 
     void tick(long long n = 1) {
         budgetLeft -= n;
@@ -1813,134 +1838,422 @@ private:
         }
     }
 
-    void initGlobals() {
-        fill(globals.begin(), globals.end(), 0);
-        for (auto &item : prog.items) {
-            if (item.kind != TopItem::Kind::Decl) continue;
-            globals[globalIndex[item.decl->name]] = evalExpr(item.decl->init.get(), nullptr);
-        }
+    // ---- bytecode compiler ----
+
+    enum : uint16_t {
+        VM_LI, VM_MOV, VM_GLD, VM_GST,
+        VM_ADD, VM_SUB, VM_MUL, VM_DIV, VM_MOD,
+        VM_SLT, VM_SGT, VM_SLE, VM_SGE, VM_SEQ, VM_SNE,
+        VM_ADDI, VM_MULI, VM_DIVI, VM_MODI,
+        VM_RSUBI, VM_RDIVI, VM_RMODI,
+        VM_SLTI, VM_SGTI, VM_SLEI, VM_SGEI, VM_SEQI, VM_SNEI,
+        VM_NEG, VM_SNEZ, VM_SEQZ,
+        VM_JMP, VM_JZ, VM_JNZ,
+        VM_CALL, VM_TCALL, VM_RET, VM_RETI,
+        VM_FOLD
+    };
+
+    int emit(uint16_t op, int a, int b, int c) {
+        if (a < 0 || a > 65535) throw TooHard();
+        cf->code.push_back(Insn{op, static_cast<uint16_t>(a), b, c});
+        return static_cast<int>(cf->code.size()) - 1;
     }
 
-    int32_t evalExpr(const Expr *e, const int32_t *frame) {
-        tick();
+    int here() const { return static_cast<int>(cf->code.size()); }
+
+    void patchC(int idx, int target) { cf->code[idx].c = target; }
+
+    int allocTemp() {
+        int t = cTempTop++;
+        if (cTempTop > cMaxTemp) cMaxTemp = cTempTop;
+        if (t > 60000) throw TooHard();
+        return t;
+    }
+
+    void compileAll() {
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func) continue;
+            funcIndex[item.func->name] = static_cast<int>(vmFuncs.size());
+            vmFuncs.push_back(VmFunc{});
+            vmFuncs.back().nparams = static_cast<int>(item.func->params.size());
+        }
+        initFuncIdx = static_cast<int>(vmFuncs.size());
+        vmFuncs.push_back(VmFunc{});
+        {
+            VmFunc fn;
+            cf = &fn;
+            cTempTop = 0;
+            cMaxTemp = 0;
+            cBreakPatches.clear();
+            cContinueTargets.clear();
+            for (auto &item : prog.items) {
+                if (item.kind != TopItem::Kind::Decl) continue;
+                int save = cTempTop;
+                int r = compileExpr(item.decl->init.get());
+                emit(VM_GST, 0, r, globalIndex[item.decl->name]);
+                cTempTop = save;
+            }
+            emit(VM_RETI, 0, 0, 0);
+            fn.frameSize = cMaxTemp;
+            vmFuncs[initFuncIdx] = std::move(fn);
+        }
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func) continue;
+            compileFunction(item.func.get(), vmFuncs[funcIndex[item.func->name]]);
+        }
+        auto it = funcIndex.find("main");
+        mainFuncIdx = it != funcIndex.end() ? it->second : -1;
+        cf = nullptr;
+    }
+
+    void compileFunction(Function *f, VmFunc &out) {
+        cf = &out;
+        int nloc = f->fastLocalCount;
+        if (nloc < 0) throw TooHard();
+        cTempTop = nloc;
+        cMaxTemp = nloc;
+        cBreakPatches.clear();
+        cContinueTargets.clear();
+        compileStmt(f->body.get());
+        emit(VM_RETI, 0, 0, 0);
+        out.frameSize = cMaxTemp;
+    }
+
+    int compileExpr(const Expr *e) {
+        if (e->kind == Expr::Kind::Var && !e->fastGlobal) return e->fastIndex;
+        int t = allocTemp();
+        compileExprInto(e, t);
+        return t;
+    }
+
+    void compileExprInto(const Expr *e, int dst) {
         switch (e->kind) {
             case Expr::Kind::Number:
-                return wrap32(e->value);
+                emit(VM_LI, dst, 0, wrap32(e->value));
+                return;
             case Expr::Kind::Var:
-                return e->fastGlobal ? globals[e->fastIndex] : frame[e->fastIndex];
+                if (e->fastGlobal) emit(VM_GLD, dst, 0, e->fastIndex);
+                else if (e->fastIndex != dst) emit(VM_MOV, dst, e->fastIndex, 0);
+                return;
             case Expr::Kind::Call: {
-                auto f = funcs.find(e->name);
-                if (f == funcs.end()) throw TooHard();
-                if (e->args.size() <= 16) {
-                    array<int32_t, 16> args{};
-                    for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), frame);
-                    return callFunction(f->second, args.data(), static_cast<int>(e->args.size()));
+                auto it = funcIndex.find(e->name);
+                if (it == funcIndex.end()) throw TooHard();
+                if (static_cast<int>(e->args.size()) != vmFuncs[it->second].nparams) throw TooHard();
+                int save = cTempTop;
+                int argBase = cTempTop;
+                for (auto &arg : e->args) {
+                    int t = allocTemp();
+                    compileExprInto(arg.get(), t);
                 }
-                vector<int32_t> args;
-                args.reserve(e->args.size());
-                for (auto &arg : e->args) args.push_back(evalExpr(arg.get(), frame));
-                return callFunction(f->second, args.data(), static_cast<int>(args.size()));
+                emit(VM_CALL, dst, argBase, it->second);
+                cTempTop = save;
+                return;
             }
             case Expr::Kind::Unary: {
-                int32_t v = evalExpr(e->lhs.get(), frame);
-                switch (e->opc) {
-                    case OPC_PLUS: return v;
-                    case OPC_NEG: return sub32(0, v);
-                    case OPC_NOT: return !truthy(v);
+                int save = cTempTop;
+                int v = compileExpr(e->lhs.get());
+                if (e->opc == OPC_PLUS) {
+                    if (v != dst) emit(VM_MOV, dst, v, 0);
+                } else if (e->opc == OPC_NEG) {
+                    emit(VM_NEG, dst, v, 0);
+                } else if (e->opc == OPC_NOT) {
+                    emit(VM_SEQZ, dst, v, 0);
+                } else {
+                    throw TooHard();
                 }
-                throw TooHard();
+                cTempTop = save;
+                return;
             }
             case Expr::Kind::Binary: {
                 int opc = e->opc;
-                if (opc == OPC_AND) {
-                    int32_t l = evalExpr(e->lhs.get(), frame);
-                    return truthy(l) && truthy(evalExpr(e->rhs.get(), frame));
+                if (opc == OPC_AND || opc == OPC_OR) {
+                    int save = cTempTop;
+                    int l = compileExpr(e->lhs.get());
+                    emit(VM_SNEZ, dst, l, 0);
+                    cTempTop = save;
+                    int jidx = emit(opc == OPC_AND ? VM_JZ : VM_JNZ, 0, dst, 0);
+                    int r = compileExpr(e->rhs.get());
+                    emit(VM_SNEZ, dst, r, 0);
+                    cTempTop = save;
+                    patchC(jidx, here());
+                    return;
                 }
-                if (opc == OPC_OR) {
-                    int32_t l = evalExpr(e->lhs.get(), frame);
-                    return truthy(l) || truthy(evalExpr(e->rhs.get(), frame));
+                int save = cTempTop;
+                if (e->rhs->kind == Expr::Kind::Number) {
+                    int32_t imm = wrap32(e->rhs->value);
+                    int l = compileExpr(e->lhs.get());
+                    switch (opc) {
+                        case OPC_ADD: emit(VM_ADDI, dst, l, imm); break;
+                        case OPC_SUB: emit(VM_ADDI, dst, l, wrap32(-static_cast<long long>(imm))); break;
+                        case OPC_MUL: emit(VM_MULI, dst, l, imm); break;
+                        case OPC_DIV: emit(VM_DIVI, dst, l, imm); break;
+                        case OPC_MOD: emit(VM_MODI, dst, l, imm); break;
+                        case OPC_LT: emit(VM_SLTI, dst, l, imm); break;
+                        case OPC_GT: emit(VM_SGTI, dst, l, imm); break;
+                        case OPC_LE: emit(VM_SLEI, dst, l, imm); break;
+                        case OPC_GE: emit(VM_SGEI, dst, l, imm); break;
+                        case OPC_EQ: emit(VM_SEQI, dst, l, imm); break;
+                        case OPC_NE: emit(VM_SNEI, dst, l, imm); break;
+                        default: throw TooHard();
+                    }
+                    cTempTop = save;
+                    return;
                 }
-                int32_t l = evalExpr(e->lhs.get(), frame);
-                int32_t r = evalExpr(e->rhs.get(), frame);
+                if (e->lhs->kind == Expr::Kind::Number) {
+                    int32_t imm = wrap32(e->lhs->value);
+                    int r = compileExpr(e->rhs.get());
+                    switch (opc) {
+                        case OPC_ADD: emit(VM_ADDI, dst, r, imm); break;
+                        case OPC_SUB: emit(VM_RSUBI, dst, r, imm); break;
+                        case OPC_MUL: emit(VM_MULI, dst, r, imm); break;
+                        case OPC_DIV: emit(VM_RDIVI, dst, r, imm); break;
+                        case OPC_MOD: emit(VM_RMODI, dst, r, imm); break;
+                        case OPC_LT: emit(VM_SGTI, dst, r, imm); break;
+                        case OPC_GT: emit(VM_SLTI, dst, r, imm); break;
+                        case OPC_LE: emit(VM_SGEI, dst, r, imm); break;
+                        case OPC_GE: emit(VM_SLEI, dst, r, imm); break;
+                        case OPC_EQ: emit(VM_SEQI, dst, r, imm); break;
+                        case OPC_NE: emit(VM_SNEI, dst, r, imm); break;
+                        default: throw TooHard();
+                    }
+                    cTempTop = save;
+                    return;
+                }
+                int l = compileExpr(e->lhs.get());
+                int r = compileExpr(e->rhs.get());
                 switch (opc) {
-                    case OPC_ADD: return add32(l, r);
-                    case OPC_SUB: return sub32(l, r);
-                    case OPC_MUL: return mul32(l, r);
-                    case OPC_DIV: return div32(l, r);
-                    case OPC_MOD: return mod32(l, r);
-                    case OPC_LT: return l < r;
-                    case OPC_GT: return l > r;
-                    case OPC_LE: return l <= r;
-                    case OPC_GE: return l >= r;
-                    case OPC_EQ: return l == r;
-                    case OPC_NE: return l != r;
+                    case OPC_ADD: emit(VM_ADD, dst, l, r); break;
+                    case OPC_SUB: emit(VM_SUB, dst, l, r); break;
+                    case OPC_MUL: emit(VM_MUL, dst, l, r); break;
+                    case OPC_DIV: emit(VM_DIV, dst, l, r); break;
+                    case OPC_MOD: emit(VM_MOD, dst, l, r); break;
+                    case OPC_LT: emit(VM_SLT, dst, l, r); break;
+                    case OPC_GT: emit(VM_SGT, dst, l, r); break;
+                    case OPC_LE: emit(VM_SLE, dst, l, r); break;
+                    case OPC_GE: emit(VM_SGE, dst, l, r); break;
+                    case OPC_EQ: emit(VM_SEQ, dst, l, r); break;
+                    case OPC_NE: emit(VM_SNE, dst, l, r); break;
+                    default: throw TooHard();
                 }
-                throw TooHard();
+                cTempTop = save;
+                return;
             }
         }
         throw TooHard();
     }
 
-    int32_t callFunction(Function *f, const int32_t *args, int argCount) {
-        tick(4);
-        int nloc = f->fastLocalCount;
-        if (nloc < 0) throw TooHard();
-        if (callDepth >= 4096 || stackTop + static_cast<size_t>(nloc) > stack.size()) throw TooHard();
-        ++callDepth;
-        int32_t *frame = stack.data() + stackTop;
-        size_t savedTop = stackTop;
-        stackTop += static_cast<size_t>(nloc);
-        for (int i = 0; i < nloc; ++i) frame[i] = 0;
-        int np = static_cast<int>(f->params.size());
-        for (int i = 0; i < np; ++i) frame[i] = i < argCount ? args[i] : 0;
-        Flow flow = execStmt(f->body.get(), frame);
-        stackTop = savedTop;
-        --callDepth;
-        return flow.kind == Flow::Kind::Return ? flow.value : 0;
-    }
-
-    Flow execStmt(const Stmt *s, int32_t *frame) {
-        tick();
+    void compileStmt(const Stmt *s) {
+        if (!s) return;
         switch (s->kind) {
             case Stmt::Kind::Block:
-                for (auto &child : s->stmts) {
-                    Flow f = execStmt(child.get(), frame);
-                    if (f.kind != Flow::Kind::Normal) return f;
-                }
-                return {};
+                for (auto &child : s->stmts) compileStmt(child.get());
+                return;
             case Stmt::Kind::Empty:
-                return {};
-            case Stmt::Kind::ExprStmt:
-                evalExpr(s->expr.get(), frame);
-                return {};
-            case Stmt::Kind::Assign:
-                if (s->fastAssignGlobal) globals[s->fastAssignIndex] = evalExpr(s->expr.get(), frame);
-                else frame[s->fastAssignIndex] = evalExpr(s->expr.get(), frame);
-                return {};
-            case Stmt::Kind::DeclStmt:
-                frame[s->decl->fastSlot] = evalExpr(s->decl->init.get(), frame);
-                return {};
-            case Stmt::Kind::If:
-                if (truthy(evalExpr(s->expr.get(), frame))) return execStmt(s->thenStmt.get(), frame);
-                if (s->elseStmt) return execStmt(s->elseStmt.get(), frame);
-                return {};
-            case Stmt::Kind::While:
-                if (tryFoldWhile(s, frame)) return {};
-                while (truthy(evalExpr(s->expr.get(), frame))) {
-                    Flow f = execStmt(s->body.get(), frame);
-                    if (f.kind == Flow::Kind::Break) return {};
-                    if (f.kind == Flow::Kind::Continue) continue;
-                    if (f.kind == Flow::Kind::Return) return f;
+                return;
+            case Stmt::Kind::ExprStmt: {
+                int save = cTempTop;
+                compileExpr(s->expr.get());
+                cTempTop = save;
+                return;
+            }
+            case Stmt::Kind::Assign: {
+                int save = cTempTop;
+                if (s->fastAssignGlobal) {
+                    int r = compileExpr(s->expr.get());
+                    emit(VM_GST, 0, r, s->fastAssignIndex);
+                } else {
+                    compileExprInto(s->expr.get(), s->fastAssignIndex);
                 }
-                return {};
+                cTempTop = save;
+                return;
+            }
+            case Stmt::Kind::DeclStmt: {
+                int save = cTempTop;
+                compileExprInto(s->decl->init.get(), s->decl->fastSlot);
+                cTempTop = save;
+                return;
+            }
+            case Stmt::Kind::If: {
+                int save = cTempTop;
+                int c = compileExpr(s->expr.get());
+                cTempTop = save;
+                int jz = emit(VM_JZ, 0, c, 0);
+                compileStmt(s->thenStmt.get());
+                if (s->elseStmt) {
+                    int jmp = emit(VM_JMP, 0, 0, 0);
+                    patchC(jz, here());
+                    compileStmt(s->elseStmt.get());
+                    patchC(jmp, here());
+                } else {
+                    patchC(jz, here());
+                }
+                return;
+            }
+            case Stmt::Kind::While: {
+                int foldIdx = emit(VM_FOLD, 0, static_cast<int>(foldStmts.size()), 0);
+                foldStmts.push_back(s);
+                int condStart = here();
+                int save = cTempTop;
+                int c = compileExpr(s->expr.get());
+                cTempTop = save;
+                int jz = emit(VM_JZ, 0, c, 0);
+                cBreakPatches.push_back({});
+                cContinueTargets.push_back(condStart);
+                compileStmt(s->body.get());
+                emit(VM_JMP, 0, 0, condStart);
+                int end = here();
+                patchC(jz, end);
+                patchC(foldIdx, end);
+                for (int idx : cBreakPatches.back()) patchC(idx, end);
+                cBreakPatches.pop_back();
+                cContinueTargets.pop_back();
+                return;
+            }
             case Stmt::Kind::Break:
-                return Flow{Flow::Kind::Break, 0};
+                if (cBreakPatches.empty()) throw TooHard();
+                cBreakPatches.back().push_back(emit(VM_JMP, 0, 0, 0));
+                return;
             case Stmt::Kind::Continue:
-                return Flow{Flow::Kind::Continue, 0};
-            case Stmt::Kind::Return:
-                return Flow{Flow::Kind::Return, s->expr ? evalExpr(s->expr.get(), frame) : 0};
+                if (cContinueTargets.empty()) throw TooHard();
+                emit(VM_JMP, 0, 0, cContinueTargets.back());
+                return;
+            case Stmt::Kind::Return: {
+                if (!s->expr) {
+                    emit(VM_RETI, 0, 0, 0);
+                    return;
+                }
+                if (s->expr->kind == Expr::Kind::Number) {
+                    emit(VM_RETI, 0, 0, wrap32(s->expr->value));
+                    return;
+                }
+                if (s->expr->kind == Expr::Kind::Call) {
+                    auto it = funcIndex.find(s->expr->name);
+                    if (it != funcIndex.end() &&
+                        static_cast<int>(s->expr->args.size()) == vmFuncs[it->second].nparams) {
+                        int save = cTempTop;
+                        int argBase = cTempTop;
+                        for (auto &arg : s->expr->args) {
+                            int t = allocTemp();
+                            compileExprInto(arg.get(), t);
+                        }
+                        emit(VM_TCALL, 0, argBase, it->second);
+                        cTempTop = save;
+                        return;
+                    }
+                }
+                int save = cTempTop;
+                int r = compileExpr(s->expr.get());
+                emit(VM_RET, 0, r, 0);
+                cTempTop = save;
+                return;
+            }
         }
         throw TooHard();
+    }
+
+    // ---- bytecode interpreter ----
+
+    int32_t runVm(int funcIdx, const int32_t *args, int argc) {
+        struct CallRec {
+            const VmFunc *fn;
+            int pc;
+            int base;
+            int dst;
+        };
+        if (funcIdx < 0 || funcIdx >= static_cast<int>(vmFuncs.size())) throw TooHard();
+        vector<CallRec> calls;
+        calls.reserve(1024);
+        const VmFunc *fn = &vmFuncs[funcIdx];
+        if (argc != fn->nparams) throw TooHard();
+        int stackSize = static_cast<int>(stack.size());
+        int base = 0;
+        if (fn->frameSize > stackSize) throw TooHard();
+        for (int i = 0; i < argc; ++i) stack[i] = args[i];
+        int32_t *r = stack.data();
+        int pc = 0;
+        for (;;) {
+            if (--budgetLeft < 0) throw TooHard();
+            if ((++tickChecks & 1048575u) == 0u) {
+                auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
+                if (elapsed > timeLimit) throw TooHard();
+            }
+            const Insn &in = fn->code[pc++];
+            switch (in.op) {
+                case VM_LI: r[in.a] = in.c; break;
+                case VM_MOV: r[in.a] = r[in.b]; break;
+                case VM_GLD: r[in.a] = globals[in.c]; break;
+                case VM_GST: globals[in.c] = r[in.b]; break;
+                case VM_ADD: r[in.a] = add32(r[in.b], r[in.c]); break;
+                case VM_SUB: r[in.a] = sub32(r[in.b], r[in.c]); break;
+                case VM_MUL: r[in.a] = mul32(r[in.b], r[in.c]); break;
+                case VM_DIV: r[in.a] = div32(r[in.b], r[in.c]); break;
+                case VM_MOD: r[in.a] = mod32(r[in.b], r[in.c]); break;
+                case VM_SLT: r[in.a] = r[in.b] < r[in.c]; break;
+                case VM_SGT: r[in.a] = r[in.b] > r[in.c]; break;
+                case VM_SLE: r[in.a] = r[in.b] <= r[in.c]; break;
+                case VM_SGE: r[in.a] = r[in.b] >= r[in.c]; break;
+                case VM_SEQ: r[in.a] = r[in.b] == r[in.c]; break;
+                case VM_SNE: r[in.a] = r[in.b] != r[in.c]; break;
+                case VM_ADDI: r[in.a] = add32(r[in.b], in.c); break;
+                case VM_MULI: r[in.a] = mul32(r[in.b], in.c); break;
+                case VM_DIVI: r[in.a] = div32(r[in.b], in.c); break;
+                case VM_MODI: r[in.a] = mod32(r[in.b], in.c); break;
+                case VM_RSUBI: r[in.a] = sub32(in.c, r[in.b]); break;
+                case VM_RDIVI: r[in.a] = div32(in.c, r[in.b]); break;
+                case VM_RMODI: r[in.a] = mod32(in.c, r[in.b]); break;
+                case VM_SLTI: r[in.a] = r[in.b] < in.c; break;
+                case VM_SGTI: r[in.a] = r[in.b] > in.c; break;
+                case VM_SLEI: r[in.a] = r[in.b] <= in.c; break;
+                case VM_SGEI: r[in.a] = r[in.b] >= in.c; break;
+                case VM_SEQI: r[in.a] = r[in.b] == in.c; break;
+                case VM_SNEI: r[in.a] = r[in.b] != in.c; break;
+                case VM_NEG: r[in.a] = sub32(0, r[in.b]); break;
+                case VM_SNEZ: r[in.a] = r[in.b] != 0; break;
+                case VM_SEQZ: r[in.a] = r[in.b] == 0; break;
+                case VM_JMP: pc = in.c; break;
+                case VM_JZ: if (!r[in.b]) pc = in.c; break;
+                case VM_JNZ: if (r[in.b]) pc = in.c; break;
+                case VM_CALL: {
+                    const VmFunc *callee = &vmFuncs[in.c];
+                    int newBase = base + fn->frameSize;
+                    if (calls.size() >= (1u << 20) || newBase + callee->frameSize > stackSize) throw TooHard();
+                    calls.push_back(CallRec{fn, pc, base, in.a});
+                    int32_t *nr = stack.data() + newBase;
+                    for (int i = 0; i < callee->nparams; ++i) nr[i] = r[in.b + i];
+                    fn = callee;
+                    base = newBase;
+                    r = nr;
+                    pc = 0;
+                    break;
+                }
+                case VM_TCALL: {
+                    const VmFunc *callee = &vmFuncs[in.c];
+                    if (base + callee->frameSize > stackSize) throw TooHard();
+                    for (int i = 0; i < callee->nparams; ++i) r[i] = r[in.b + i];
+                    fn = callee;
+                    pc = 0;
+                    break;
+                }
+                case VM_RET:
+                case VM_RETI: {
+                    int32_t v = in.op == VM_RET ? r[in.b] : in.c;
+                    if (calls.empty()) return v;
+                    CallRec rec = calls.back();
+                    calls.pop_back();
+                    fn = rec.fn;
+                    pc = rec.pc;
+                    base = rec.base;
+                    r = stack.data() + base;
+                    r[rec.dst] = v;
+                    break;
+                }
+                case VM_FOLD:
+                    if (tryFoldWhile(foldStmts[in.b], r)) pc = in.c;
+                    break;
+                default:
+                    throw TooHard();
+            }
+        }
     }
 
     // ---- slot helpers ----
