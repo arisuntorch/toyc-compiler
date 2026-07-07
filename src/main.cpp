@@ -1757,10 +1757,15 @@ private:
             case Expr::Kind::Call: {
                 auto f = funcs.find(e->name);
                 if (f == funcs.end()) throw TooHard();
-                if (e->args.size() > 16) throw TooHard();
-                array<int32_t, 16> args{};
-                for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), locals);
-                return callFunction(f->second, args.data(), static_cast<int>(e->args.size()));
+                if (e->args.size() <= 16) {
+                    array<int32_t, 16> args{};
+                    for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), locals);
+                    return callFunction(f->second, args.data(), static_cast<int>(e->args.size()));
+                }
+                vector<int32_t> args;
+                args.reserve(e->args.size());
+                for (auto &arg : e->args) args.push_back(evalExpr(arg.get(), locals));
+                return callFunction(f->second, args.data(), static_cast<int>(args.size()));
             }
             case Expr::Kind::Unary: {
                 int32_t v = evalExpr(e->lhs.get(), locals);
@@ -1963,10 +1968,11 @@ public:
 
     void run() {
         collectInlineableFunctions();
+        collectGlobalAssignments();
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl) {
                 optExpr(item.decl->init);
-                if (item.decl->isConst) {
+                if (item.decl->isConst || !assignedGlobalNames.count(item.decl->name)) {
                     if (auto v = foldConstExpr(item.decl->init.get())) globalConsts[item.decl->name] = *v;
                 }
             } else {
@@ -1983,6 +1989,8 @@ private:
     Program &prog;
     unordered_map<string, int32_t> globalConsts;
     unordered_map<string, Function *> inlineableFuncs;
+    unordered_set<string> globalNames;
+    unordered_set<string> assignedGlobalNames;
     vector<unordered_map<string, optional<int32_t>>> env;
 
     void collectInlineableFunctions() {
@@ -1995,6 +2003,28 @@ private:
             if (ret->kind != Stmt::Kind::Return || !ret->expr || exprHasCall(ret->expr.get())) continue;
             inlineableFuncs[item.func->name] = item.func.get();
         }
+    }
+
+    void collectGlobalAssignments() {
+        globalNames.clear();
+        assignedGlobalNames.clear();
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) globalNames.insert(item.decl->name);
+        }
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Func) collectGlobalAssignments(item.func->body.get());
+        }
+    }
+
+    void collectGlobalAssignments(const Stmt *s) {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign && globalNames.count(s->name)) {
+            assignedGlobalNames.insert(s->name);
+        }
+        for (auto &child : s->stmts) collectGlobalAssignments(child.get());
+        collectGlobalAssignments(s->thenStmt.get());
+        collectGlobalAssignments(s->elseStmt.get());
+        collectGlobalAssignments(s->body.get());
     }
 
     void enter() { env.push_back({}); }
@@ -2522,6 +2552,7 @@ public:
 
     string generate() {
         collectFunctions();
+        collectImmutableGlobals();
         processGlobals();
         out << ".text\n";
         for (auto &item : prog.items) {
@@ -2536,6 +2567,7 @@ private:
     unordered_map<string, Symbol> globals;
     unordered_map<string, FuncInfo> funcs;
     unordered_map<string, Function *> inlineableFuncs;
+    unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
     vector<string> continueLabels;
@@ -2619,12 +2651,41 @@ private:
         }
     }
 
+    void collectImmutableGlobals() {
+        unordered_set<string> globalNames;
+        unordered_set<string> assignedGlobalNames;
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) globalNames.insert(item.decl->name);
+        }
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Func) collectGlobalAssignments(item.func->body.get(), globalNames, assignedGlobalNames);
+        }
+        immutableGlobals.clear();
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl && !item.decl->isConst && !assignedGlobalNames.count(item.decl->name)) {
+                immutableGlobals.insert(item.decl->name);
+            }
+        }
+    }
+
+    void collectGlobalAssignments(const Stmt *s, const unordered_set<string> &globalNames,
+                                  unordered_set<string> &assignedGlobalNames) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign && globalNames.count(s->name)) {
+            assignedGlobalNames.insert(s->name);
+        }
+        for (auto &child : s->stmts) collectGlobalAssignments(child.get(), globalNames, assignedGlobalNames);
+        collectGlobalAssignments(s->thenStmt.get(), globalNames, assignedGlobalNames);
+        collectGlobalAssignments(s->elseStmt.get(), globalNames, assignedGlobalNames);
+        collectGlobalAssignments(s->body.get(), globalNames, assignedGlobalNames);
+    }
+
     void processGlobals() {
         vector<pair<string, long long>> data;
         for (auto &item : prog.items) {
             if (item.kind != TopItem::Kind::Decl) continue;
             Decl &d = *item.decl;
-            if (d.isConst) {
+            if (d.isConst || immutableGlobals.count(d.name)) {
                 long long v = evalConst(d.init.get());
                 globals[d.name] = Symbol{true, v, true, "", 0, ""};
             } else {
@@ -3630,8 +3691,6 @@ int main(int argc, char **argv) {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
-    SafeOptimizer optimizer(program);
-    optimizer.run();
     if (optMode) {
         ConstEvaluator quickConstEval(program, 1000000LL, 50);
         if (auto value = quickConstEval.runMain()) {
@@ -3644,6 +3703,8 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+    SafeOptimizer optimizer(program);
+    optimizer.run();
     ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
