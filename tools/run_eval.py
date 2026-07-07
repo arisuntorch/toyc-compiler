@@ -141,16 +141,14 @@ def oj_check(args: argparse.Namespace) -> None:
     repo_url = args.repo_url or os.getenv("EDUCG_REPO_URL") or file_env.get("EDUCG_REPO_URL") or DEFAULT_REPO_URL
     cmd = [
         sys.executable,
-        str(ROOT / "tools" / "educg_oj_loop.py"),
+        str(ROOT / "tools" / "oj_resilient.py"),
         "--repo-url",
         repo_url,
-        "--runs",
-        str(args.runs),
+        "--attempts",
+        str(args.attempts),
         "--out",
         args.out,
-        "--clone-retries",
-        str(args.clone_retries),
-        "--retry-delay",
+        "--delay",
         str(args.retry_delay),
         "--poll-interval",
         str(args.poll_interval),
@@ -161,6 +159,8 @@ def oj_check(args: argparse.Namespace) -> None:
         cmd.extend(["--branch", branch])
     if args.until_total is not None:
         cmd.extend(["--until-total", str(args.until_total)])
+    if args.until_performance is not None:
+        cmd.extend(["--until-performance", str(args.until_performance)])
 
     env = os.environ.copy()
     env["EDUCG_SESSION"] = session
@@ -178,7 +178,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-url", default=None)
     parser.add_argument("--branch", default=None, help="Git branch to submit; defaults to current branch")
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=None,
+        help="max OJ submit attempts; defaults to max(--runs, --clone-retries + 1)",
+    )
     parser.add_argument("--until-total", type=float, default=None)
+    parser.add_argument("--until-performance", type=float, default=None)
     parser.add_argument("--out", default=DEFAULT_RESULT_LOG)
     parser.add_argument("--shape-timeout", type=float, default=5.0)
     parser.add_argument("--clone-retries", type=int, default=3)
@@ -190,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.attempts is None:
+        args.attempts = max(args.runs, args.clone_retries + 1)
     if not args.skip_local:
         local_checks(args.shape_timeout)
     if args.oj:
