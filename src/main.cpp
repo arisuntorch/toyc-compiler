@@ -1757,7 +1757,7 @@ private:
     JitThunk jitThunk = nullptr;
     size_t jitThunkOffset = 0;
 
-    static constexpr int64_t kJitRecheckPeriod = 20000000;  // backedges per time check
+    static constexpr int64_t kJitRecheckPeriod = 1000000;   // backedges per time check
     static constexpr int32_t kJitMaxNativeDepth = 90000;    // guards the native stack
 #endif
 
@@ -7010,9 +7010,9 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        long long remaining = 7000 - elapsedMs();
+        long long remaining = 11000 - elapsedMs();
         if (remaining > 1000) {
-            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 4800)));
+            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 8500)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
