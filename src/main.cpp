@@ -1347,7 +1347,7 @@ public:
             initGlobals();
             auto it = funcs.find("main");
             if (it == funcs.end()) return nullopt;
-            return callFunction(it->second, {});
+            return callFunction(it->second, nullptr, 0);
         } catch (const TooHard &) {
             return nullopt;
         }
@@ -1503,10 +1503,10 @@ private:
             case Expr::Kind::Call: {
                 auto f = funcs.find(e->name);
                 if (f == funcs.end()) throw TooHard();
-                vector<int32_t> args;
-                args.reserve(e->args.size());
-                for (auto &arg : e->args) args.push_back(evalExpr(arg.get(), locals));
-                return callFunction(f->second, args);
+                if (e->args.size() > 16) throw TooHard();
+                array<int32_t, 16> args{};
+                for (size_t i = 0; i < e->args.size(); ++i) args[i] = evalExpr(e->args[i].get(), locals);
+                return callFunction(f->second, args.data(), static_cast<int>(e->args.size()));
             }
             case Expr::Kind::Unary: {
                 int32_t v = evalExpr(e->lhs.get(), locals);
@@ -1543,11 +1543,11 @@ private:
         throw TooHard();
     }
 
-    int32_t callFunction(Function *f, const vector<int32_t> &args) {
+    int32_t callFunction(Function *f, const int32_t *args, int argCount) {
         tick(4);
         if (++callDepth > 1024) throw TooHard();
         vector<int32_t> locals(localCounts[f], 0);
-        for (size_t i = 0; i < f->params.size(); ++i) locals[i] = i < args.size() ? args[i] : 0;
+        for (size_t i = 0; i < f->params.size(); ++i) locals[i] = static_cast<int>(i) < argCount ? args[i] : 0;
         Flow flow = execStmt(f->body.get(), locals);
         --callDepth;
         return flow.kind == Flow::Kind::Return ? flow.value : 0;
@@ -3359,7 +3359,7 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
-    ConstEvaluator constEval(program, optMode ? 10000000000LL : 300000000LL, optMode ? 15000 : 2500);
+    ConstEvaluator constEval(program, optMode ? 1000000000LL : 300000000LL, optMode ? 7000 : 2500);
     if (auto value = constEval.runMain()) {
         cout << genConstReturnAsm(*value);
         return 0;
