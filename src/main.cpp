@@ -714,6 +714,37 @@ private:
         return true;
     }
 
+    bool collectAffineNames(const Stmt *s, vector<string> &vars, unordered_set<string> &seen,
+                            unordered_set<string> &transient) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectAffineNames(child.get(), vars, seen, transient)) return false;
+                }
+                return true;
+            case Stmt::Kind::Assign:
+                if (!seen.count(s->name)) {
+                    seen.insert(s->name);
+                    vars.push_back(s->name);
+                }
+                return true;
+            case Stmt::Kind::DeclStmt:
+                if (!s->decl || !s->decl->init || seen.count(s->decl->name)) return false;
+                if (lookupVar(s->decl->name)) return false;
+                seen.insert(s->decl->name);
+                vars.push_back(s->decl->name);
+                transient.insert(s->decl->name);
+                return true;
+            case Stmt::Kind::While:
+                return collectAffineNames(s->body.get(), vars, seen, transient);
+            case Stmt::Kind::Empty:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     static bool constRow(const vector<uint32_t> &row) {
         for (size_t i = 0; i + 1 < row.size(); ++i) {
             if (row[i] != 0) return false;
@@ -969,6 +1000,57 @@ private:
         return true;
     }
 
+    bool buildNestedAffineLoop(const Stmt *s, AffineLoop &loop) {
+        string ind, cmp;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
+
+        vector<string> vars;
+        unordered_set<string> seen;
+        unordered_set<string> transient;
+        seen.insert(ind);
+        vars.push_back(ind);
+        if (!collectAffineNames(s->body.get(), vars, seen, transient)) return false;
+        if (vars.size() <= 1) return false;
+
+        unordered_map<string, int> idx;
+        for (int i = 0; i < static_cast<int>(vars.size()); ++i) idx[vars[i]] = i;
+        int k = static_cast<int>(vars.size());
+        int d = k + 1;
+        vector<vector<uint32_t>> cur(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) cur[i][i] = 1;
+
+        if (!processAffineTransformStmt(s->body.get(), idx, cur)) return false;
+
+        int indIdx = idx[ind];
+        const auto &ir = cur[indIdx];
+        for (int j = 0; j < k; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return false;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return false;
+        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
+        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
+
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+        vector<uint32_t> bound;
+        if (!affineExpr(boundExpr, idx, idmat, bound)) return false;
+        for (int i = 0; i < k; ++i) {
+            if (bound[i] != 0) return false;
+        }
+
+        loop.vars = std::move(vars);
+        loop.mat = std::move(cur);
+        loop.bound = std::move(bound);
+        loop.transient = std::move(transient);
+        loop.induction = indIdx;
+        loop.cmp = std::move(cmp);
+        loop.step = step;
+        return true;
+    }
+
     static vector<uint32_t> matVec(const vector<vector<uint32_t>> &m, const vector<uint32_t> &v) {
         int n = static_cast<int>(v.size());
         vector<uint32_t> out(n, 0);
@@ -993,6 +1075,95 @@ private:
             }
         }
         return c;
+    }
+
+    static optional<int32_t> constRowValue(const vector<uint32_t> &row) {
+        if (!constRow(row)) return nullopt;
+        return static_cast<int32_t>(row.back());
+    }
+
+    bool processAffineTransformStmt(const Stmt *s, const unordered_map<string, int> &idx,
+                                    vector<vector<uint32_t>> &cur) {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!processAffineTransformStmt(child.get(), idx, cur)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                auto it = idx.find(s->decl->name);
+                if (it == idx.end()) return false;
+                vector<uint32_t> row;
+                if (!affineExpr(s->decl->init.get(), idx, cur, row)) return false;
+                cur[it->second] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                auto it = idx.find(s->name);
+                if (it == idx.end()) return false;
+                vector<uint32_t> row;
+                if (!affineExpr(s->expr.get(), idx, cur, row)) return false;
+                cur[it->second] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::While:
+                return processNestedAffineWhile(s, idx, cur);
+            default:
+                return false;
+        }
+    }
+
+    bool processNestedAffineWhile(const Stmt *s, const unordered_map<string, int> &idx,
+                                  vector<vector<uint32_t>> &cur) {
+        string ind, cmp;
+        const Expr *boundExpr = nullptr;
+        if (!extractLoopCondition(s->expr.get(), ind, cmp, boundExpr)) return false;
+        auto indIt = idx.find(ind);
+        if (indIt == idx.end()) return false;
+        int indIdx = indIt->second;
+
+        int d = static_cast<int>(cur.size());
+        vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
+        for (int i = 0; i < d; ++i) idmat[i][i] = 1;
+
+        vector<vector<uint32_t>> bodyMat = idmat;
+        if (!processAffineTransformStmt(s->body.get(), idx, bodyMat)) return false;
+
+        const auto &ir = bodyMat[indIdx];
+        for (int j = 0; j + 1 < d; ++j) {
+            uint32_t want = j == indIdx ? 1u : 0u;
+            if (ir[j] != want) return false;
+        }
+        int32_t step = static_cast<int32_t>(ir[d - 1]);
+        if (step == 0) return false;
+        if ((cmp == "<" || cmp == "<=") && step <= 0) return false;
+        if ((cmp == ">" || cmp == ">=") && step >= 0) return false;
+
+        vector<uint32_t> boundRow;
+        if (!affineExpr(boundExpr, idx, cur, boundRow)) return false;
+        auto iv = constRowValue(cur[indIdx]);
+        auto bound = constRowValue(boundRow);
+        if (!iv || !bound) return false;
+
+        AffineLoop inner;
+        inner.step = step;
+        inner.cmp = cmp;
+        uint64_t niter = countIterations(inner, *iv, *bound);
+        if (niter == 0) return true;
+
+        vector<vector<uint32_t>> power = bodyMat;
+        vector<vector<uint32_t>> combined = idmat;
+        while (niter) {
+            tick(10);
+            if (niter & 1) combined = matMul(power, combined);
+            niter >>= 1;
+            if (niter) power = matMul(power, power);
+        }
+        cur = matMul(combined, cur);
+        return true;
     }
 
     static uint64_t ceilDivPositive(int64_t a, int64_t b) {
@@ -1389,7 +1560,7 @@ private:
     bool tryRunAffineLoop(const Stmt *s) {
         if (tryRunPeriodicAffineLoop(s)) return true;
         AffineLoop loop;
-        if (!buildAffineLoop(s, loop)) return false;
+        if (!buildAffineLoop(s, loop) && !buildNestedAffineLoop(s, loop)) return false;
         tick(100);
         int k = static_cast<int>(loop.vars.size());
         int d = k + 1;
