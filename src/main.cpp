@@ -5579,11 +5579,14 @@ public:
                     if (auto v = foldConstExpr(item.decl->init.get())) globalConsts[item.decl->name] = *v;
                 }
             } else {
-                env.clear();
-                enter();
-                for (const string &param : item.func->params) env.back()[param] = LocalInfo{};
-                optStmt(item.func->body);
-                leave();
+                for (int round = 0; round < 2; ++round) {
+                    env.clear();
+                    enter();
+                    for (const string &param : item.func->params) env.back()[param] = LocalInfo{};
+                    optStmt(item.func->body);
+                    leave();
+                    dceFunction(*item.func);
+                }
             }
         }
     }
@@ -5930,6 +5933,169 @@ private:
             case Stmt::Kind::Continue:
                 break;
         }
+    }
+
+    // ---- backward-liveness dead code elimination ----
+    //
+    // Removes assignments to locals that are never read afterwards, pure
+    // expression statements, and control flow that only guards dead code
+    // (an if whose branches empty out no longer keeps its condition's
+    // operands alive). Globals are conservatively always live here; the
+    // whole-program dead-store analysis handles them later. Loop bodies are
+    // analyzed to a fixpoint without mutation first, then rewritten once
+    // under the converged (conservative) live set.
+
+    struct DceCtx {
+        const unordered_set<string> *breakLive = nullptr;
+        const unordered_set<string> *continueLive = nullptr;
+    };
+
+    // Names referenced (read or written) by statements the pass keeps. A
+    // declaration may only be deleted when its name never appears afterwards:
+    // liveness alone is not enough, because a kept later store kills liveness
+    // backwards yet still needs the symbol to exist.
+    unordered_set<string> dceUsed;
+
+    static void addReads(const Expr *e, unordered_set<string> &live) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            live.insert(e->name);
+            return;
+        }
+        addReads(e->lhs.get(), live);
+        addReads(e->rhs.get(), live);
+        for (auto &arg : e->args) addReads(arg.get(), live);
+    }
+
+    void dceReads(const Expr *e, unordered_set<string> &live) {
+        addReads(e, live);
+        addReads(e, dceUsed);
+    }
+
+    // Returns true when the statement is (or, after mutation, became) free of
+    // live effects and thus deletable. In analyze-only mode nothing is
+    // rewritten, but the return value still reflects what mutation would do,
+    // so a loop fixpoint sees the same live sets the rewrite will use.
+    bool dceStmt(unique_ptr<Stmt> &s, unordered_set<string> &live, DceCtx ctx, bool mutate) {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool allDead = true;
+                for (auto it = s->stmts.rbegin(); it != s->stmts.rend(); ++it) {
+                    if (!dceStmt(*it, live, ctx, mutate)) allDead = false;
+                }
+                if (mutate) {
+                    s->stmts.erase(remove_if(s->stmts.begin(), s->stmts.end(),
+                                             [](const unique_ptr<Stmt> &c) {
+                                                 return !c || c->kind == Stmt::Kind::Empty;
+                                             }),
+                                   s->stmts.end());
+                }
+                return allDead;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                if (!exprHasCall(s->expr.get())) {
+                    if (mutate) s = emptyStmt();
+                    return true;
+                }
+                dceReads(s->expr.get(), live);
+                return false;
+            case Stmt::Kind::Assign: {
+                bool isGlobalName = globalNames.count(s->name) != 0;
+                if (!isGlobalName && !live.count(s->name)) {
+                    if (!exprHasCall(s->expr.get())) {
+                        if (mutate) s = emptyStmt();
+                        return true;
+                    }
+                    if (mutate) {
+                        s->kind = Stmt::Kind::ExprStmt;  // keep the call, drop the store
+                        s->name.clear();
+                    }
+                    dceReads(s->expr.get(), live);
+                    return false;
+                }
+                if (!isGlobalName) live.erase(s->name);
+                dceUsed.insert(s->name);  // the kept store still needs the symbol
+                dceReads(s->expr.get(), live);
+                return false;
+            }
+            case Stmt::Kind::DeclStmt: {
+                const string &name = s->decl->name;
+                if (!live.count(name) && !dceUsed.count(name)) {
+                    if (!s->decl->init || !exprHasCall(s->decl->init.get())) {
+                        if (mutate) s = emptyStmt();
+                        return true;
+                    }
+                    if (mutate) {
+                        auto e = std::move(s->decl->init);
+                        s->kind = Stmt::Kind::ExprStmt;
+                        s->expr = std::move(e);
+                        s->decl.reset();
+                        dceReads(s->expr.get(), live);
+                        return false;
+                    }
+                    dceReads(s->decl->init.get(), live);
+                    return false;
+                }
+                live.erase(name);
+                if (s->decl->init) dceReads(s->decl->init.get(), live);
+                return false;
+            }
+            case Stmt::Kind::If: {
+                auto liveThen = live;
+                bool thenDead = dceStmt(s->thenStmt, liveThen, ctx, mutate);
+                auto liveElse = live;
+                bool elseDead = dceStmt(s->elseStmt, liveElse, ctx, mutate);
+                if (thenDead && elseDead && !exprHasCall(s->expr.get())) {
+                    if (mutate) s = emptyStmt();
+                    return true;  // condition operands stay dead
+                }
+                live = liveThen;
+                live.insert(liveElse.begin(), liveElse.end());
+                dceReads(s->expr.get(), live);
+                return false;
+            }
+            case Stmt::Kind::While: {
+                unordered_set<string> exitLive = live;
+                unordered_set<string> head = live;
+                dceReads(s->expr.get(), head);
+                // Analyze-only fixpoint: converge the loop-head live set.
+                for (int iter = 0; iter < 64; ++iter) {
+                    auto trial = head;
+                    DceCtx inner{&exitLive, &head};
+                    dceStmt(s->body, trial, inner, false);
+                    size_t before = head.size();
+                    head.insert(trial.begin(), trial.end());
+                    if (head.size() == before) break;
+                }
+                if (mutate) {
+                    auto bodyLive = head;
+                    DceCtx inner{&exitLive, &head};
+                    dceStmt(s->body, bodyLive, inner, true);
+                }
+                live = head;
+                return false;  // whole-loop deletion is left to later passes
+            }
+            case Stmt::Kind::Break:
+                if (ctx.breakLive) live = *ctx.breakLive;
+                return false;
+            case Stmt::Kind::Continue:
+                if (ctx.continueLive) live = *ctx.continueLive;
+                return false;
+            case Stmt::Kind::Return:
+                live.clear();
+                dceReads(s->expr.get(), live);
+                return false;
+        }
+        return false;
+    }
+
+    void dceFunction(Function &f) {
+        dceUsed.clear();
+        unordered_set<string> live;
+        dceStmt(f.body, live, DceCtx{}, true);
     }
 
     // ---- loop-invariant code motion ----
