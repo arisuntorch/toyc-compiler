@@ -6157,10 +6157,22 @@ private:
         return false;
     }
 
+    bool cseReadsGlobal(const Expr *e) const {
+        unordered_set<string> reads;
+        addReads(e, reads);
+        for (const string &name : reads) {
+            if (globalNames.count(name)) return true;
+        }
+        return false;
+    }
+
+    // noGlobals: the surrounding expression contains a call, so global values
+    // may change mid-expression; global-reading subexpressions must neither
+    // match existing entries nor be recorded.
     void cseVisitExpr(unique_ptr<Expr> &e, int idx, vector<CseEntry> &avail,
-                      vector<CseInsert> &inserts) {
+                      vector<CseInsert> &inserts, bool noGlobals = false) {
         if (!e) return;
-        if (cseCandidate(e.get())) {
+        if (cseCandidate(e.get()) && !(noGlobals && cseReadsGlobal(e.get()))) {
             for (auto &entry : avail) {
                 if (!exprStructEq(*entry.slot ? entry.slot->get() : nullptr, e.get())) continue;
                 if (entry.temp.empty()) {
@@ -6203,9 +6215,9 @@ private:
             // fall through: sub-candidates are recorded too, so a later
             // repeat of an inner piece can still be shared
         }
-        cseVisitExpr(e->lhs, idx, avail, inserts);
-        cseVisitExpr(e->rhs, idx, avail, inserts);
-        for (auto &arg : e->args) cseVisitExpr(arg, idx, avail, inserts);
+        cseVisitExpr(e->lhs, idx, avail, inserts, noGlobals);
+        cseVisitExpr(e->rhs, idx, avail, inserts, noGlobals);
+        for (auto &arg : e->args) cseVisitExpr(arg, idx, avail, inserts, noGlobals);
     }
 
     static void cseInvalidate(vector<CseEntry> &avail, const unordered_set<string> &written) {
@@ -6244,24 +6256,34 @@ private:
             Stmt *s = stmts[static_cast<size_t>(i)].get();
             switch (s->kind) {
                 case Stmt::Kind::ExprStmt:
-                case Stmt::Kind::Return:
-                    cseVisitExpr(s->expr, i, avail, inserts);
-                    if (s->expr && exprHasCall(s->expr.get())) cseDropGlobals(avail);
+                case Stmt::Kind::Return: {
+                    bool call = s->expr && exprHasCall(s->expr.get());
+                    if (call) cseDropGlobals(avail);
+                    cseVisitExpr(s->expr, i, avail, inserts, call);
+                    if (call) cseDropGlobals(avail);
                     break;
-                case Stmt::Kind::Assign:
-                    cseVisitExpr(s->expr, i, avail, inserts);
-                    if (exprHasCall(s->expr.get())) cseDropGlobals(avail);
+                }
+                case Stmt::Kind::Assign: {
+                    bool call = exprHasCall(s->expr.get());
+                    if (call) cseDropGlobals(avail);
+                    cseVisitExpr(s->expr, i, avail, inserts, call);
+                    if (call) cseDropGlobals(avail);
                     cseInvalidate(avail, {s->name});
                     break;
+                }
                 case Stmt::Kind::DeclStmt:
                     if (s->decl->init) {
-                        cseVisitExpr(s->decl->init, i, avail, inserts);
-                        if (exprHasCall(s->decl->init.get())) cseDropGlobals(avail);
+                        bool call = exprHasCall(s->decl->init.get());
+                        if (call) cseDropGlobals(avail);
+                        cseVisitExpr(s->decl->init, i, avail, inserts, call);
+                        if (call) cseDropGlobals(avail);
                     }
                     cseInvalidate(avail, {s->decl->name});
                     break;
                 case Stmt::Kind::If: {
-                    cseVisitExpr(s->expr, i, avail, inserts);
+                    bool condCall = exprHasCall(s->expr.get());
+                    if (condCall) cseDropGlobals(avail);
+                    cseVisitExpr(s->expr, i, avail, inserts, condCall);
                     cseNested(s->thenStmt.get());
                     cseNested(s->elseStmt.get());
                     cseInvalidate(avail, assignedInStmt(s));
@@ -8160,11 +8182,13 @@ private:
 
         // When one side is call-free (pure), evaluate the call side first and
         // the pure side afterwards into a temporary, avoiding the stack
-        // round-trip. Function calls cannot modify caller locals, so the pure
-        // side reads the same values either way.
+        // round-trip. Function calls cannot modify caller locals, so a pure
+        // side that reads no globals sees the same values either way; a
+        // global-reading lhs must NOT be reordered after an rhs call that
+        // could write those globals.
         string lhsReg = "t0";
         string rhsReg = "a0";
-        if (!hasCall(e->lhs.get())) {
+        if (!hasCall(e->lhs.get()) && !exprReadsAnyGlobal(e->lhs.get())) {
             genExpr(e->rhs.get());
             lhsReg = condOperandReg(e->lhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
         } else if (!hasCall(e->rhs.get())) {
@@ -8178,6 +8202,19 @@ private:
             popTo("t0");
         }
         emitBinaryReg(e->op, "a0", lhsReg, rhsReg);
+    }
+
+    bool exprReadsAnyGlobal(const Expr *e) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var) {
+            auto sym = lookup(e->name);
+            return sym && sym->isGlobal;
+        }
+        if (exprReadsAnyGlobal(e->lhs.get()) || exprReadsAnyGlobal(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (exprReadsAnyGlobal(arg.get())) return true;
+        }
+        return false;
     }
 
     void genCall(const Expr *e) {
