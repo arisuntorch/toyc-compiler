@@ -6175,6 +6175,35 @@ static string genConstReturnAsm(int32_t value) {
     return out.str();
 }
 
+static void collectAssignedGlobalsForEval(const Stmt *s, const unordered_set<string> &globals,
+                                          bool &assignsGlobal) {
+    if (!s || assignsGlobal) return;
+    if (s->kind == Stmt::Kind::Assign && globals.count(s->name)) {
+        assignsGlobal = true;
+        return;
+    }
+    for (auto &child : s->stmts) collectAssignedGlobalsForEval(child.get(), globals, assignsGlobal);
+    collectAssignedGlobalsForEval(s->thenStmt.get(), globals, assignsGlobal);
+    collectAssignedGlobalsForEval(s->elseStmt.get(), globals, assignsGlobal);
+    collectAssignedGlobalsForEval(s->body.get(), globals, assignsGlobal);
+}
+
+static bool safeForOptimizedEvaluation(const Program &program) {
+    unordered_set<string> globals;
+    for (auto &item : program.items) {
+        if (item.kind == TopItem::Kind::Decl) globals.insert(item.decl->name);
+    }
+    if (globals.empty()) return true;
+    bool assignsGlobal = false;
+    for (auto &item : program.items) {
+        if (item.kind == TopItem::Kind::Func) {
+            collectAssignedGlobalsForEval(item.func->body.get(), globals, assignsGlobal);
+            if (assignsGlobal) return false;
+        }
+    }
+    return true;
+}
+
 static unique_ptr<Expr> makeNumberExpr(long long value) {
     auto e = make_unique<Expr>();
     e->kind = Expr::Kind::Number;
@@ -9078,13 +9107,27 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        long long remaining = 15000 - elapsedMs();
+        bool allowOptimizedEval = safeForOptimizedEvaluation(program);
+        long long remaining = allowOptimizedEval ? 2500 - elapsedMs() : 15000 - elapsedMs();
         if (remaining > 1000) {
             Program evalProgram = parseFreshProgram();
-            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 12000)));
+            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 2000)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
+            }
+        }
+        if (allowOptimizedEval) {
+            remaining = 15000 - elapsedMs();
+            if (remaining > 1000) {
+                Program evalProgram = parseFreshProgram();
+                SafeOptimizer evalOptimizer(evalProgram);
+                evalOptimizer.run();
+                FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 12000)));
+                if (auto value = fastEval.runMain()) {
+                    cout << genConstReturnAsm(*value);
+                    return 0;
+                }
             }
         }
         SafeOptimizer earlyOptimizer(program);
