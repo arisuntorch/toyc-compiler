@@ -1674,7 +1674,8 @@ private:
         NO_AFFINE = 4,
         NO_NESTED = 8,
         NO_POLY_SUM = 16,
-        NO_PERIODIC_POLY = 32
+        NO_PERIODIC_POLY = 32,
+        NO_LCG_MOD_SUM = 64
     };
     enum class TransformFlow { Fail, Normal, Continue, Break };
 
@@ -4966,6 +4967,10 @@ private:
         }
     }
 
+    bool exprIsKey(const Expr *e, int key) const {
+        return e && e->kind == Expr::Kind::Var && exprSlotKey(e) == key;
+    }
+
     bool evalExprNoChanging(const Expr *e, const unordered_set<int> &changing,
                             const int32_t *frame, int32_t &out) const {
         if (!e) return false;
@@ -5029,6 +5034,212 @@ private:
             }
         }
         return false;
+    }
+
+    bool linearSelfExpr(const Expr *e, int key, const unordered_set<int> &changing,
+                        const int32_t *frame, int32_t &mul, int32_t &add) const {
+        if (!e) return false;
+        if (exprIsKey(e, key)) {
+            mul = 1;
+            add = 0;
+            return true;
+        }
+        if (e->kind == Expr::Kind::Unary) {
+            int32_t m = 0, a = 0;
+            if (!linearSelfExpr(e->lhs.get(), key, changing, frame, m, a)) return false;
+            if (e->opc == OPC_PLUS) {
+                mul = m;
+                add = a;
+                return true;
+            }
+            if (e->opc == OPC_NEG) {
+                mul = sub32(0, m);
+                add = sub32(0, a);
+                return true;
+            }
+            return false;
+        }
+        if (e->kind != Expr::Kind::Binary) return false;
+        if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
+            int32_t m = 0, a = 0, c = 0;
+            if (linearSelfExpr(e->lhs.get(), key, changing, frame, m, a) &&
+                evalExprNoChanging(e->rhs.get(), changing, frame, c)) {
+                mul = m;
+                add = e->opc == OPC_ADD ? add32(a, c) : sub32(a, c);
+                return true;
+            }
+            if (e->opc == OPC_ADD && evalExprNoChanging(e->lhs.get(), changing, frame, c) &&
+                linearSelfExpr(e->rhs.get(), key, changing, frame, m, a)) {
+                mul = m;
+                add = add32(c, a);
+                return true;
+            }
+            return false;
+        }
+        if (e->opc == OPC_MUL) {
+            int32_t c = 0;
+            if (exprIsKey(e->lhs.get(), key) && evalExprNoChanging(e->rhs.get(), changing, frame, c)) {
+                mul = c;
+                add = 0;
+                return true;
+            }
+            if (exprIsKey(e->rhs.get(), key) && evalExprNoChanging(e->lhs.get(), changing, frame, c)) {
+                mul = c;
+                add = 0;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool modOfKeyExpr(const Expr *e, int key, const unordered_set<int> &changing,
+                      const int32_t *frame, int32_t &modv) const {
+        if (!e || e->kind != Expr::Kind::Binary || e->opc != OPC_MOD) return false;
+        if (!exprIsKey(e->lhs.get(), key)) return false;
+        if (!evalExprNoChanging(e->rhs.get(), changing, frame, modv) || modv == 0) return false;
+        return modv != numeric_limits<int32_t>::min();
+    }
+
+    bool accumModExpr(const Expr *e, int accKey, int valueKey, const unordered_set<int> &changing,
+                      const int32_t *frame, int32_t &modv) const {
+        if (!e || e->kind != Expr::Kind::Binary || e->opc != OPC_ADD) return false;
+        if (exprIsKey(e->lhs.get(), accKey)) return modOfKeyExpr(e->rhs.get(), valueKey, changing, frame, modv);
+        if (exprIsKey(e->rhs.get(), accKey)) return modOfKeyExpr(e->lhs.get(), valueKey, changing, frame, modv);
+        return false;
+    }
+
+    bool runLcgModLoop(uint64_t niter, uint32_t &x, uint32_t &acc, uint32_t mul, uint32_t add,
+                       int32_t modv, bool addBeforeUpdate) {
+        auto timeExceeded = [&]() {
+            auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
+            return elapsed > timeLimit;
+        };
+        if (modv == 100 || modv == -100) {
+            for (uint64_t t = 0; t < niter; ++t) {
+                if ((t & ((1ull << 20) - 1)) == 0 && timeExceeded()) return false;
+                if (addBeforeUpdate) acc += static_cast<uint32_t>(static_cast<int32_t>(x) % 100);
+                x = static_cast<uint32_t>(static_cast<uint64_t>(x) * mul + add);
+                if (!addBeforeUpdate) acc += static_cast<uint32_t>(static_cast<int32_t>(x) % 100);
+            }
+            return true;
+        }
+        for (uint64_t t = 0; t < niter; ++t) {
+            if ((t & ((1ull << 20) - 1)) == 0 && timeExceeded()) return false;
+            if (addBeforeUpdate) acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(x), modv));
+            x = static_cast<uint32_t>(static_cast<uint64_t>(x) * mul + add);
+            if (!addBeforeUpdate) acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(x), modv));
+        }
+        return true;
+    }
+
+    FoldRes tryRunLcgModuloSumLoop(const Stmt *s, int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr, boundAdjust)) return FoldStructFail;
+        if (indKey & kGlobalBit) return FoldStructFail;
+
+        vector<const Stmt *> flat;
+        if (!flattenPolyLoopStmt(s->body.get(), flat) || flat.empty()) return FoldStructFail;
+
+        unordered_set<int> changing;
+        for (const Stmt *st : flat) {
+            if (st->kind == Stmt::Kind::Assign) {
+                int key = assignSlotKey(st);
+                if (key & kGlobalBit) return FoldStructFail;
+                changing.insert(key);
+            } else if (st->kind == Stmt::Kind::DeclStmt && st->decl) {
+                return FoldStructFail;
+            } else if (st->kind != Stmt::Kind::Empty && st->kind != Stmt::Kind::ExprStmt) {
+                return FoldStructFail;
+            }
+        }
+        if (!changing.count(indKey)) return FoldStructFail;
+
+        int32_t bound = 0;
+        if (!evalExprNoChanging(boundExpr, changing, frame, bound)) return FoldStructFail;
+        bound = add32(bound, boundAdjust);
+
+        int lcgKey = -1;
+        int32_t lcgMul = 0;
+        int32_t lcgAdd = 0;
+        for (const Stmt *st : flat) {
+            if (st->kind != Stmt::Kind::Assign || st->fastDeadStore) continue;
+            int key = assignSlotKey(st);
+            if (key == indKey) continue;
+            int32_t m = 0, a = 0;
+            if (linearSelfExpr(st->expr.get(), key, changing, frame, m, a) && (m != 1 || a != 0)) {
+                if (lcgKey != -1 && lcgKey != key) return FoldStructFail;
+                lcgKey = key;
+                lcgMul = m;
+                lcgAdd = a;
+            }
+        }
+        if (lcgKey < 0) return FoldStructFail;
+
+        int accKey = -1;
+        int32_t modv = 0;
+        int32_t step = 0;
+        bool sawLcg = false;
+        bool sawAcc = false;
+        bool sawInd = false;
+        bool addBeforeUpdate = false;
+        for (const Stmt *st : flat) {
+            if (st->kind == Stmt::Kind::Empty || st->kind == Stmt::Kind::ExprStmt || st->fastDeadStore) continue;
+            if (st->kind != Stmt::Kind::Assign) return FoldStructFail;
+            int key = assignSlotKey(st);
+            if (key == indKey) {
+                int rhsKey = -1;
+                int32_t off = 0;
+                if (!extractInductionPlusConst(st->expr.get(), rhsKey, off) || rhsKey != indKey || off == 0) {
+                    return FoldStructFail;
+                }
+                if (sawInd && step != off) return FoldStructFail;
+                step = off;
+                sawInd = true;
+                continue;
+            }
+            if (key == lcgKey) {
+                int32_t m = 0, a = 0;
+                if (!linearSelfExpr(st->expr.get(), key, changing, frame, m, a) || m != lcgMul || a != lcgAdd) {
+                    return FoldStructFail;
+                }
+                if (sawLcg) return FoldStructFail;
+                sawLcg = true;
+                continue;
+            }
+            int32_t thisMod = 0;
+            if (!accumModExpr(st->expr.get(), key, lcgKey, changing, frame, thisMod)) return FoldStructFail;
+            if (accKey != -1 && (accKey != key || modv != thisMod)) return FoldStructFail;
+            accKey = key;
+            modv = thisMod;
+            addBeforeUpdate = !sawLcg;
+            sawAcc = true;
+        }
+        if (!sawLcg || !sawAcc || !sawInd || accKey < 0) return FoldStructFail;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+
+        int32_t startIv = readSlot(indKey, frame);
+        auto niterOpt = countIterationsMaybe(cmp, step, startIv, bound);
+        if (!niterOpt) return FoldValueFail;
+        uint64_t niter = *niterOpt;
+        if (niter == 0) return FoldOk;
+
+        uint32_t x = static_cast<uint32_t>(readSlot(lcgKey, frame));
+        uint32_t acc = static_cast<uint32_t>(readSlot(accKey, frame));
+        if (!runLcgModLoop(niter, x, acc, static_cast<uint32_t>(lcgMul), static_cast<uint32_t>(lcgAdd),
+                           modv, addBeforeUpdate)) {
+            return FoldValueFail;
+        }
+
+        uint32_t finalIv = static_cast<uint32_t>(startIv) +
+                           static_cast<uint32_t>(step) * static_cast<uint32_t>(niter);
+        writeSlot(indKey, static_cast<int32_t>(finalIv), frame);
+        writeSlot(lcgKey, static_cast<int32_t>(x), frame);
+        writeSlot(accKey, static_cast<int32_t>(acc), frame);
+        return FoldOk;
     }
 
     bool polyExpr(const Expr *e, int indKey, int64_t indBase, int32_t step,
@@ -5734,7 +5945,7 @@ private:
         if (s->fastLoopId < 0 || s->fastLoopId >= static_cast<int>(loopStats.size())) return false;
         LoopStat &st = loopStats[s->fastLoopId];
         constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED |
-                                      NO_POLY_SUM | NO_PERIODIC_POLY;
+                                      NO_POLY_SUM | NO_PERIODIC_POLY | NO_LCG_MOD_SUM;
         if ((st.structFlags & allStruct) == allStruct) return false;
         if (!st.everFolded && st.failCount >= 8) {
             ++st.failCount;
@@ -5742,6 +5953,14 @@ private:
         }
         tick(16);
 
+        if (!(st.structFlags & NO_LCG_MOD_SUM)) {
+            FoldRes r = tryRunLcgModuloSumLoop(s, frame);
+            if (r == FoldOk) {
+                st.everFolded = true;
+                return true;
+            }
+            if (r == FoldStructFail) st.structFlags |= NO_LCG_MOD_SUM;
+        }
         if (!(st.structFlags & NO_PERIODIC)) {
             FoldRes r = tryRunPeriodicAffineLoop(s, frame);
             if (r == FoldOk) {
