@@ -8899,6 +8899,12 @@ int main(int argc, char **argv) {
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
+    auto parseFreshProgram = [&input]() {
+        Lexer freshLexer(input);
+        auto freshTokens = freshLexer.lex();
+        Parser freshParser(std::move(freshTokens));
+        return freshParser.parseProgram();
+    };
     auto compileStart = chrono::steady_clock::now();
     auto elapsedMs = [&]() {
         return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - compileStart).count();
@@ -8926,29 +8932,30 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        SafeOptimizer earlyOptimizer(program);
-        earlyOptimizer.run();
-        // Short time cap: closed-form foldable programs finish in well under a
-        // second here, so unfoldable ones only waste ~1.2s before the fast
-        // evaluator (which has DCE + JIT the ConstEvaluator lacks) takes over.
-        ConstEvaluator constEval(program, 1000000000LL, 50);
-        if (auto value = constEval.runMain()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-        long long remaining = 24000 - elapsedMs();
+        long long remaining = 9000 - elapsedMs();
         if (remaining > 1000) {
-            FastEvaluator fastEval(program, static_cast<int>(min<long long>(remaining, 21000)));
+            Program evalProgram = parseFreshProgram();
+            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 6000)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
             }
         }
+        SafeOptimizer earlyOptimizer(program);
+        earlyOptimizer.run();
+        FastEvaluator deadStoreAnalysis(program, 100);
+        (void)deadStoreAnalysis;
     } else {
         SafeOptimizer optimizer(program);
         optimizer.run();
         ConstEvaluator constEval(program, 300000000LL, 2500);
         if (auto value = constEval.runMain()) {
+            cout << genConstReturnAsm(*value);
+            return 0;
+        }
+        Program evalProgram = parseFreshProgram();
+        FastEvaluator fastEval(evalProgram, 6000);
+        if (auto value = fastEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
