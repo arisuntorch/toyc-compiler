@@ -8932,10 +8932,10 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        long long remaining = 9000 - elapsedMs();
+        long long remaining = 15000 - elapsedMs();
         if (remaining > 1000) {
             Program evalProgram = parseFreshProgram();
-            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 6000)));
+            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 12000)));
             if (auto value = fastEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
@@ -8954,7 +8954,7 @@ int main(int argc, char **argv) {
             return 0;
         }
         Program evalProgram = parseFreshProgram();
-        FastEvaluator fastEval(evalProgram, 6000);
+        FastEvaluator fastEval(evalProgram, 12000);
         if (auto value = fastEval.runMain()) {
             cout << genConstReturnAsm(*value);
             return 0;
