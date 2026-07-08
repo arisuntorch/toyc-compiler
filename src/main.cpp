@@ -6179,6 +6179,9 @@ private:
     string functionBodyLabel;
     vector<string> currentParams;
     vector<string> savedVarRegs;
+    int varRegCap = 0;
+    unordered_map<long long, string> constRegMap;
+    vector<pair<long long, string>> hoistedConsts;
     int labelId = 0;
     int nextSlot = 0;
     int nextVarReg = 0;
@@ -6490,8 +6493,101 @@ private:
     }
 
     string allocVarReg() {
-        if (nextVarReg >= static_cast<int>(savedVarRegs.size())) return "";
+        if (nextVarReg >= varRegCap) return "";
         return savedVarRegs[nextVarReg++];
+    }
+
+    string constReg(long long v) const {
+        auto it = constRegMap.find(v);
+        return it == constRegMap.end() ? string() : it->second;
+    }
+
+    void emitLoadConst(const string &dst, long long v) {
+        string cr = constReg(v);
+        if (!cr.empty()) {
+            if (dst != cr) emit("mv " + dst + ", " + cr);
+            return;
+        }
+        emit("li " + dst + ", " + to_string(v));
+    }
+
+    // ---- loop-invariant constant hoisting ----
+    //
+    // Constants materialized inside loops (multiplier/modulus immediates,
+    // magic-division multipliers, loop bounds) cost an li (or lui+addi) every
+    // iteration. Spare callee-saved registers not needed for variables are
+    // loaded once in the function prologue and used as operands in place.
+
+    void hoistNoteConst(long long v, long long weight, unordered_map<long long, long long> &w) const {
+        if (v == 0) return;  // x0 already serves as zero
+        w[v] += weight * (fits12(v) ? 1 : 2);
+    }
+
+    void hoistScanExpr(const Expr *e, long long mult, unordered_map<long long, long long> &w) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Number) {
+            hoistNoteConst(e->value, mult, w);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary && e->rhs && e->rhs->kind == Expr::Kind::Number) {
+            long long v = e->rhs->value;
+            bool counted = false;
+            if ((e->op == "+" || e->op == "-") && fits12(e->op == "+" ? v : -v)) counted = true;  // addi
+            else if (e->op == "*" && (v == 0 || v == 1 || isPowerOfTwo(v))) counted = true;       // slli
+            else if ((e->op == "/" || e->op == "%") && v > 0) {
+                if (isPowerOfTwo(v) && v <= 2048) counted = true;  // shift sequence
+                else if (auto spec = codegenMagicForDivisor(static_cast<int>(v))) {
+                    hoistNoteConst(spec->magic, mult, w);
+                    if (e->op == "%") hoistNoteConst(v, mult, w);
+                    counted = true;
+                }
+            }
+            // Relational constants are NOT skipped: branch codegen needs the
+            // value in a register even when the slti immediate form would fit.
+            if (!counted) hoistNoteConst(v, mult, w);
+            hoistScanExpr(e->lhs.get(), mult, w);
+            return;
+        }
+        hoistScanExpr(e->lhs.get(), mult, w);
+        hoistScanExpr(e->rhs.get(), mult, w);
+        for (auto &arg : e->args) hoistScanExpr(arg.get(), mult, w);
+    }
+
+    void hoistScanStmt(const Stmt *s, int depth, unordered_map<long long, long long> &w) const {
+        if (!s || s->fastDeadStore) return;
+        long long mult = depth > 0 ? (1LL << (3 * min(depth, 3))) : 0;
+        if (s->kind == Stmt::Kind::While) {
+            long long inner = 1LL << (3 * min(depth + 1, 3));
+            hoistScanExpr(s->expr.get(), inner, w);
+            hoistScanStmt(s->body.get(), depth + 1, w);
+            return;
+        }
+        if (mult > 0) {
+            if (s->expr) hoistScanExpr(s->expr.get(), mult, w);
+            if (s->decl && s->decl->init) hoistScanExpr(s->decl->init.get(), mult, w);
+        }
+        for (auto &child : s->stmts) hoistScanStmt(child.get(), depth, w);
+        hoistScanStmt(s->thenStmt.get(), depth, w);
+        hoistScanStmt(s->elseStmt.get(), depth, w);
+        hoistScanStmt(s->body.get(), depth, w);
+    }
+
+    vector<long long> collectHoistConsts(const Function &f, int maxCount) const {
+        if (maxCount <= 0) return {};
+        unordered_map<long long, long long> w;
+        hoistScanStmt(f.body.get(), 0, w);
+        vector<pair<long long, long long>> ranked(w.begin(), w.end());
+        sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+        vector<long long> out;
+        for (auto &[v, weight] : ranked) {
+            if (weight < 8) break;  // only worth it inside a loop
+            out.push_back(v);
+            if (static_cast<int>(out.size()) >= maxCount) break;
+        }
+        return out;
     }
 
     void enterScope() { scopes.push_back({}); }
@@ -6500,7 +6596,17 @@ private:
     void genFunction(Function &f) {
         int slots = countSlots(f);
         static const vector<string> allVarRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
-        savedVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + min<int>(allVarRegs.size(), slots));
+        varRegCap = min<int>(static_cast<int>(allVarRegs.size()), slots);
+        auto hoistVals = collectHoistConsts(f, min(4, static_cast<int>(allVarRegs.size()) - varRegCap));
+        constRegMap.clear();
+        hoistedConsts.clear();
+        for (size_t i = 0; i < hoistVals.size(); ++i) {
+            const string &reg = allVarRegs[varRegCap + static_cast<int>(i)];
+            constRegMap[hoistVals[i]] = reg;
+            hoistedConsts.push_back({hoistVals[i], reg});
+        }
+        savedVarRegs.assign(allVarRegs.begin(),
+                            allVarRegs.begin() + varRegCap + static_cast<int>(hoistVals.size()));
         frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
         nextSlot = 0;
         nextVarReg = 0;
@@ -6542,6 +6648,10 @@ private:
             }
         }
 
+        for (auto &[value, reg] : hoistedConsts) {
+            emit("li " + reg + ", " + to_string(value));
+        }
+
         emitLabel(functionBodyLabel);
         genStmt(f.body.get());
         emit("li a0, 0");
@@ -6573,11 +6683,24 @@ private:
                 if (s->fastDeadStore || !hasCall(s->expr.get())) break;
                 genExpr(s->expr.get());
                 break;
-            case Stmt::Kind::Assign:
+            case Stmt::Kind::Assign: {
                 if (s->fastDeadStore) break;
-                genExpr(s->expr.get());
+                const Expr *rhs = s->expr.get();
+                // Call-free, short-circuit-free right-hand sides can target the
+                // variable's home register directly: every read in such an
+                // expression is emitted before the first write of the target,
+                // so `x = f(x)` still reads the old value.
+                if (!hasCall(rhs) && !exprHasShortCircuit(rhs)) {
+                    auto sym = lookup(s->name);
+                    if (sym && !sym->isConst && !sym->reg.empty()) {
+                        genExprNoCall(rhs, sym->reg, {"t0", "t1", "t2", "t3", "t4", "t5"});
+                        break;
+                    }
+                }
+                genExpr(rhs);
                 storeVar(s->name);
                 break;
+            }
             case Stmt::Kind::DeclStmt:
                 genDecl(*s->decl, s->fastDeadStore);
                 break;
@@ -6616,9 +6739,35 @@ private:
         int off = reg.empty() ? allocSlot() : 0;
         scopes.back()[d.name] = Symbol{false, 0, false, "", off, reg};
         if (skipInit) return;
-        genExpr(d.init.get());
+        const Expr *init = d.init.get();
+        if (!reg.empty() && !hasCall(init) && !exprHasShortCircuit(init) &&
+            !exprReadsVarName(init, d.name)) {
+            genExprNoCall(init, reg, {"t0", "t1", "t2", "t3", "t4", "t5"});
+            return;
+        }
+        genExpr(init);
         if (!reg.empty()) emit("mv " + reg + ", a0");
         else storeMem("a0", "s0", off);
+    }
+
+    static bool exprHasShortCircuit(const Expr *e) {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Binary && (e->op == "&&" || e->op == "||")) return true;
+        if (exprHasShortCircuit(e->lhs.get()) || exprHasShortCircuit(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (exprHasShortCircuit(arg.get())) return true;
+        }
+        return false;
+    }
+
+    static bool exprReadsVarName(const Expr *e, const string &name) {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var && e->name == name) return true;
+        if (exprReadsVarName(e->lhs.get(), name) || exprReadsVarName(e->rhs.get(), name)) return true;
+        for (auto &arg : e->args) {
+            if (exprReadsVarName(arg.get(), name)) return true;
+        }
+        return false;
     }
 
     void genIf(const Stmt *s) {
@@ -6638,23 +6787,30 @@ private:
     }
 
     void genWhile(const Stmt *s) {
-        if (auto v = tryConst(s->expr.get()); v && !*v) return;
-        string beginLabel = newLabel("while_begin");
+        auto constCond = tryConst(s->expr.get());
+        if (constCond && !*constCond) return;
+        // Rotated loop: guard test up front, condition test at the bottom.
+        // Saves the unconditional back-jump every iteration at the cost of
+        // duplicating the condition once.
+        string bodyLabel = newLabel("while_body");
+        string condLabel = newLabel("while_cond");
         string endLabel = newLabel("while_end");
-        emitLabel(beginLabel);
-        genCondFalse(s->expr.get(), endLabel);
+        if (!constCond) genCondFalse(s->expr.get(), endLabel);
+        emitLabel(bodyLabel);
         breakLabels.push_back(endLabel);
-        continueLabels.push_back(beginLabel);
+        continueLabels.push_back(condLabel);
         genStmt(s->body.get());
         continueLabels.pop_back();
         breakLabels.pop_back();
-        emit("j " + beginLabel);
+        emitLabel(condLabel);
+        if (constCond) emit("j " + bodyLabel);
+        else genCondTrue(s->expr.get(), bodyLabel);
         emitLabel(endLabel);
     }
 
     void genExpr(const Expr *e) {
         if (auto v = tryConst(e)) {
-            emit("li a0, " + to_string(*v));
+            emitLoadConst("a0", *v);
             return;
         }
         if (!hasCall(e)) {
@@ -6694,7 +6850,7 @@ private:
             return;
         }
         if (sym->isConst) {
-            emit("li " + dst + ", " + to_string(sym->constValue));
+            emitLoadConst(dst, sym->constValue);
         } else if (!sym->reg.empty()) {
             if (dst != sym->reg) emit("mv " + dst + ", " + sym->reg);
         } else if (sym->isGlobal) {
@@ -6805,12 +6961,20 @@ private:
         }
         auto spec = codegenMagicForDivisor(divisor);
         if (!spec) {
-            emit("li " + tmp + ", " + to_string(divisor));
-            emit("div " + dst + ", " + src + ", " + tmp);
+            string dreg = constReg(divisor);
+            if (dreg.empty()) {
+                emit("li " + tmp + ", " + to_string(divisor));
+                dreg = tmp;
+            }
+            emit("div " + dst + ", " + src + ", " + dreg);
             return;
         }
-        emit("li " + tmp + ", " + to_string(spec->magic));
-        emit("mulh " + dst + ", " + src + ", " + tmp);
+        string mreg = constReg(spec->magic);
+        if (mreg.empty()) {
+            emit("li " + tmp + ", " + to_string(spec->magic));
+            mreg = tmp;
+        }
+        emit("mulh " + dst + ", " + src + ", " + mreg);
         int postShift = spec->logicalShift
             ? (spec->addDividend ? spec->shift : spec->shift - 32)
             : spec->shift - 32;
@@ -6844,8 +7008,12 @@ private:
         emitQuotientConst(dst, orig, divisor, tmp);
         if (isPowerOfTwo(divisor)) emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(divisor)));
         else {
-            emit("li " + tmp + ", " + to_string(divisor));
-            emit("mul " + dst + ", " + dst + ", " + tmp);
+            string dreg = constReg(divisor);
+            if (dreg.empty()) {
+                emit("li " + tmp + ", " + to_string(divisor));
+                dreg = tmp;
+            }
+            emit("mul " + dst + ", " + dst + ", " + dreg);
         }
         emit("sub " + dst + ", " + orig + ", " + dst);
     }
@@ -6875,12 +7043,12 @@ private:
 
     void genExprNoCall(const Expr *e, const string &dst, vector<string> regs) {
         if (auto v = tryConst(e)) {
-            emit("li " + dst + ", " + to_string(*v));
+            emitLoadConst(dst, *v);
             return;
         }
         switch (e->kind) {
             case Expr::Kind::Number:
-                emit("li " + dst + ", " + to_string(e->value));
+                emitLoadConst(dst, e->value);
                 return;
             case Expr::Kind::Var:
                 loadVarTo(e->name, dst);
@@ -7028,6 +7196,24 @@ private:
             }
         }
 
+        // A constant operand held in a hoisted register is used in place.
+        if (auto rv = tryConst(e->rhs.get())) {
+            string cr = constReg(*rv);
+            if (!cr.empty()) {
+                genExprNoCall(e->lhs.get(), dst, regs);
+                emitBinaryReg(e->op, dst, dst, cr);
+                return;
+            }
+        }
+        if (auto lv = tryConst(e->lhs.get())) {
+            string cr = constReg(*lv);
+            if (!cr.empty()) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                emitBinaryReg(e->op, dst, cr, dst);
+                return;
+            }
+        }
+
         if (regs.empty()) {
             genExprNoCall(e->lhs.get(), dst, regs);
             pushReg(dst);
@@ -7037,11 +7223,41 @@ private:
             return;
         }
 
+        // A variable already in a callee-saved register can serve as the lhs
+        // operand in place (no copy), as long as it is not also the
+        // destination: rhs evaluation only writes dst and the pool.
+        if (e->lhs->kind == Expr::Kind::Var) {
+            auto sym = lookup(e->lhs->name);
+            if (sym && !sym->isConst && !sym->isGlobal && !sym->reg.empty() && sym->reg != dst) {
+                genExprNoCall(e->rhs.get(), dst, regs);
+                emitBinaryReg(e->op, dst, sym->reg, dst);
+                return;
+            }
+        }
         string lhsReg = regs.front();
         regs.erase(regs.begin());
         genExprNoCall(e->lhs.get(), lhsReg, regs);
         genExprNoCall(e->rhs.get(), dst, regs);
         emitBinaryReg(e->op, dst, lhsReg, dst);
+    }
+
+    // Materialize a branch operand: constants of zero become x0, variables
+    // already living in a callee-saved register are used in place, and
+    // everything else is evaluated into the given scratch register.
+    string condOperandReg(const Expr *e, const string &scratch, const vector<string> &pool) {
+        if (auto v = tryConst(e)) {
+            if (*v == 0) return "x0";
+            string cr = constReg(*v);
+            if (!cr.empty()) return cr;
+            emit("li " + scratch + ", " + to_string(*v));
+            return scratch;
+        }
+        if (e->kind == Expr::Kind::Var) {
+            auto sym = lookup(e->name);
+            if (sym && !sym->isConst && !sym->isGlobal && !sym->reg.empty()) return sym->reg;
+        }
+        genExprNoCall(e, scratch, pool);
+        return scratch;
     }
 
     void genCondFalse(const Expr *e, const string &falseLabel) {
@@ -7067,14 +7283,14 @@ private:
         }
         static const unordered_set<string> relops = {"<", ">", "<=", ">=", "==", "!="};
         if (e->kind == Expr::Kind::Binary && relops.count(e->op) && !hasCall(e)) {
-            genExprNoCall(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
-            genExprNoCall(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
-            if (e->op == "<") emit("bge a0, t0, " + falseLabel);
-            else if (e->op == ">") emit("bge t0, a0, " + falseLabel);
-            else if (e->op == "<=") emit("blt t0, a0, " + falseLabel);
-            else if (e->op == ">=") emit("blt a0, t0, " + falseLabel);
-            else if (e->op == "==") emit("bne a0, t0, " + falseLabel);
-            else if (e->op == "!=") emit("beq a0, t0, " + falseLabel);
+            string l = condOperandReg(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
+            string r = condOperandReg(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
+            if (e->op == "<") emit("bge " + l + ", " + r + ", " + falseLabel);
+            else if (e->op == ">") emit("bge " + r + ", " + l + ", " + falseLabel);
+            else if (e->op == "<=") emit("blt " + r + ", " + l + ", " + falseLabel);
+            else if (e->op == ">=") emit("blt " + l + ", " + r + ", " + falseLabel);
+            else if (e->op == "==") emit("bne " + l + ", " + r + ", " + falseLabel);
+            else if (e->op == "!=") emit("beq " + l + ", " + r + ", " + falseLabel);
             return;
         }
         genExpr(e);
@@ -7104,14 +7320,14 @@ private:
         }
         static const unordered_set<string> relops = {"<", ">", "<=", ">=", "==", "!="};
         if (e->kind == Expr::Kind::Binary && relops.count(e->op) && !hasCall(e)) {
-            genExprNoCall(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
-            genExprNoCall(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
-            if (e->op == "<") emit("blt a0, t0, " + trueLabel);
-            else if (e->op == ">") emit("blt t0, a0, " + trueLabel);
-            else if (e->op == "<=") emit("bge t0, a0, " + trueLabel);
-            else if (e->op == ">=") emit("bge a0, t0, " + trueLabel);
-            else if (e->op == "==") emit("beq a0, t0, " + trueLabel);
-            else if (e->op == "!=") emit("bne a0, t0, " + trueLabel);
+            string l = condOperandReg(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
+            string r = condOperandReg(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
+            if (e->op == "<") emit("blt " + l + ", " + r + ", " + trueLabel);
+            else if (e->op == ">") emit("blt " + r + ", " + l + ", " + trueLabel);
+            else if (e->op == "<=") emit("bge " + r + ", " + l + ", " + trueLabel);
+            else if (e->op == ">=") emit("bge " + l + ", " + r + ", " + trueLabel);
+            else if (e->op == "==") emit("beq " + l + ", " + r + ", " + trueLabel);
+            else if (e->op == "!=") emit("bne " + l + ", " + r + ", " + trueLabel);
             return;
         }
         genExpr(e);
