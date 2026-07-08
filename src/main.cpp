@@ -4861,10 +4861,8 @@ private:
 
     // ---- polynomial accumulator loop analysis (slot-based) ----
 
-    static constexpr int kPolyTerms = 6;
-
     struct PolyS {
-        array<uint32_t, kPolyTerms> c{};
+        array<uint32_t, 4> c{};
     };
 
     static PolyS polyConst(uint32_t v) {
@@ -4874,27 +4872,27 @@ private:
     }
 
     static PolyS polyAdd(PolyS a, const PolyS &b) {
-        for (int i = 0; i < kPolyTerms; ++i) a.c[i] += b.c[i];
+        for (int i = 0; i < 4; ++i) a.c[i] += b.c[i];
         return a;
     }
 
     static PolyS polySub(PolyS a, const PolyS &b) {
-        for (int i = 0; i < kPolyTerms; ++i) a.c[i] -= b.c[i];
+        for (int i = 0; i < 4; ++i) a.c[i] -= b.c[i];
         return a;
     }
 
     static PolyS polyNeg(PolyS a) {
-        for (int i = 0; i < kPolyTerms; ++i) a.c[i] = 0u - a.c[i];
+        for (int i = 0; i < 4; ++i) a.c[i] = 0u - a.c[i];
         return a;
     }
 
     static bool polyMul(const PolyS &a, const PolyS &b, PolyS &out) {
         out = PolyS{};
-        for (int i = 0; i < kPolyTerms; ++i) {
+        for (int i = 0; i < 4; ++i) {
             if (!a.c[i]) continue;
-            for (int j = 0; j < kPolyTerms; ++j) {
+            for (int j = 0; j < 4; ++j) {
                 if (!b.c[j]) continue;
-                if (i + j >= kPolyTerms) return false;
+                if (i + j >= 4) return false;
                 out.c[i + j] = static_cast<uint32_t>(out.c[i + j] +
                     static_cast<uint64_t>(a.c[i]) * b.c[j]);
             }
@@ -4907,32 +4905,7 @@ private:
                                      static_cast<uint32_t>(b));
     }
 
-    __extension__ using UInt128 = unsigned __int128;
-
-    static uint32_t productDivMod32(initializer_list<UInt128> rawFactors, uint64_t denom) {
-        vector<UInt128> factors(rawFactors);
-        for (uint64_t p : {2ull, 3ull, 5ull, 7ull}) {
-            while (denom % p == 0) {
-                bool divided = false;
-                for (auto &factor : factors) {
-                    if (factor % p == 0) {
-                        factor /= p;
-                        denom /= p;
-                        divided = true;
-                        break;
-                    }
-                }
-                if (!divided) return 0;
-            }
-        }
-        if (denom != 1) return 0;
-        uint32_t out = 1;
-        for (auto factor : factors) out = mulMod32(out, static_cast<uint64_t>(factor));
-        return out;
-    }
-
     static uint32_t sumPow(uint64_t n, int pow) {
-        if (n == 0) return 0;
         switch (pow) {
             case 0:
                 return static_cast<uint32_t>(n);
@@ -4958,32 +4931,13 @@ private:
                 uint32_t t = mulMod32(a, b);
                 return mulMod32(t, t);
             }
-            case 4: {
-                UInt128 nn = n;
-                return productDivMod32({
-                    nn,
-                    nn - 1,
-                    2 * nn - 1,
-                    3 * nn * nn - 3 * nn - 1,
-                }, 30);
-            }
-            case 5: {
-                UInt128 nn = n;
-                return productDivMod32({
-                    nn,
-                    nn,
-                    nn - 1,
-                    nn - 1,
-                    2 * nn * nn - 2 * nn - 1,
-                }, 12);
-            }
         }
         return 0;
     }
 
     static uint32_t sumPoly(const PolyS &p, uint64_t n) {
         uint32_t out = 0;
-        for (int i = 0; i < kPolyTerms; ++i) {
+        for (int i = 0; i < 4; ++i) {
             out = static_cast<uint32_t>(out + static_cast<uint64_t>(p.c[i]) * sumPow(n, i));
         }
         return out;
