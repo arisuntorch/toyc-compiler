@@ -5581,7 +5581,7 @@ public:
             } else {
                 env.clear();
                 enter();
-                for (const string &param : item.func->params) env.back()[param] = nullopt;
+                for (const string &param : item.func->params) env.back()[param] = LocalInfo{};
                 optStmt(item.func->body);
                 leave();
             }
@@ -5594,7 +5594,11 @@ private:
     unordered_map<string, Function *> inlineableFuncs;
     unordered_set<string> globalNames;
     unordered_set<string> assignedGlobalNames;
-    vector<unordered_map<string, optional<int32_t>>> env;
+    struct LocalInfo {
+        optional<int32_t> constVal;
+        string copyOf;  // empty = not a copy of another local
+    };
+    vector<unordered_map<string, LocalInfo>> env;
 
     void collectInlineableFunctions() {
         inlineableFuncs.clear();
@@ -5636,33 +5640,73 @@ private:
     optional<int32_t> lookupLocalConst(const string &name) const {
         for (auto it = env.rbegin(); it != env.rend(); ++it) {
             auto found = it->find(name);
-            if (found != it->end()) return found->second;
+            if (found != it->end()) return found->second.constVal;
         }
         return nullopt;
     }
 
-    bool isKnownLocal(const string &name) const {
-        for (auto it = env.rbegin(); it != env.rend(); ++it) {
-            if (it->count(name)) return true;
-        }
-        return false;
-    }
-
-    void setLocalValue(const string &name, optional<int32_t> value) {
+    // Innermost scope entry for a name, or nullptr.
+    LocalInfo *findLocal(const string &name) {
         for (auto it = env.rbegin(); it != env.rend(); ++it) {
             auto found = it->find(name);
-            if (found != it->end()) {
-                found->second = value;
-                return;
+            if (found != it->end()) return &found->second;
+        }
+        return nullptr;
+    }
+
+    // Scope depth of a name's innermost binding (-1 if unknown).
+    int localScopeIndex(const string &name) const {
+        for (int i = static_cast<int>(env.size()) - 1; i >= 0; --i) {
+            if (env[static_cast<size_t>(i)].count(name)) return i;
+        }
+        return -1;
+    }
+
+    bool isKnownLocal(const string &name) const {
+        return localScopeIndex(name) >= 0;
+    }
+
+    // Any recorded "x is a copy of name" relations become invalid once name
+    // is reassigned.
+    void killCopiesOf(const string &name) {
+        for (auto &scope : env) {
+            for (auto &[key, info] : scope) {
+                if (info.copyOf == name) info.copyOf.clear();
             }
         }
     }
 
+    void setLocalValue(const string &name, optional<int32_t> value) {
+        killCopiesOf(name);
+        if (LocalInfo *info = findLocal(name)) {
+            info->constVal = value;
+            info->copyOf.clear();
+        }
+    }
+
     void eraseLocalValue(const string &name) {
+        killCopiesOf(name);
         for (auto &scope : env) {
             auto found = scope.find(name);
-            if (found != scope.end()) found->second = nullopt;
+            if (found != scope.end()) found->second = LocalInfo{};
         }
+    }
+
+    // Record "dst reads the same value as the local variable src". Only
+    // sources bound at the same or an outer scope stay alive for as long as
+    // the relation can be used, so deeper-scoped sources are rejected.
+    void recordCopy(const string &dst, const Expr *rhs) {
+        if (!rhs || rhs->kind != Expr::Kind::Var || rhs->name == dst) return;
+        string src = rhs->name;
+        if (LocalInfo *srcInfo = findLocal(src)) {
+            if (!srcInfo->copyOf.empty()) src = srcInfo->copyOf;  // collapse chains
+        } else {
+            return;  // not a local
+        }
+        int dstIdx = localScopeIndex(dst);
+        int srcIdx = localScopeIndex(src);
+        if (dstIdx < 0 || srcIdx < 0 || srcIdx > dstIdx || src == dst) return;
+        if (LocalInfo *dstInfo = findLocal(dst)) dstInfo->copyOf = src;
     }
 
     void optExpr(unique_ptr<Expr> &e) {
@@ -5673,6 +5717,10 @@ private:
             case Expr::Kind::Var: {
                 if (auto v = lookupLocalConst(e->name)) {
                     e = makeNumberExpr(*v);
+                    return;
+                }
+                if (LocalInfo *info = findLocal(e->name); info && !info->copyOf.empty()) {
+                    e->name = info->copyOf;  // copy propagation
                     return;
                 }
                 auto g = globalConsts.find(e->name);
@@ -5695,27 +5743,90 @@ private:
         }
     }
 
+    // Structural equality of pure (call-free) expressions.
+    static bool exprStructEq(const Expr *a, const Expr *b) {
+        if (!a || !b) return a == b;
+        if (a->kind != b->kind) return false;
+        switch (a->kind) {
+            case Expr::Kind::Number:
+                return a->value == b->value;
+            case Expr::Kind::Var:
+                return a->name == b->name;
+            case Expr::Kind::Unary:
+                return a->op == b->op && exprStructEq(a->lhs.get(), b->lhs.get());
+            case Expr::Kind::Binary:
+                return a->op == b->op && exprStructEq(a->lhs.get(), b->lhs.get()) &&
+                       exprStructEq(a->rhs.get(), b->rhs.get());
+            case Expr::Kind::Call:
+                return false;  // calls are never treated as equal
+        }
+        return false;
+    }
+
+    static unique_ptr<Expr> makeBinary(const string &op, unique_ptr<Expr> lhs, unique_ptr<Expr> rhs) {
+        auto e = make_unique<Expr>();
+        e->kind = Expr::Kind::Binary;
+        e->op = op;
+        e->lhs = std::move(lhs);
+        e->rhs = std::move(rhs);
+        return e;
+    }
+
     void simplifyBinary(unique_ptr<Expr> &e) {
         if (auto v = foldConstExpr(e.get())) {
             e = makeNumberExpr(*v);
             return;
         }
         if (!e || e->kind != Expr::Kind::Binary) return;
+
+        // Canonicalize: constant operand of a commutative operator moves to
+        // the right, where both the reassociation rules below and the code
+        // generator's immediate forms expect it.
+        if ((e->op == "+" || e->op == "*") && foldConstExpr(e->lhs.get()) &&
+            !foldConstExpr(e->rhs.get())) {
+            swap(e->lhs, e->rhs);
+        }
+
         auto l = foldConstExpr(e->lhs.get());
         auto r = foldConstExpr(e->rhs.get());
         bool lhsPure = !exprHasCall(e->lhs.get());
         bool rhsPure = !exprHasCall(e->rhs.get());
 
+        // Reassociate constant chains: (x op c1) op c2 -> x op (c1 op c2)
+        // for +/- mixes and multiplication (32-bit wrapping keeps this exact).
+        if (r && e->lhs->kind == Expr::Kind::Binary) {
+            Expr *inner = e->lhs.get();
+            if (auto ic = foldConstExpr(inner->rhs.get())) {
+                long long c1 = *ic, c2 = *r;
+                if ((e->op == "+" || e->op == "-") && (inner->op == "+" || inner->op == "-")) {
+                    long long outer = e->op == "+" ? c2 : -c2;
+                    long long innerC = inner->op == "+" ? c1 : -c1;
+                    long long total = wrap32(innerC + outer);
+                    e = makeBinary("+", std::move(inner->lhs), makeNumberExpr(total));
+                    simplifyBinary(e);
+                    return;
+                }
+                if (e->op == "*" && inner->op == "*") {
+                    e = makeBinary("*", std::move(inner->lhs), makeNumberExpr(wrap32(c1 * c2)));
+                    simplifyBinary(e);
+                    return;
+                }
+            }
+        }
+
         if (e->op == "+" && r && *r == 0) e = std::move(e->lhs);
         else if (e->op == "+" && l && *l == 0) e = std::move(e->rhs);
         else if (e->op == "-" && r && *r == 0) e = std::move(e->lhs);
+        else if (e->op == "-" && lhsPure && exprStructEq(e->lhs.get(), e->rhs.get())) e = makeNumberExpr(0);
         else if (e->op == "*" && r && *r == 1) e = std::move(e->lhs);
         else if (e->op == "*" && l && *l == 1) e = std::move(e->rhs);
         else if (e->op == "*" && r && *r == 0 && lhsPure) e = makeNumberExpr(0);
         else if (e->op == "*" && l && *l == 0 && rhsPure) e = makeNumberExpr(0);
         else if (e->op == "/" && r && *r == 1) e = std::move(e->lhs);
         else if (e->op == "%" && r && *r == 1 && lhsPure) e = makeNumberExpr(0);
-        else if (e->op == "&&" && l && !truthy(*l)) e = makeNumberExpr(0);
+        else if (e->op == "+" && lhsPure && exprStructEq(e->lhs.get(), e->rhs.get())) {
+            e = makeBinary("*", std::move(e->lhs), makeNumberExpr(2));
+        } else if (e->op == "&&" && l && !truthy(*l)) e = makeNumberExpr(0);
         else if (e->op == "||" && l && truthy(*l)) e = makeNumberExpr(1);
     }
 
@@ -5760,11 +5871,16 @@ private:
                 break;
             case Stmt::Kind::DeclStmt:
                 optExpr(s->decl->init);
-                env.back()[s->decl->name] = foldConstExpr(s->decl->init.get());
+                killCopiesOf(s->decl->name);  // shadowed outer relations die here
+                env.back()[s->decl->name] = LocalInfo{foldConstExpr(s->decl->init.get()), ""};
+                recordCopy(s->decl->name, s->decl->init.get());
                 break;
             case Stmt::Kind::Assign:
                 optExpr(s->expr);
-                if (isKnownLocal(s->name)) setLocalValue(s->name, foldConstExpr(s->expr.get()));
+                if (isKnownLocal(s->name)) {
+                    setLocalValue(s->name, foldConstExpr(s->expr.get()));
+                    recordCopy(s->name, s->expr.get());
+                }
                 break;
             case Stmt::Kind::If: {
                 optExpr(s->expr);
@@ -5799,6 +5915,11 @@ private:
                     s = emptyStmt();
                     break;
                 }
+                if (hoistLoopInvariants(s)) {
+                    // s is now a Block{temp decls..., while}; reprocess it.
+                    optStmt(s);
+                    break;
+                }
                 auto saved = env;
                 optStmt(s->body);
                 env = saved;
@@ -5809,6 +5930,138 @@ private:
             case Stmt::Kind::Continue:
                 break;
         }
+    }
+
+    // ---- loop-invariant code motion ----
+    //
+    // Pure subexpressions whose operands cannot change during the loop are
+    // computed once in temporaries declared just before the loop. Divisions
+    // are hoisted only for safe constant divisors, so a division guarded
+    // inside the loop can never change behavior by being evaluated early.
+
+    int licmCounter = 0;
+
+    struct LicmCtx {
+        unordered_set<string> modified;   // names assigned/declared in the loop
+        bool callsInBody = false;         // calls may write any global
+        vector<pair<unique_ptr<Expr>, string>> hoisted;
+    };
+
+    bool stmtHasCall(const Stmt *s) const {
+        if (!s) return false;
+        if (s->expr && exprHasCall(s->expr.get())) return true;
+        if (s->decl && s->decl->init && exprHasCall(s->decl->init.get())) return true;
+        for (auto &child : s->stmts) {
+            if (stmtHasCall(child.get())) return true;
+        }
+        return stmtHasCall(s->thenStmt.get()) || stmtHasCall(s->elseStmt.get()) ||
+               stmtHasCall(s->body.get());
+    }
+
+    bool licmInvariant(const Expr *e, const LicmCtx &ctx) const {
+        if (!e) return true;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return true;
+            case Expr::Kind::Var:
+                if (ctx.modified.count(e->name)) return false;
+                if (isKnownLocal(e->name)) return true;       // locals are call-proof
+                if (!globalNames.count(e->name)) return false;
+                return !ctx.callsInBody;                      // globals only without calls
+            case Expr::Kind::Unary:
+                return licmInvariant(e->lhs.get(), ctx);
+            case Expr::Kind::Binary:
+                if (e->op == "/" || e->op == "%") {
+                    // Only hoist divisions whose divisor is a safe constant;
+                    // evaluating a guarded division early must not be able to
+                    // change semantics anywhere (target or evaluators).
+                    auto d = foldConstExpr(e->rhs.get());
+                    if (!d || *d == 0 || *d == -1) return false;
+                }
+                return licmInvariant(e->lhs.get(), ctx) && licmInvariant(e->rhs.get(), ctx);
+            case Expr::Kind::Call:
+                return false;
+        }
+        return false;
+    }
+
+    static void licmCost(const Expr *e, int &ops, bool &hasMulDiv) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Binary) {
+            ++ops;
+            if (e->op == "*" || e->op == "/" || e->op == "%") hasMulDiv = true;
+        } else if (e->kind == Expr::Kind::Unary) {
+            ++ops;
+        }
+        licmCost(e->lhs.get(), ops, hasMulDiv);
+        licmCost(e->rhs.get(), ops, hasMulDiv);
+    }
+
+    bool licmWorthHoisting(const Expr *e) const {
+        if (e->kind != Expr::Kind::Binary && e->kind != Expr::Kind::Unary) return false;
+        if (foldConstExpr(e)) return false;  // plain constants stay as immediates
+        int ops = 0;
+        bool hasMulDiv = false;
+        licmCost(e, ops, hasMulDiv);
+        return hasMulDiv || ops >= 2;
+    }
+
+    void licmVisitExpr(unique_ptr<Expr> &e, LicmCtx &ctx) {
+        if (!e) return;
+        if (licmInvariant(e.get(), ctx)) {
+            if (!licmWorthHoisting(e.get())) return;
+            for (auto &[expr, name] : ctx.hoisted) {
+                if (exprStructEq(expr.get(), e.get())) {
+                    auto v = make_unique<Expr>();
+                    v->kind = Expr::Kind::Var;
+                    v->name = name;
+                    e = std::move(v);
+                    return;
+                }
+            }
+            string name = "$licm" + to_string(licmCounter++);
+            auto v = make_unique<Expr>();
+            v->kind = Expr::Kind::Var;
+            v->name = name;
+            ctx.hoisted.push_back({std::move(e), name});
+            e = std::move(v);
+            return;
+        }
+        licmVisitExpr(e->lhs, ctx);
+        licmVisitExpr(e->rhs, ctx);
+        for (auto &arg : e->args) licmVisitExpr(arg, ctx);
+    }
+
+    void licmVisitStmt(Stmt *s, LicmCtx &ctx) {
+        if (!s) return;
+        if (s->expr) licmVisitExpr(s->expr, ctx);
+        if (s->decl && s->decl->init) licmVisitExpr(s->decl->init, ctx);
+        for (auto &child : s->stmts) licmVisitStmt(child.get(), ctx);
+        licmVisitStmt(s->thenStmt.get(), ctx);
+        licmVisitStmt(s->elseStmt.get(), ctx);
+        licmVisitStmt(s->body.get(), ctx);
+    }
+
+    bool hoistLoopInvariants(unique_ptr<Stmt> &s) {
+        LicmCtx ctx;
+        ctx.modified = assignedInStmt(s->body.get());
+        ctx.callsInBody = stmtHasCall(s->body.get());
+        licmVisitExpr(s->expr, ctx);
+        licmVisitStmt(s->body.get(), ctx);
+        if (ctx.hoisted.empty()) return false;
+        auto block = make_unique<Stmt>();
+        block->kind = Stmt::Kind::Block;
+        for (auto &[expr, name] : ctx.hoisted) {
+            auto decl = make_unique<Stmt>();
+            decl->kind = Stmt::Kind::DeclStmt;
+            decl->decl = make_unique<Decl>();
+            decl->decl->name = name;
+            decl->decl->init = std::move(expr);
+            block->stmts.push_back(std::move(decl));
+        }
+        block->stmts.push_back(std::move(s));
+        s = std::move(block);
+        return true;
     }
 
     bool alwaysJumps(const Stmt *s) const {
