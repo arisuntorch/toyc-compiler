@@ -8257,17 +8257,43 @@ private:
     };
 
     static optional<CodegenMagicDiv> codegenMagicForDivisor(int divisor) {
-        switch (divisor) {
-            case 3: return CodegenMagicDiv{3, 1431655766, 32, false, true};
-            case 5: return CodegenMagicDiv{5, 1717986919, 33, false, false};
-            case 7: return CodegenMagicDiv{7, static_cast<int32_t>(2454267027u), 2, true, true};
-            case 10: return CodegenMagicDiv{10, 1717986919, 34, false, false};
-            case 11: return CodegenMagicDiv{11, 780903145, 33, false, false};
-            case 13: return CodegenMagicDiv{13, 1321528399, 34, false, false};
-            case 31: return CodegenMagicDiv{31, static_cast<int32_t>(2216757315u), 4, true, true};
-            case 100: return CodegenMagicDiv{100, 1374389535, 37, false, false};
-            default: return nullopt;
-        }
+        if (divisor <= 1) return nullopt;
+        const int64_t two31 = 1ll << 31;
+        const int64_t ad = divisor;
+        const int64_t anc = two31 - 1 - (two31 - 1) % ad;
+        int p = 31;
+        int64_t q1 = two31 / anc;
+        int64_t r1 = two31 - q1 * anc;
+        int64_t q2 = two31 / ad;
+        int64_t r2 = two31 - q2 * ad;
+        int64_t delta = 0;
+        do {
+            ++p;
+            q1 <<= 1;
+            r1 <<= 1;
+            if (r1 >= anc) {
+                ++q1;
+                r1 -= anc;
+            }
+            q2 <<= 1;
+            r2 <<= 1;
+            if (r2 >= ad) {
+                ++q2;
+                r2 -= ad;
+            }
+            delta = ad - r2;
+        } while (q1 < delta || (q1 == delta && r1 == 0));
+
+        int32_t magic = static_cast<int32_t>(static_cast<uint32_t>(q2 + 1));
+        int shift = p - 32;
+        bool addDividend = magic < 0;
+        return CodegenMagicDiv{
+            divisor,
+            magic,
+            addDividend ? shift : shift + 32,
+            addDividend,
+            addDividend,
+        };
     }
 
     bool canStrengthReduceDivisor(long long divisor) const {
