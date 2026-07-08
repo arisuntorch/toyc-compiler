@@ -4943,6 +4943,116 @@ private:
         return out;
     }
 
+    bool polyExprFromAliases(const Expr *e, unordered_map<int, PolyS> &aliases,
+                             const int32_t *frame, PolyS &out, int depth) const {
+        if (!e || depth > 8) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out = polyConst(static_cast<uint32_t>(wrap32(e->value)));
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                auto it = aliases.find(key);
+                if (it != aliases.end()) {
+                    out = it->second;
+                    return true;
+                }
+                if (key & kGlobalBit) {
+                    out = polyConst(static_cast<uint32_t>(readSlot(key, frame)));
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Unary: {
+                PolyS a;
+                if (!polyExprFromAliases(e->lhs.get(), aliases, frame, a, depth)) return false;
+                if (e->opc == OPC_PLUS) out = a;
+                else if (e->opc == OPC_NEG) out = polyNeg(a);
+                else return false;
+                return true;
+            }
+            case Expr::Kind::Binary: {
+                PolyS a, b;
+                if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
+                    if (!polyExprFromAliases(e->lhs.get(), aliases, frame, a, depth) ||
+                        !polyExprFromAliases(e->rhs.get(), aliases, frame, b, depth)) return false;
+                    out = e->opc == OPC_ADD ? polyAdd(a, b) : polySub(a, b);
+                    return true;
+                }
+                if (e->opc == OPC_MUL) {
+                    if (!polyExprFromAliases(e->lhs.get(), aliases, frame, a, depth) ||
+                        !polyExprFromAliases(e->rhs.get(), aliases, frame, b, depth)) return false;
+                    return polyMul(a, b, out);
+                }
+                return false;
+            }
+            case Expr::Kind::Call: {
+                auto found = funcs.find(e->name);
+                if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+                vector<PolyS> callArgs;
+                callArgs.reserve(e->args.size());
+                for (auto &arg : e->args) {
+                    PolyS p;
+                    if (!polyExprFromAliases(arg.get(), aliases, frame, p, depth)) return false;
+                    callArgs.push_back(p);
+                }
+                return polyPureFunction(found->second, callArgs, frame, out, depth + 1);
+            }
+        }
+        return false;
+    }
+
+    bool polyPureStmt(const Stmt *s, unordered_map<int, PolyS> &aliases,
+                      const int32_t *frame, PolyS &out, bool &returned, int depth) const {
+        if (!s || returned) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!polyPureStmt(child.get(), aliases, frame, out, returned, depth)) return false;
+                    if (returned) return true;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
+                if (!s->decl || !s->decl->init) return false;
+                PolyS p;
+                if (!polyExprFromAliases(s->decl->init.get(), aliases, frame, p, depth)) return false;
+                aliases[s->decl->fastSlot] = p;
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
+                int key = assignSlotKey(s);
+                if (key & kGlobalBit) return false;
+                PolyS p;
+                if (!polyExprFromAliases(s->expr.get(), aliases, frame, p, depth)) return false;
+                aliases[key] = p;
+                return true;
+            }
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::Return:
+                if (!s->expr) out = polyConst(0);
+                else if (!polyExprFromAliases(s->expr.get(), aliases, frame, out, depth)) return false;
+                returned = true;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool polyPureFunction(const Function *f, const vector<PolyS> &args,
+                          const int32_t *frame, PolyS &out, int depth) const {
+        if (!f || f->returnsVoid || args.size() != f->params.size() || depth > 8) return false;
+        unordered_map<int, PolyS> aliases;
+        for (size_t i = 0; i < args.size(); ++i) aliases[static_cast<int>(i)] = args[i];
+        bool returned = false;
+        if (!polyPureStmt(f->body.get(), aliases, frame, out, returned, depth)) return false;
+        return returned;
+    }
+
     bool flattenPolyLoopStmt(const Stmt *s, vector<const Stmt *> &out) const {
         if (!s) return true;
         switch (s->kind) {
@@ -5290,8 +5400,18 @@ private:
                 out = polyConst(static_cast<uint32_t>(readSlot(key, frame)));
                 return true;
             }
-            case Expr::Kind::Call:
-                return false;
+            case Expr::Kind::Call: {
+                auto found = funcs.find(e->name);
+                if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+                vector<PolyS> args;
+                args.reserve(e->args.size());
+                for (auto &arg : e->args) {
+                    PolyS p;
+                    if (!polyExpr(arg.get(), indKey, indBase, step, changing, aliases, frame, p)) return false;
+                    args.push_back(p);
+                }
+                return polyPureFunction(found->second, args, frame, out, 0);
+            }
             case Expr::Kind::Unary: {
                 PolyS a;
                 if (!polyExpr(e->lhs.get(), indKey, indBase, step, changing, aliases, frame, a)) return false;
