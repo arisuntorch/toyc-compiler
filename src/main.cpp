@@ -2022,6 +2022,121 @@ private:
         for (auto &arg : e->args) blExprReads(arg.get(), live);
     }
 
+    bool exprUsesAnyKey(const Expr *e, const unordered_set<int> &keys) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var) return keys.count(exprSlotKey(e));
+        if (exprUsesAnyKey(e->lhs.get(), keys) || exprUsesAnyKey(e->rhs.get(), keys)) return true;
+        for (auto &arg : e->args) {
+            if (exprUsesAnyKey(arg.get(), keys)) return true;
+        }
+        return false;
+    }
+
+    bool stmtWritesKey(const Stmt *s, int key) const {
+        if (!s || s->fastDeadStore) return false;
+        if (s->kind == Stmt::Kind::Assign) return assignSlotKey(s) == key;
+        if (s->kind == Stmt::Kind::DeclStmt) return s->decl && s->decl->fastSlot == key;
+        for (auto &child : s->stmts) {
+            if (stmtWritesKey(child.get(), key)) return true;
+        }
+        return stmtWritesKey(s->thenStmt.get(), key) || stmtWritesKey(s->elseStmt.get(), key) ||
+               stmtWritesKey(s->body.get(), key);
+    }
+
+    bool collectDeadLoopAssignments(const Stmt *s, unordered_set<int> &assigned) const {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectDeadLoopAssignments(child.get(), assigned)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::Assign: {
+                if (exprHasCallS(s->expr.get())) return false;
+                int key = assignSlotKey(s);
+                if (key & kGlobalBit) return false;
+                assigned.insert(key);
+                return true;
+            }
+            case Stmt::Kind::DeclStmt:
+                if (!s->decl || exprHasCallS(s->decl->init.get())) return false;
+                assigned.insert(s->decl->fastSlot);
+                return true;
+            case Stmt::Kind::If:
+                return !exprHasCallS(s->expr.get()) &&
+                       collectDeadLoopAssignments(s->thenStmt.get(), assigned) &&
+                       collectDeadLoopAssignments(s->elseStmt.get(), assigned);
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool findDeadLoopInductionStep(const Stmt *s, int indKey, optional<int32_t> &step) const {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!findDeadLoopInductionStep(child.get(), indKey, step)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::DeclStmt:
+                return true;
+            case Stmt::Kind::Assign:
+                if (assignSlotKey(s) != indKey) return true;
+                if (exprHasCallS(s->expr.get())) return false;
+                int key;
+                int32_t off;
+                if (!extractInductionPlusConst(s->expr.get(), key, off) || key != indKey || off == 0) return false;
+                if (step && *step != off) return false;
+                step = off;
+                return true;
+            case Stmt::Kind::If:
+                if (stmtWritesKey(s->thenStmt.get(), indKey) || stmtWritesKey(s->elseStmt.get(), indKey)) return false;
+                return true;
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool canDropDeadLoop(const Stmt *s, const unordered_set<int> &liveAfter) const {
+        if (!s || s->kind != Stmt::Kind::While || exprHasCallS(s->expr.get())) return false;
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *bound = nullptr;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, bound, boundAdjust)) return false;
+        (void)boundAdjust;
+        if (indKey & kGlobalBit) return false;
+
+        unordered_set<int> assigned;
+        if (!collectDeadLoopAssignments(s->body.get(), assigned)) return false;
+        if (!assigned.count(indKey)) return false;
+        for (int key : assigned) {
+            if ((key & kGlobalBit) || liveAfter.count(key)) return false;
+        }
+        if (exprUsesAnyKey(bound, assigned)) return false;
+
+        optional<int32_t> step;
+        if (!findDeadLoopInductionStep(s->body.get(), indKey, step) || !step) return false;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && *step > 0) return true;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && *step < 0) return true;
+        return false;
+    }
+
     // Processes s backwards: live is the live-after set on entry and the
     // live-before set on return. When mark is true, provably dead local
     // stores are flagged. breakLive/continueLive are the live sets at the
@@ -2063,6 +2178,11 @@ private:
             }
             case Stmt::Kind::While: {
                 unordered_set<int> after = live;
+                if (mark && canDropDeadLoop(s, after)) {
+                    s->fastDeadStore = true;
+                    live = std::move(after);
+                    return;
+                }
                 unordered_set<int> head = live;
                 blExprReads(s->expr.get(), head);
                 for (int iter = 0; iter < 16; ++iter) {
@@ -2545,6 +2665,7 @@ private:
                 return;
             }
             case Stmt::Kind::While: {
+                if (s->fastDeadStore) return;
                 int foldIdx = emit(VM_FOLD, 0, static_cast<int>(foldStmts.size()), 0);
                 foldStmts.push_back(s);
                 int condStart = here();
@@ -6808,6 +6929,7 @@ private:
                 genIf(s);
                 break;
             case Stmt::Kind::While:
+                if (s->fastDeadStore) break;
                 genWhile(s);
                 break;
             case Stmt::Kind::Break:
