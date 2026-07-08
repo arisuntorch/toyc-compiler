@@ -5044,6 +5044,29 @@ private:
             add = 0;
             return true;
         }
+        if (e->kind == Expr::Kind::Call) {
+            auto found = funcs.find(e->name);
+            if (found == funcs.end()) return false;
+            Function *f = found->second;
+            if (e->args.size() != f->params.size()) return false;
+            vector<vector<uint32_t>> args;
+            args.reserve(e->args.size());
+            for (auto &arg : e->args) {
+                int32_t am = 0, aa = 0;
+                if (linearSelfExpr(arg.get(), key, changing, frame, am, aa)) {
+                    args.push_back({static_cast<uint32_t>(am), static_cast<uint32_t>(aa)});
+                    continue;
+                }
+                int32_t c = 0;
+                if (!evalExprNoChanging(arg.get(), changing, frame, c)) return false;
+                args.push_back({0u, static_cast<uint32_t>(c)});
+            }
+            vector<uint32_t> out;
+            if (!affinePureFunction(f, args, 2, out) || out.size() != 2) return false;
+            mul = static_cast<int32_t>(out[0]);
+            add = static_cast<int32_t>(out[1]);
+            return true;
+        }
         if (e->kind == Expr::Kind::Unary) {
             int32_t m = 0, a = 0;
             if (!linearSelfExpr(e->lhs.get(), key, changing, frame, m, a)) return false;
