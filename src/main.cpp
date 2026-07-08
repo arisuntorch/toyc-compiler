@@ -7196,22 +7196,59 @@ private:
             }
         }
 
-        // A constant operand held in a hoisted register is used in place.
-        if (auto rv = tryConst(e->rhs.get())) {
-            string cr = constReg(*rv);
-            if (!cr.empty()) {
-                genExprNoCall(e->lhs.get(), dst, regs);
-                emitBinaryReg(e->op, dst, dst, cr);
-                return;
+        // Operands already available in registers are used in place with no
+        // evaluation code: zero (x0), hoisted constants, and variables living
+        // in callee-saved registers. A home register must differ from dst,
+        // since evaluating the opposite side may write dst first.
+        auto inPlaceReg = [&](const Expr *operand) -> string {
+            if (auto v = tryConst(operand)) {
+                if (*v == 0) return "x0";
+                return constReg(*v);
             }
+            if (operand->kind == Expr::Kind::Var) {
+                auto sym = lookup(operand->name);
+                if (sym && !sym->isConst && !sym->isGlobal && !sym->reg.empty() && sym->reg != dst) {
+                    return sym->reg;
+                }
+            }
+            return string();
+        };
+        string lhsInPlace = inPlaceReg(e->lhs.get());
+        string rhsInPlace = inPlaceReg(e->rhs.get());
+        if (!lhsInPlace.empty() && !rhsInPlace.empty()) {
+            emitBinaryReg(e->op, dst, lhsInPlace, rhsInPlace);
+            return;
         }
-        if (auto lv = tryConst(e->lhs.get())) {
-            string cr = constReg(*lv);
-            if (!cr.empty()) {
-                genExprNoCall(e->rhs.get(), dst, regs);
-                emitBinaryReg(e->op, dst, cr, dst);
-                return;
-            }
+        if (!lhsInPlace.empty()) {
+            genExprNoCall(e->rhs.get(), dst, regs);
+            emitBinaryReg(e->op, dst, lhsInPlace, dst);
+            return;
+        }
+        if (!rhsInPlace.empty()) {
+            genExprNoCall(e->lhs.get(), dst, regs);
+            emitBinaryReg(e->op, dst, dst, rhsInPlace);
+            return;
+        }
+        // The destination variable itself as an operand (x = x op e): keep it
+        // in place, evaluate the other side into a temporary, combine last.
+        auto isDstVar = [&](const Expr *operand) {
+            if (operand->kind != Expr::Kind::Var) return false;
+            auto sym = lookup(operand->name);
+            return sym && !sym->isConst && !sym->isGlobal && sym->reg == dst;
+        };
+        if (!regs.empty() && isDstVar(e->lhs.get())) {
+            string tmp = regs.front();
+            vector<string> rest(regs.begin() + 1, regs.end());
+            genExprNoCall(e->rhs.get(), tmp, rest);
+            emitBinaryReg(e->op, dst, dst, tmp);
+            return;
+        }
+        if (!regs.empty() && isDstVar(e->rhs.get())) {
+            string tmp = regs.front();
+            vector<string> rest(regs.begin() + 1, regs.end());
+            genExprNoCall(e->lhs.get(), tmp, rest);
+            emitBinaryReg(e->op, dst, tmp, dst);
+            return;
         }
 
         if (regs.empty()) {
@@ -7223,17 +7260,6 @@ private:
             return;
         }
 
-        // A variable already in a callee-saved register can serve as the lhs
-        // operand in place (no copy), as long as it is not also the
-        // destination: rhs evaluation only writes dst and the pool.
-        if (e->lhs->kind == Expr::Kind::Var) {
-            auto sym = lookup(e->lhs->name);
-            if (sym && !sym->isConst && !sym->isGlobal && !sym->reg.empty() && sym->reg != dst) {
-                genExprNoCall(e->rhs.get(), dst, regs);
-                emitBinaryReg(e->op, dst, sym->reg, dst);
-                return;
-            }
-        }
         string lhsReg = regs.front();
         regs.erase(regs.begin());
         genExprNoCall(e->lhs.get(), lhsReg, regs);
@@ -7512,31 +7538,26 @@ private:
             return;
         }
 
-        genExpr(e->lhs.get());
-        pushA0();
-        genExpr(e->rhs.get());
-        popTo("t0");
-
-        if (e->op == "+") emit("add a0, t0, a0");
-        else if (e->op == "-") emit("sub a0, t0, a0");
-        else if (e->op == "*") emit("mul a0, t0, a0");
-        else if (e->op == "/") emit("div a0, t0, a0");
-        else if (e->op == "%") emit("rem a0, t0, a0");
-        else if (e->op == "<") emit("slt a0, t0, a0");
-        else if (e->op == ">") emit("slt a0, a0, t0");
-        else if (e->op == "<=") {
-            emit("slt a0, a0, t0");
-            emit("xori a0, a0, 1");
-        } else if (e->op == ">=") {
-            emit("slt a0, t0, a0");
-            emit("xori a0, a0, 1");
-        } else if (e->op == "==") {
-            emit("sub a0, t0, a0");
-            emit("sltiu a0, a0, 1");
-        } else if (e->op == "!=") {
-            emit("sub a0, t0, a0");
-            emit("sltu a0, x0, a0");
+        // When one side is call-free (pure), evaluate the call side first and
+        // the pure side afterwards into a temporary, avoiding the stack
+        // round-trip. Function calls cannot modify caller locals, so the pure
+        // side reads the same values either way.
+        string lhsReg = "t0";
+        string rhsReg = "a0";
+        if (!hasCall(e->lhs.get())) {
+            genExpr(e->rhs.get());
+            lhsReg = condOperandReg(e->lhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
+        } else if (!hasCall(e->rhs.get())) {
+            genExpr(e->lhs.get());
+            lhsReg = "a0";
+            rhsReg = condOperandReg(e->rhs.get(), "t0", {"t1", "t2", "t3", "t4", "t5"});
+        } else {
+            genExpr(e->lhs.get());
+            pushA0();
+            genExpr(e->rhs.get());
+            popTo("t0");
         }
+        emitBinaryReg(e->op, "a0", lhsReg, rhsReg);
     }
 
     void genCall(const Expr *e) {
