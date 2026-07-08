@@ -5579,12 +5579,13 @@ public:
                     if (auto v = foldConstExpr(item.decl->init.get())) globalConsts[item.decl->name] = *v;
                 }
             } else {
-                for (int round = 0; round < 2; ++round) {
+                for (int round = 0; round < 3; ++round) {
                     env.clear();
                     enter();
                     for (const string &param : item.func->params) env.back()[param] = LocalInfo{};
                     optStmt(item.func->body);
                     leave();
+                    cseFunction(*item.func);
                     dceFunction(*item.func);
                 }
             }
@@ -6096,6 +6097,206 @@ private:
         dceUsed.clear();
         unordered_set<string> live;
         dceStmt(f.body, live, DceCtx{}, true);
+    }
+
+    // ---- local common subexpression elimination ----
+    //
+    // Within a block's statement sequence, repeated pure subexpressions are
+    // computed once in a temporary declared at the first occurrence. Only
+    // maximal candidate subtrees are recorded per expression (recorded and
+    // matched nodes are disjoint, so no slot pointer can dangle); running
+    // multiple optimizer rounds lets smaller shared pieces surface later,
+    // with copy propagation and DCE cleaning up temp-to-temp chains.
+    // Availability is invalidated by writes to any operand and, for
+    // global-reading expressions, by any call. Branch- and loop-internal
+    // scans start fresh, so a temp's defining occurrence is always at least
+    // as unconditional as the occurrences it replaces.
+
+    int cseCounter = 0;
+
+    struct CseEntry {
+        unique_ptr<Expr> *slot;
+        int idx;
+        string temp;
+        unordered_set<string> reads;
+        bool readsGlobal = false;
+    };
+
+    struct CseInsert {
+        int idx;
+        unique_ptr<Stmt> decl;
+    };
+
+    bool cseCandidate(const Expr *e) const {
+        if (e->kind != Expr::Kind::Binary && e->kind != Expr::Kind::Unary) return false;
+        if (exprHasCall(e)) return false;
+        if (foldConstExpr(e)) return false;
+        int ops = 0;
+        bool hasMulDiv = false;
+        licmCost(e, ops, hasMulDiv);
+        return hasMulDiv || ops >= 2;
+    }
+
+    static unique_ptr<Expr> makeVarExpr(const string &name) {
+        auto v = make_unique<Expr>();
+        v->kind = Expr::Kind::Var;
+        v->name = name;
+        return v;
+    }
+
+    static bool exprContainsSlot(const Expr *root, const unique_ptr<Expr> *slot) {
+        if (!root) return false;
+        if (&root->lhs == slot || &root->rhs == slot) return true;
+        for (auto &arg : root->args) {
+            if (&arg == slot) return true;
+        }
+        if (exprContainsSlot(root->lhs.get(), slot) || exprContainsSlot(root->rhs.get(), slot)) return true;
+        for (auto &arg : root->args) {
+            if (exprContainsSlot(arg.get(), slot)) return true;
+        }
+        return false;
+    }
+
+    void cseVisitExpr(unique_ptr<Expr> &e, int idx, vector<CseEntry> &avail,
+                      vector<CseInsert> &inserts) {
+        if (!e) return;
+        if (cseCandidate(e.get())) {
+            for (auto &entry : avail) {
+                if (!exprStructEq(*entry.slot ? entry.slot->get() : nullptr, e.get())) continue;
+                if (entry.temp.empty()) {
+                    entry.temp = "$cse" + to_string(cseCounter++);
+                    auto decl = make_unique<Stmt>();
+                    decl->kind = Stmt::Kind::DeclStmt;
+                    decl->decl = make_unique<Decl>();
+                    decl->decl->name = entry.temp;
+                    decl->decl->init = std::move(*entry.slot);
+                    *entry.slot = makeVarExpr(entry.temp);
+                    // If the first occurrence now lives inside an already
+                    // materialized temp's initializer, this temp must be
+                    // declared before that one.
+                    size_t pos = inserts.size();
+                    for (size_t k = 0; k < inserts.size(); ++k) {
+                        if (inserts[k].decl &&
+                            exprContainsSlot(inserts[k].decl->decl->init.get(), entry.slot)) {
+                            pos = k;
+                            break;
+                        }
+                    }
+                    CseInsert ins{pos < inserts.size() ? inserts[pos].idx : entry.idx, std::move(decl)};
+                    entry.slot = &ins.decl->decl->init;
+                    inserts.insert(inserts.begin() + static_cast<long>(pos), std::move(ins));
+                }
+                e = makeVarExpr(entry.temp);
+                return;
+            }
+            CseEntry entry;
+            entry.slot = &e;
+            entry.idx = idx;
+            addReads(e.get(), entry.reads);
+            for (const string &name : entry.reads) {
+                if (globalNames.count(name)) {
+                    entry.readsGlobal = true;
+                    break;
+                }
+            }
+            avail.push_back(std::move(entry));
+            // fall through: sub-candidates are recorded too, so a later
+            // repeat of an inner piece can still be shared
+        }
+        cseVisitExpr(e->lhs, idx, avail, inserts);
+        cseVisitExpr(e->rhs, idx, avail, inserts);
+        for (auto &arg : e->args) cseVisitExpr(arg, idx, avail, inserts);
+    }
+
+    static void cseInvalidate(vector<CseEntry> &avail, const unordered_set<string> &written) {
+        avail.erase(remove_if(avail.begin(), avail.end(),
+                              [&](const CseEntry &entry) {
+                                  for (const string &name : written) {
+                                      if (entry.reads.count(name)) return true;
+                                  }
+                                  return false;
+                              }),
+                    avail.end());
+    }
+
+    static void cseDropGlobals(vector<CseEntry> &avail) {
+        avail.erase(remove_if(avail.begin(), avail.end(),
+                              [](const CseEntry &entry) { return entry.readsGlobal; }),
+                    avail.end());
+    }
+
+    void cseNested(Stmt *s) {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Block) {
+            cseBlock(s->stmts);
+            return;
+        }
+        // Single-statement branch bodies: recurse into any nested structure.
+        cseNested(s->thenStmt.get());
+        cseNested(s->elseStmt.get());
+        cseNested(s->body.get());
+    }
+
+    void cseBlock(vector<unique_ptr<Stmt>> &stmts) {
+        vector<CseEntry> avail;
+        vector<CseInsert> inserts;
+        for (int i = 0; i < static_cast<int>(stmts.size()); ++i) {
+            Stmt *s = stmts[static_cast<size_t>(i)].get();
+            switch (s->kind) {
+                case Stmt::Kind::ExprStmt:
+                case Stmt::Kind::Return:
+                    cseVisitExpr(s->expr, i, avail, inserts);
+                    if (s->expr && exprHasCall(s->expr.get())) cseDropGlobals(avail);
+                    break;
+                case Stmt::Kind::Assign:
+                    cseVisitExpr(s->expr, i, avail, inserts);
+                    if (exprHasCall(s->expr.get())) cseDropGlobals(avail);
+                    cseInvalidate(avail, {s->name});
+                    break;
+                case Stmt::Kind::DeclStmt:
+                    if (s->decl->init) {
+                        cseVisitExpr(s->decl->init, i, avail, inserts);
+                        if (exprHasCall(s->decl->init.get())) cseDropGlobals(avail);
+                    }
+                    cseInvalidate(avail, {s->decl->name});
+                    break;
+                case Stmt::Kind::If: {
+                    cseVisitExpr(s->expr, i, avail, inserts);
+                    cseNested(s->thenStmt.get());
+                    cseNested(s->elseStmt.get());
+                    cseInvalidate(avail, assignedInStmt(s));
+                    if (stmtHasCall(s)) cseDropGlobals(avail);
+                    break;
+                }
+                case Stmt::Kind::While: {
+                    cseInvalidate(avail, assignedInStmt(s->body.get()));
+                    if (stmtHasCall(s->body.get()) || exprHasCall(s->expr.get())) cseDropGlobals(avail);
+                    cseNested(s->body.get());
+                    break;
+                }
+                case Stmt::Kind::Block:
+                    cseBlock(s->stmts);
+                    cseInvalidate(avail, assignedInStmt(s));
+                    if (stmtHasCall(s)) cseDropGlobals(avail);
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (inserts.empty()) return;
+        vector<unique_ptr<Stmt>> result;
+        result.reserve(stmts.size() + inserts.size());
+        for (int i = 0; i < static_cast<int>(stmts.size()); ++i) {
+            for (auto &ins : inserts) {
+                if (ins.idx == i && ins.decl) result.push_back(std::move(ins.decl));
+            }
+            result.push_back(std::move(stmts[static_cast<size_t>(i)]));
+        }
+        stmts = std::move(result);
+    }
+
+    void cseFunction(Function &f) {
+        if (f.body && f.body->kind == Stmt::Kind::Block) cseBlock(f.body->stmts);
     }
 
     // ---- loop-invariant code motion ----
