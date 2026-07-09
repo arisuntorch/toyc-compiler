@@ -3967,6 +3967,8 @@ private:
                 transient.insert(key);
                 return true;
             }
+            case Stmt::Kind::ExprStmt:
+                return collectAffineSideEffectCallNames(s->expr.get(), vars, seen);
             case Stmt::Kind::While:
                 return collectAffineNames(s->body.get(), vars, seen, transient);
             case Stmt::Kind::If:
@@ -4129,6 +4131,12 @@ private:
                 return true;
             case Expr::Kind::Var: {
                 if (e->fastGlobal) {
+                    int key = e->fastIndex | kGlobalBit;
+                    auto alias = aliases.find(key);
+                    if (alias != aliases.end()) {
+                        out = alias->second;
+                        return true;
+                    }
                     out[d - 1] = static_cast<uint32_t>(globals[e->fastIndex]);
                     return true;
                 }
@@ -4227,6 +4235,99 @@ private:
         bool returned = false;
         if (!affinePureStmt(f->body.get(), aliases, d, out, returned)) return false;
         return returned;
+    }
+
+    bool collectAffineSideEffectStmtNames(const Stmt *s, vector<int> &vars,
+                                          unordered_set<int> &seen) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectAffineSideEffectStmtNames(child.get(), vars, seen)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
+                int key = assignSlotKey(s);
+                if (!seen.count(key)) {
+                    seen.insert(key);
+                    vars.push_back(key);
+                }
+                return true;
+            }
+            case Stmt::Kind::Return:
+                return !exprHasCallS(s->expr.get());
+            default:
+                return false;
+        }
+    }
+
+    bool collectAffineSideEffectCallNames(const Expr *e, vector<int> &vars,
+                                          unordered_set<int> &seen) const {
+        if (!e || e->kind != Expr::Kind::Call) return false;
+        auto found = funcs.find(e->name);
+        if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+        for (auto &arg : e->args) {
+            if (exprHasCallS(arg.get())) return false;
+        }
+        return collectAffineSideEffectStmtNames(found->second->body.get(), vars, seen);
+    }
+
+    bool processAffineSideEffectStmt(const Stmt *s, unordered_map<int, vector<uint32_t>> &aliases,
+                                     const unordered_map<int, int> &idx,
+                                     vector<vector<uint32_t>> &cur, bool &returned) const {
+        if (!s || returned) return true;
+        int d = static_cast<int>(cur.size());
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!processAffineSideEffectStmt(child.get(), aliases, idx, cur, returned)) return false;
+                    if (returned) return true;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
+                vector<uint32_t> row;
+                if (!affineExprAliases(s->expr.get(), aliases, d, row)) return false;
+                int key = assignSlotKey(s);
+                auto it = idx.find(key);
+                if (it != idx.end()) {
+                    cur[it->second] = row;
+                    aliases[key] = std::move(row);
+                    return true;
+                }
+                if (key & kGlobalBit) return false;
+                aliases[key] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::Return:
+                returned = true;
+                return !exprHasCallS(s->expr.get());
+            default:
+                return false;
+        }
+    }
+
+    bool processAffineSideEffectCall(const Expr *e, const unordered_map<int, int> &idx,
+                                     vector<vector<uint32_t>> &cur, const int32_t *frame) const {
+        if (!e || e->kind != Expr::Kind::Call) return false;
+        auto found = funcs.find(e->name);
+        if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+        unordered_map<int, vector<uint32_t>> aliases;
+        for (auto &kv : idx) {
+            if (kv.first & kGlobalBit) aliases[kv.first] = cur[kv.second];
+        }
+        for (size_t i = 0; i < e->args.size(); ++i) {
+            vector<uint32_t> row;
+            if (!affineExpr(e->args[i].get(), idx, cur, row, frame)) return false;
+            aliases[static_cast<int>(i)] = std::move(row);
+        }
+        bool returned = false;
+        return processAffineSideEffectStmt(found->second->body.get(), aliases, idx, cur, returned);
     }
 
     optional<int32_t> invariantValue(const Expr *e, const unordered_map<int, int> &idx,
@@ -4473,6 +4574,9 @@ private:
             }
             case Stmt::Kind::While:
                 return processNestedAffineWhile(s, idx, cur, frame);
+            case Stmt::Kind::ExprStmt:
+                if (!exprHasCallS(s->expr.get())) return true;
+                return processAffineSideEffectCall(s->expr.get(), idx, cur, frame);
             default:
                 return false;
         }
