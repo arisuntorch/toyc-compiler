@@ -5502,7 +5502,8 @@ private:
     }
 
 
-    bool collectStrictPeriodicModuli(const Expr *e, int indKey, const unordered_set<int> &changing,
+    bool collectStrictPeriodicModuli(const Expr *e, int indKey, int32_t startIv, int32_t offset,
+                                     int32_t step, const unordered_set<int> &changing,
                                      const int32_t *frame, vector<int32_t> &mods) const {
         if (!e) return true;
         switch (e->kind) {
@@ -5515,23 +5516,94 @@ private:
             case Expr::Kind::Call:
                 return false;
             case Expr::Kind::Unary:
-                return e->opc != OPC_NOT && collectStrictPeriodicModuli(e->lhs.get(), indKey, changing, frame, mods);
+                return e->opc != OPC_NOT &&
+                       collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset, step,
+                                                   changing, frame, mods);
             case Expr::Kind::Binary:
                 if (e->opc == OPC_MOD) {
                     int key = -1;
                     int32_t off = 0;
-                    if (!extractInductionPlusConst(e->lhs.get(), key, off) || key != indKey) return false;
                     int32_t m = 0;
                     if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
                     if (m < 0) m = -m;
-                    if (m > 1) mods.push_back(m);
-                    return true;
+                    if (extractInductionPlusConst(e->lhs.get(), key, off) && key == indKey) {
+                        if (m > 1) mods.push_back(m);
+                        return true;
+                    }
+                    if (e->lhs && e->lhs->kind == Expr::Kind::Binary && e->lhs->opc == OPC_DIV) {
+                        int32_t divv = 0;
+                        if (!extractInductionPlusConst(e->lhs->lhs.get(), key, off) || key != indKey ||
+                            !evalExprNoChanging(e->lhs->rhs.get(), changing, frame, divv) || divv <= 0 ||
+                            step <= 0) {
+                            return false;
+                        }
+                        int64_t first = static_cast<int64_t>(startIv) + offset + off;
+                        if (first < 0) return false;
+                        uint64_t period = static_cast<uint64_t>(divv) * static_cast<uint64_t>(m);
+                        if (period > static_cast<uint64_t>(INT32_MAX)) return false;
+                        if (m > 1 && period > 1) mods.push_back(static_cast<int32_t>(period));
+                        return true;
+                    }
+                    return false;
+                }
+                if (e->opc == OPC_DIV) {
+                    return false;
                 }
                 if (e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL) {
-                    return collectStrictPeriodicModuli(e->lhs.get(), indKey, changing, frame, mods) &&
-                           collectStrictPeriodicModuli(e->rhs.get(), indKey, changing, frame, mods);
+                    return collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset, step,
+                                                       changing, frame, mods) &&
+                           collectStrictPeriodicModuli(e->rhs.get(), indKey, startIv, offset, step,
+                                                       changing, frame, mods);
                 }
                 return false;
+        }
+        return false;
+    }
+
+    bool collectPeriodicCondModuli(const Expr *e, int indKey, int32_t startIv, int32_t step,
+                                   const unordered_set<int> &changing, const int32_t *frame,
+                                   vector<int32_t> &mods) const {
+        if (!e) return true;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                return key != indKey && !changing.count(key);
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary:
+                return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step, changing, frame, mods);
+            case Expr::Kind::Binary:
+                if (e->opc == OPC_MOD) {
+                    int key = -1;
+                    int32_t off = 0;
+                    int32_t m = 0;
+                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m < 0) m = -m;
+                    if (extractInductionPlusConst(e->lhs.get(), key, off) && key == indKey) {
+                        if (m > 1) mods.push_back(m);
+                        return true;
+                    }
+                    if (e->lhs && e->lhs->kind == Expr::Kind::Binary && e->lhs->opc == OPC_DIV) {
+                        int32_t divv = 0;
+                        if (!extractInductionPlusConst(e->lhs->lhs.get(), key, off) || key != indKey ||
+                            !evalExprNoChanging(e->lhs->rhs.get(), changing, frame, divv) || divv <= 0 ||
+                            step <= 0) {
+                            return false;
+                        }
+                        int64_t first = static_cast<int64_t>(startIv) + off;
+                        if (first < 0) return false;
+                        uint64_t period = static_cast<uint64_t>(divv) * static_cast<uint64_t>(m);
+                        if (period > static_cast<uint64_t>(INT32_MAX)) return false;
+                        if (m > 1 && period > 1) mods.push_back(static_cast<int32_t>(period));
+                        return true;
+                    }
+                    return false;
+                }
+                return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step, changing, frame, mods) &&
+                       collectPeriodicCondModuli(e->rhs.get(), indKey, startIv, step, changing, frame, mods);
         }
         return false;
     }
@@ -5610,7 +5682,10 @@ private:
                                int32_t step, uint64_t niter, const unordered_set<int> &changing,
                                const int32_t *frame, uint32_t &out) const {
         vector<int32_t> mods;
-        if (!collectStrictPeriodicModuli(e, indKey, changing, frame, mods) || mods.empty()) return false;
+        if (!collectStrictPeriodicModuli(e, indKey, startIv, offset, step, changing, frame, mods) ||
+            mods.empty()) {
+            return false;
+        }
         uint64_t period = 1;
         uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
         for (int32_t mod : mods) {
@@ -5682,44 +5757,17 @@ private:
         return true;
     }
 
-    bool collectPeriodicCondModuli(const Expr *e, int indKey, const unordered_set<int> &changing,
-                                   const int32_t *frame, vector<int32_t> &mods) const {
-        if (!e) return true;
-        switch (e->kind) {
-            case Expr::Kind::Number:
-                return true;
-            case Expr::Kind::Var: {
-                int key = exprSlotKey(e);
-                return key != indKey && !changing.count(key);
-            }
-            case Expr::Kind::Call:
-                return false;
-            case Expr::Kind::Unary:
-                return collectPeriodicCondModuli(e->lhs.get(), indKey, changing, frame, mods);
-            case Expr::Kind::Binary:
-                if (e->opc == OPC_MOD) {
-                    int key = -1;
-                    int32_t off = 0;
-                    if (!extractInductionPlusConst(e->lhs.get(), key, off) || key != indKey) return false;
-                    int32_t m = 0;
-                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
-                    if (m < 0) m = -m;
-                    if (m > 1) mods.push_back(m);
-                    return true;
-                }
-                return collectPeriodicCondModuli(e->lhs.get(), indKey, changing, frame, mods) &&
-                       collectPeriodicCondModuli(e->rhs.get(), indKey, changing, frame, mods);
-        }
-        return false;
-    }
-
-    bool collectIfPeriodicModuli(const Stmt *s, int indKey, const unordered_set<int> &changing,
-                                 const int32_t *frame, vector<int32_t> &mods, bool &sawIf) const {
+    bool collectIfPeriodicModuli(const Stmt *s, int indKey, int32_t startIv, int32_t step,
+                                 const unordered_set<int> &changing, const int32_t *frame,
+                                 vector<int32_t> &mods, bool &sawIf) const {
         if (!s) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
-                    if (!collectIfPeriodicModuli(child.get(), indKey, changing, frame, mods, sawIf)) return false;
+                    if (!collectIfPeriodicModuli(child.get(), indKey, startIv, step, changing, frame,
+                                                 mods, sawIf)) {
+                        return false;
+                    }
                 }
                 return true;
             case Stmt::Kind::If: {
@@ -5732,11 +5780,16 @@ private:
                 }
                 if (usesInduction) {
                     size_t before = mods.size();
-                    if (!collectPeriodicCondModuli(s->expr.get(), indKey, changing, frame, mods)) return false;
+                    if (!collectPeriodicCondModuli(s->expr.get(), indKey, startIv, step,
+                                                   changing, frame, mods)) {
+                        return false;
+                    }
                     if (mods.size() == before) return false;
                 }
-                return collectIfPeriodicModuli(s->thenStmt.get(), indKey, changing, frame, mods, sawIf) &&
-                       collectIfPeriodicModuli(s->elseStmt.get(), indKey, changing, frame, mods, sawIf);
+                return collectIfPeriodicModuli(s->thenStmt.get(), indKey, startIv, step, changing,
+                                               frame, mods, sawIf) &&
+                       collectIfPeriodicModuli(s->elseStmt.get(), indKey, startIv, step, changing,
+                                               frame, mods, sawIf);
             }
             case Stmt::Kind::While:
             case Stmt::Kind::Break:
@@ -5903,7 +5956,8 @@ private:
 
         vector<int32_t> moduli;
         bool sawIf = false;
-        if (!collectIfPeriodicModuli(s->body.get(), indKey, changing, frame, moduli, sawIf) || !sawIf) {
+        if (!collectIfPeriodicModuli(s->body.get(), indKey, startIv, step, changing, frame, moduli, sawIf) ||
+            !sawIf) {
             return FoldStructFail;
         }
         uint64_t period = 1;
