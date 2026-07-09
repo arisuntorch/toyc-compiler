@@ -5154,29 +5154,6 @@ private:
             add = 0;
             return true;
         }
-        if (e->kind == Expr::Kind::Call) {
-            auto found = funcs.find(e->name);
-            if (found == funcs.end()) return false;
-            Function *f = found->second;
-            if (e->args.size() != f->params.size()) return false;
-            vector<vector<uint32_t>> args;
-            args.reserve(e->args.size());
-            for (auto &arg : e->args) {
-                int32_t am = 0, aa = 0;
-                if (linearSelfExpr(arg.get(), key, changing, frame, am, aa)) {
-                    args.push_back({static_cast<uint32_t>(am), static_cast<uint32_t>(aa)});
-                    continue;
-                }
-                int32_t c = 0;
-                if (!evalExprNoChanging(arg.get(), changing, frame, c)) return false;
-                args.push_back({0u, static_cast<uint32_t>(c)});
-            }
-            vector<uint32_t> out;
-            if (!affinePureFunction(f, args, 2, out) || out.size() != 2) return false;
-            mul = static_cast<int32_t>(out[0]);
-            add = static_cast<int32_t>(out[1]);
-            return true;
-        }
         if (e->kind == Expr::Kind::Unary) {
             int32_t m = 0, a = 0;
             if (!linearSelfExpr(e->lhs.get(), key, changing, frame, m, a)) return false;
@@ -5325,7 +5302,8 @@ private:
             if (key == indKey) {
                 int rhsKey = -1;
                 int32_t off = 0;
-                if (!extractInductionPlusConst(st->expr.get(), rhsKey, off) || rhsKey != indKey || off == 0) {
+                if (!extractInductionPlusConstWithParams(st->expr.get(), {}, changing, frame,
+                                                         rhsKey, off) || rhsKey != indKey || off == 0) {
                     return FoldStructFail;
                 }
                 if (sawInd && step != off) return FoldStructFail;
@@ -5535,6 +5513,17 @@ private:
                                              const unordered_set<int> &changing, const int32_t *frame,
                                              int &key, int32_t &offset) const {
         if (!e) return false;
+        if (e->kind == Expr::Kind::Call) {
+            if (!paramArgs.empty()) return false;
+            auto found = funcs.find(e->name);
+            if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+            const Expr *ret = nullptr;
+            if (!simpleReturnFunctionExpr(found->second, ret)) return false;
+            vector<const Expr *> args;
+            args.reserve(e->args.size());
+            for (auto &arg : e->args) args.push_back(arg.get());
+            return extractInductionPlusConstWithParams(ret, args, changing, frame, key, offset);
+        }
         if (e->kind == Expr::Kind::Var) {
             int k = exprSlotKey(e);
             if (k >= 0 && k < static_cast<int>(paramArgs.size())) {
@@ -6059,7 +6048,8 @@ private:
                 if (key == indKey) {
                     int rhsKey = -1;
                     int32_t off = 0;
-                    if (!extractInductionPlusConst(s->expr.get(), rhsKey, off) || rhsKey != indKey) {
+                    if (!extractInductionPlusConstWithParams(s->expr.get(), {}, changing, frame,
+                                                             rhsKey, off) || rhsKey != indKey) {
                         return TransformFlow::Fail;
                     }
                     ctx.indOffset = add32(ctx.indOffset, off);
@@ -6214,7 +6204,8 @@ private:
             if (st->kind != Stmt::Kind::Assign || assignSlotKey(st) != indKey) continue;
             int key = -1;
             int32_t off = 0;
-            if (!extractInductionPlusConst(st->expr.get(), key, off) || key != indKey) return FoldStructFail;
+            if (!extractInductionPlusConstWithParams(st->expr.get(), {}, changing, frame,
+                                                     key, off) || key != indKey) return FoldStructFail;
             iterOffset = add32(iterOffset, off);
             ++indUpdates;
         }
@@ -6249,7 +6240,8 @@ private:
             if (key == indKey) {
                 int rhsKey = -1;
                 int32_t off = 0;
-                if (!extractInductionPlusConst(st->expr.get(), rhsKey, off) || rhsKey != indKey) return FoldStructFail;
+                if (!extractInductionPlusConstWithParams(st->expr.get(), {}, changing, frame,
+                                                         rhsKey, off) || rhsKey != indKey) return FoldStructFail;
                 iterOffset = add32(iterOffset, off);
                 aliases.erase(key);
                 continue;
