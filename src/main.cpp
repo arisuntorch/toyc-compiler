@@ -6225,6 +6225,94 @@ private:
         return true;
     }
 
+    template<int MOD>
+    static uint32_t runQuadraticModLoopConst(uint64_t n, uint32_t x, uint32_t step) {
+        uint32_t acc = 0;
+        uint32_t sq = static_cast<uint32_t>(static_cast<uint64_t>(x) * x);
+        uint32_t delta = static_cast<uint32_t>(2ull * step * x + static_cast<uint64_t>(step) * step);
+        uint32_t delta2 = static_cast<uint32_t>(2ull * step * step);
+#define TOYC_QUAD_MOD_ONE() \
+        do { \
+            acc += static_cast<uint32_t>(static_cast<int32_t>(sq) % MOD); \
+            sq += delta; \
+            delta += delta2; \
+        } while (0)
+        while (n >= 8) {
+            TOYC_QUAD_MOD_ONE(); TOYC_QUAD_MOD_ONE(); TOYC_QUAD_MOD_ONE(); TOYC_QUAD_MOD_ONE();
+            TOYC_QUAD_MOD_ONE(); TOYC_QUAD_MOD_ONE(); TOYC_QUAD_MOD_ONE(); TOYC_QUAD_MOD_ONE();
+            n -= 8;
+        }
+        while (n--) TOYC_QUAD_MOD_ONE();
+#undef TOYC_QUAD_MOD_ONE
+        return acc;
+    }
+
+    static uint32_t runQuadraticModLoopRuntime(uint64_t n, uint32_t x, uint32_t step, int32_t modv) {
+        if (modv == 1 || modv == -1) return 0;
+        uint32_t acc = 0;
+        uint32_t sq = static_cast<uint32_t>(static_cast<uint64_t>(x) * x);
+        uint32_t delta = static_cast<uint32_t>(2ull * step * x + static_cast<uint64_t>(step) * step);
+        uint32_t delta2 = static_cast<uint32_t>(2ull * step * step);
+#define TOYC_QUAD_MOD_RUNTIME_ONE() \
+        do { \
+            acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(sq), modv)); \
+            sq += delta; \
+            delta += delta2; \
+        } while (0)
+        while (n >= 8) {
+            TOYC_QUAD_MOD_RUNTIME_ONE(); TOYC_QUAD_MOD_RUNTIME_ONE();
+            TOYC_QUAD_MOD_RUNTIME_ONE(); TOYC_QUAD_MOD_RUNTIME_ONE();
+            TOYC_QUAD_MOD_RUNTIME_ONE(); TOYC_QUAD_MOD_RUNTIME_ONE();
+            TOYC_QUAD_MOD_RUNTIME_ONE(); TOYC_QUAD_MOD_RUNTIME_ONE();
+            n -= 8;
+        }
+        while (n--) TOYC_QUAD_MOD_RUNTIME_ONE();
+#undef TOYC_QUAD_MOD_RUNTIME_ONE
+        return acc;
+    }
+
+    static uint32_t runQuadraticModLoop(uint64_t n, uint32_t x, uint32_t step, int32_t modv) {
+        int32_t absMod = modv;
+        if (absMod < 0 && absMod != numeric_limits<int32_t>::min()) absMod = -absMod;
+        switch (absMod) {
+            case 1: return 0;
+            case 3: return runQuadraticModLoopConst<3>(n, x, step);
+            case 5: return runQuadraticModLoopConst<5>(n, x, step);
+            case 7: return runQuadraticModLoopConst<7>(n, x, step);
+            case 10: return runQuadraticModLoopConst<10>(n, x, step);
+            case 11: return runQuadraticModLoopConst<11>(n, x, step);
+            case 13: return runQuadraticModLoopConst<13>(n, x, step);
+            case 16: return runQuadraticModLoopConst<16>(n, x, step);
+            case 31: return runQuadraticModLoopConst<31>(n, x, step);
+            case 97: return runQuadraticModLoopConst<97>(n, x, step);
+            case 100: return runQuadraticModLoopConst<100>(n, x, step);
+            default: return runQuadraticModLoopRuntime(n, x, step, modv);
+        }
+    }
+
+    bool sumQuadraticModExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
+                             int32_t step, uint64_t niter, const unordered_set<int> &changing,
+                             const int32_t *frame, uint32_t &out) const {
+        if (!e || e->kind != Expr::Kind::Binary || e->opc != OPC_MOD) return false;
+        int32_t modv = 0;
+        if (!evalExprNoChanging(e->rhs.get(), changing, frame, modv) || modv == 0) return false;
+        if (!e->lhs || e->lhs->kind != Expr::Kind::Binary || e->lhs->opc != OPC_MUL) return false;
+
+        int lhsKey = -1, rhsKey = -1;
+        int32_t lhsOff = 0, rhsOff = 0;
+        if (!extractInductionPlusConstWithParams(e->lhs->lhs.get(), {}, changing, frame, lhsKey, lhsOff) ||
+            !extractInductionPlusConstWithParams(e->lhs->rhs.get(), {}, changing, frame, rhsKey, rhsOff) ||
+            lhsKey != indKey || rhsKey != indKey || lhsOff != rhsOff) {
+            return false;
+        }
+
+        uint32_t x = static_cast<uint32_t>(startIv);
+        x += static_cast<uint32_t>(offset);
+        x += static_cast<uint32_t>(lhsOff);
+        out = runQuadraticModLoop(niter, x, static_cast<uint32_t>(step), modv);
+        return true;
+    }
+
     bool collectIfPeriodicModuli(const Stmt *s, int indKey, int32_t startIv, int32_t step,
                                  const unordered_set<int> &changing, const int32_t *frame,
                                  vector<int32_t> &mods, bool &sawIf) const {
@@ -6363,7 +6451,9 @@ private:
                     if (polyExpr(term, indKey, base, ctx.qStep, changing, ctx.aliases, frame, p)) {
                         sum = sumPoly(p, ctx.count);
                     } else if (ctx.aliases.empty() &&
-                               (sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
+                               (sumQuadraticModExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
+                                                    ctx.count, changing, frame, sum) ||
+                                sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                       ctx.count, changing, frame, sum) ||
                                 sumLinearDivExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                  ctx.count, changing, frame, sum))) {
@@ -6553,7 +6643,8 @@ private:
                     deltas[key] = polyAdd(deltas[key], p);
                 } else if (aliases.empty()) {
                     uint32_t sum = 0;
-                    if (sumStrictPeriodicExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
+                    if (sumQuadraticModExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
+                        sumStrictPeriodicExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumLinearDivExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum)) {
                         periodicDeltas[key] += sign < 0 ? 0u - sum : sum;
                     } else {
