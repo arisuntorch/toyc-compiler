@@ -3970,7 +3970,9 @@ private:
             case Stmt::Kind::While:
                 return collectAffineNames(s->body.get(), vars, seen, transient);
             case Stmt::Kind::If:
-                return isTopBreakIf(s) || isTopContinueIf(s);
+                if (isTopBreakIf(s) || isTopContinueIf(s)) return true;
+                if (!collectAffineNames(s->thenStmt.get(), vars, seen, transient)) return false;
+                return !s->elseStmt || collectAffineNames(s->elseStmt.get(), vars, seen, transient);
             case Stmt::Kind::Empty:
                 return true;
             default:
@@ -4060,6 +4062,43 @@ private:
             return true;
         }
         return false;
+    }
+
+    bool singleIfElseInBlock(const Stmt *s, const Expr *&cond, const Stmt *&thenStmt,
+                             const Stmt *&elseStmt) const {
+        cond = nullptr;
+        thenStmt = nullptr;
+        elseStmt = nullptr;
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::If && s->expr && s->elseStmt) {
+            cond = s->expr.get();
+            thenStmt = s->thenStmt.get();
+            elseStmt = s->elseStmt.get();
+            return true;
+        }
+        if (s->kind != Stmt::Kind::Block) return false;
+        const Stmt *found = nullptr;
+        for (auto &child : s->stmts) {
+            if (!child || child->kind == Stmt::Kind::Empty) continue;
+            if (found) return false;
+            found = child.get();
+        }
+        return found && singleIfElseInBlock(found, cond, thenStmt, elseStmt);
+    }
+
+    void collectIfConditionVars(const Stmt *s, unordered_set<int> &out) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::If) {
+            collectExprVarKeys(s->expr.get(), out);
+            collectIfConditionVars(s->thenStmt.get(), out);
+            collectIfConditionVars(s->elseStmt.get(), out);
+            return;
+        }
+        if (s->kind == Stmt::Kind::Block) {
+            for (auto &child : s->stmts) collectIfConditionVars(child.get(), out);
+            return;
+        }
+        if (s->kind == Stmt::Kind::While) collectIfConditionVars(s->body.get(), out);
     }
 
     static bool returnedExprS(const Stmt *s, const Expr *&expr) {
@@ -4568,6 +4607,164 @@ private:
             if (remaining != 0) return false;
             cur = matMul(combined, cur);
             return true;
+        }
+
+        const Expr *ifCond = nullptr;
+        const Stmt *thenBranch = nullptr;
+        const Stmt *elseBranch = nullptr;
+        if (singleIfElseInBlock(s->body.get(), ifCond, thenBranch, elseBranch)) {
+            vector<vector<uint32_t>> thenMat = idmat;
+            vector<vector<uint32_t>> elseMat = idmat;
+            if (!processAffineTransformStmt(thenBranch, idx, thenMat, frame) ||
+                !processAffineTransformStmt(elseBranch, idx, elseMat, frame)) {
+                return false;
+            }
+
+            int32_t thenStep = 0, elseStep = 0;
+            if (!inductionStepFromMat(thenMat, thenStep) ||
+                !inductionStepFromMat(elseMat, elseStep) ||
+                thenStep != elseStep) {
+                return false;
+            }
+            int32_t step = thenStep;
+            if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return false;
+            if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return false;
+
+            vector<uint32_t> boundRow;
+            if (!affineExpr(boundExpr, idx, cur, boundRow, frame)) return false;
+            boundRow[d - 1] += static_cast<uint32_t>(boundAdjust);
+            auto iv = constRowValue(cur[indIdx]);
+            auto bound = constRowValue(boundRow);
+            if (!iv || !bound) return false;
+
+            auto niterOpt = countIterationsMaybe(cmp, step, *iv, *bound);
+            if (!niterOpt) return false;
+            uint64_t remaining = *niterOpt;
+            if (remaining == 0) return true;
+
+            vector<vector<uint32_t>> guardMat = cur;
+            guardMat[indIdx] = idmat[indIdx];
+            unordered_set<int> ifVars;
+            collectExprVarKeys(ifCond, ifVars);
+            for (int key : ifVars) {
+                if (key == indKey) continue;
+                auto it = idx.find(key);
+                if (it == idx.end()) continue;
+                int varIdx = it->second;
+                for (int j = 0; j < d; ++j) {
+                    uint32_t want = j == varIdx ? 1u : 0u;
+                    if (thenMat[varIdx][j] != want || elseMat[varIdx][j] != want) return false;
+                }
+            }
+
+            Guard branchGuard;
+            bool hasGuard = false;
+            if (!guardFromCondition(ifCond, idx, guardMat, frame, indIdx, branchGuard, hasGuard) ||
+                !hasGuard) {
+                return false;
+            }
+
+            vector<vector<uint32_t>> combined = idmat;
+            int32_t segIv = *iv;
+            for (int segment = 0; remaining > 0 && segment < 8; ++segment) {
+                Guard g = branchGuard;
+                g.truth = cmpHolds(g.cmp, segIv, g.bound);
+                uint64_t span = min(remaining, guardSameTruthSpan(g, step, segIv));
+                if (span == 0) return false;
+                const vector<vector<uint32_t>> &mat = g.truth ? thenMat : elseMat;
+                combined = matMul(cachedMatPow(s->fastLoopId, mat, span), combined);
+                segIv = static_cast<int32_t>(static_cast<uint32_t>(segIv) +
+                                             static_cast<uint32_t>(step) * static_cast<uint32_t>(span));
+                remaining -= span;
+            }
+            if (remaining != 0) return false;
+            cur = matMul(combined, cur);
+            return true;
+        }
+
+        {
+            unordered_set<int> changing;
+            collectAssignedKeys(s->body.get(), changing);
+            vector<uint32_t> sample(d, 0);
+            sample[d - 1] = 1;
+            bool sampleOk = true;
+            for (int i = 0; i + 1 < d; ++i) {
+                auto v = constRowValue(cur[i]);
+                if (v) sample[i] = static_cast<uint32_t>(*v);
+            }
+            unordered_set<int> condVars;
+            collectIfConditionVars(s->body.get(), condVars);
+            for (int key : condVars) {
+                if (key == indKey) continue;
+                auto it = idx.find(key);
+                if (it != idx.end() && !constRowValue(cur[it->second])) sampleOk = false;
+            }
+            if (sampleOk) {
+                vector<vector<uint32_t>> firstMat = idmat;
+                TransformFlow firstFlow = buildPeriodicTransformStmt(s->body.get(), idx, sample, firstMat, frame);
+                int32_t firstStep = 0;
+                if (firstFlow == TransformFlow::Normal && inductionStepFromMat(firstMat, firstStep) &&
+                    !condVars.empty() &&
+                    !((cmp == CMP_LT || cmp == CMP_LE) && firstStep <= 0) &&
+                    !((cmp == CMP_GT || cmp == CMP_GE) && firstStep >= 0)) {
+                    vector<uint32_t> boundRow;
+                    if (!affineExpr(boundExpr, idx, cur, boundRow, frame)) return false;
+                    boundRow[d - 1] += static_cast<uint32_t>(boundAdjust);
+                    auto iv = constRowValue(cur[indIdx]);
+                    auto bound = constRowValue(boundRow);
+                    if (!iv || !bound) return false;
+                    auto niterOpt = countIterationsMaybe(cmp, firstStep, *iv, *bound);
+                    if (!niterOpt) return false;
+                    uint64_t niter = *niterOpt;
+                    if (niter == 0) return true;
+
+                    vector<int32_t> moduli;
+                    bool sawIf = false;
+                    if (collectIfPeriodicModuli(s->body.get(), indKey, *iv, firstStep, changing,
+                                                frame, moduli, sawIf) && sawIf) {
+                        uint64_t period = 1;
+                        uint64_t absStep = firstStep < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(firstStep))
+                                                         : static_cast<uint64_t>(firstStep);
+                        for (int32_t mod : moduli) {
+                            uint64_t m = static_cast<uint64_t>(mod);
+                            uint64_t reduced = m / gcd64(m, absStep % m);
+                            period = lcmCapped(period, reduced, 4096);
+                            if (period > 4096) break;
+                        }
+                        if (period > 0 && period <= 4096) {
+                            vector<vector<vector<uint32_t>>> iterMats;
+                            iterMats.reserve(static_cast<size_t>(period));
+                            vector<uint32_t> phaseSample = sample;
+                            bool ok = true;
+                            for (uint64_t phase = 0; phase < period; ++phase) {
+                                vector<vector<uint32_t>> mat = idmat;
+                                TransformFlow flow = buildPeriodicTransformStmt(s->body.get(), idx, phaseSample, mat, frame);
+                                int32_t matStep = 0;
+                                if (flow != TransformFlow::Normal || !inductionStepFromMat(mat, matStep) ||
+                                    matStep != firstStep) {
+                                    ok = false;
+                                    break;
+                                }
+                                iterMats.push_back(mat);
+                                phaseSample = matVec(mat, phaseSample);
+                            }
+                            if (ok) {
+                                vector<vector<uint32_t>> periodMat = idmat;
+                                for (auto &mat : iterMats) periodMat = matMul(mat, periodMat);
+                                uint64_t whole = niter / period;
+                                uint64_t rem = niter % period;
+                                vector<vector<uint32_t>> combined = idmat;
+                                if (whole > 0) combined = matMul(cachedMatPow(s->fastLoopId, periodMat, whole), combined);
+                                for (uint64_t phase = 0; phase < rem; ++phase) {
+                                    combined = matMul(iterMats[static_cast<size_t>(phase)], combined);
+                                }
+                                cur = matMul(combined, cur);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         vector<vector<uint32_t>> bodyMat = idmat;
