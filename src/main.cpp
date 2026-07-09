@@ -3969,11 +3969,51 @@ private:
             }
             case Stmt::Kind::While:
                 return collectAffineNames(s->body.get(), vars, seen, transient);
+            case Stmt::Kind::If:
+                return isTopBreakIf(s);
             case Stmt::Kind::Empty:
                 return true;
             default:
                 return false;
         }
+    }
+
+    bool isBreakOnlyStmt(const Stmt *s) const {
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::Break) return true;
+        if (s->kind != Stmt::Kind::Block) return false;
+        bool sawBreak = false;
+        for (auto &child : s->stmts) {
+            if (!child || child->kind == Stmt::Kind::Empty) continue;
+            if (sawBreak || child->kind != Stmt::Kind::Break) return false;
+            sawBreak = true;
+        }
+        return sawBreak;
+    }
+
+    bool isTopBreakIf(const Stmt *s) const {
+        return s && s->kind == Stmt::Kind::If && s->expr && !s->elseStmt &&
+               isBreakOnlyStmt(s->thenStmt.get());
+    }
+
+    bool topBreakInBlock(const Stmt *s, const Expr *&cond, const Stmt *&skip) const {
+        cond = nullptr;
+        skip = nullptr;
+        if (!s) return false;
+        if (isTopBreakIf(s)) {
+            cond = s->expr.get();
+            skip = s;
+            return true;
+        }
+        if (s->kind != Stmt::Kind::Block) return false;
+        for (auto &child : s->stmts) {
+            if (!child || child->kind == Stmt::Kind::Empty) continue;
+            if (!isTopBreakIf(child.get())) return false;
+            cond = child->expr.get();
+            skip = child.get();
+            return true;
+        }
+        return false;
     }
 
     static bool returnedExprS(const Stmt *s, const Expr *&expr) {
@@ -4315,12 +4355,14 @@ private:
     }
 
     bool processAffineTransformStmt(const Stmt *s, const unordered_map<int, int> &idx,
-                                    vector<vector<uint32_t>> &cur, const int32_t *frame) {
+                                    vector<vector<uint32_t>> &cur, const int32_t *frame,
+                                    const Stmt *skip = nullptr) {
         if (!s) return true;
+        if (s == skip) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
-                    if (!processAffineTransformStmt(child.get(), idx, cur, frame)) return false;
+                    if (!processAffineTransformStmt(child.get(), idx, cur, frame, skip)) return false;
                 }
                 return true;
             case Stmt::Kind::Empty:
@@ -4366,8 +4408,12 @@ private:
         vector<vector<uint32_t>> idmat(d, vector<uint32_t>(d, 0));
         for (int i = 0; i < d; ++i) idmat[i][i] = 1;
 
+        const Expr *breakCond = nullptr;
+        const Stmt *breakSkip = nullptr;
+        bool hasTopBreak = topBreakInBlock(s->body.get(), breakCond, breakSkip);
+
         vector<vector<uint32_t>> bodyMat = idmat;
-        if (!processAffineTransformStmt(s->body.get(), idx, bodyMat, frame)) return false;
+        if (!processAffineTransformStmt(s->body.get(), idx, bodyMat, frame, breakSkip)) return false;
 
         const auto &ir = bodyMat[indIdx];
         for (int j = 0; j + 1 < d; ++j) {
@@ -4389,6 +4435,29 @@ private:
         auto niterOpt = countIterationsMaybe(cmp, step, *iv, *bound);
         if (!niterOpt) return false;
         uint64_t niter = *niterOpt;
+
+        if (hasTopBreak) {
+            vector<vector<uint32_t>> guardMat = cur;
+            guardMat[indIdx] = idmat[indIdx];
+            unordered_set<int> breakVars;
+            collectExprVarKeys(breakCond, breakVars);
+            for (int key : breakVars) {
+                if (key == indKey) continue;
+                auto it = idx.find(key);
+                if (it == idx.end()) continue;
+                int varIdx = it->second;
+                for (int j = 0; j < d; ++j) {
+                    uint32_t want = j == varIdx ? 1u : 0u;
+                    if (bodyMat[varIdx][j] != want) return false;
+                }
+            }
+            Guard breakGuard;
+            bool hasGuard = false;
+            if (!guardFromCondition(breakCond, idx, guardMat, frame, indIdx, breakGuard, hasGuard) || !hasGuard) return false;
+            breakGuard.truth = cmpHolds(breakGuard.cmp, *iv, breakGuard.bound);
+            if (breakGuard.truth) return true;
+            niter = min(niter, guardSameTruthSpan(breakGuard, step, *iv));
+        }
         if (niter == 0) return true;
 
         const vector<vector<uint32_t>> &combined = cachedMatPow(s->fastLoopId, bodyMat, niter);
