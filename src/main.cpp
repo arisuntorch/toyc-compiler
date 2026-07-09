@@ -5509,6 +5509,53 @@ private:
         return f && !f->returnsVoid && simpleReturnExpr(f->body.get(), ret);
     }
 
+    bool simpleReturnExprWithLocalDecls(const Stmt *s, vector<pair<int, const Expr *>> &aliases,
+                                        const Expr *&ret) const {
+        if (!s || ret) return !ret;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!child || child->kind == Stmt::Kind::Empty) continue;
+                    if (ret) return false;
+                    if (!simpleReturnExprWithLocalDecls(child.get(), aliases, ret)) return false;
+                }
+                return ret != nullptr;
+            case Stmt::Kind::DeclStmt:
+                if (!s->decl || !s->decl->init || exprHasCallS(s->decl->init.get())) return false;
+                aliases.push_back({s->decl->fastSlot, s->decl->init.get()});
+                return true;
+            case Stmt::Kind::Return:
+                if (!s->expr) return false;
+                ret = s->expr.get();
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool simpleReturnFunctionExprWithLocalDecls(const Function *f, const Expr *&ret,
+                                                vector<pair<int, const Expr *>> &aliases) const {
+        ret = nullptr;
+        aliases.clear();
+        return f && !f->returnsVoid && simpleReturnExprWithLocalDecls(f->body.get(), aliases, ret);
+    }
+
+    static unordered_map<int, const Expr *> aliasMapFromList(const vector<pair<int, const Expr *>> &aliases) {
+        unordered_map<int, const Expr *> out;
+        for (auto &kv : aliases) out[kv.first] = kv.second;
+        return out;
+    }
+
+    const Expr *resolveLocalAliasExpr(const Expr *e, const unordered_map<int, const Expr *> &aliases,
+                                      int depth = 0) const {
+        while (e && e->kind == Expr::Kind::Var && depth++ < 8) {
+            auto it = aliases.find(exprSlotKey(e));
+            if (it == aliases.end()) break;
+            e = it->second;
+        }
+        return e;
+    }
+
     bool extractInductionPlusConstWithParams(const Expr *e, const vector<const Expr *> &paramArgs,
                                              const unordered_set<int> &changing, const int32_t *frame,
                                              int &key, int32_t &offset) const {
@@ -5557,17 +5604,20 @@ private:
     }
 
     bool collectParamPeriodicModuli(const Expr *e, const vector<const Expr *> &paramArgs,
+                                    const unordered_map<int, const Expr *> &localAliases,
                                     int indKey, int32_t startIv, int32_t offset, int32_t step,
                                     const unordered_set<int> &changing, const int32_t *frame,
                                     vector<int32_t> &mods, bool strict, int depth) const {
         if (!e || depth > 4) return false;
+        e = resolveLocalAliasExpr(e, localAliases, depth);
+        if (!e) return false;
         switch (e->kind) {
             case Expr::Kind::Number:
                 return true;
             case Expr::Kind::Var: {
                 int key = exprSlotKey(e);
                 if (key >= 0 && key < static_cast<int>(paramArgs.size())) {
-                    return collectParamPeriodicModuli(paramArgs[static_cast<size_t>(key)], {}, indKey,
+                    return collectParamPeriodicModuli(paramArgs[static_cast<size_t>(key)], {}, {}, indKey,
                                                       startIv, offset, step, changing, frame,
                                                       mods, strict, depth + 1);
                 }
@@ -5578,34 +5628,37 @@ private:
                 auto found = funcs.find(e->name);
                 if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
                 const Expr *ret = nullptr;
-                if (!simpleReturnFunctionExpr(found->second, ret)) return false;
+                vector<pair<int, const Expr *>> aliases;
+                if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) return false;
                 vector<const Expr *> args;
                 args.reserve(e->args.size());
                 for (auto &arg : e->args) args.push_back(arg.get());
-                return collectParamPeriodicModuli(ret, args, indKey, startIv, offset, step,
+                return collectParamPeriodicModuli(ret, args, aliasMapFromList(aliases), indKey,
+                                                  startIv, offset, step,
                                                   changing, frame, mods, strict, depth + 1);
             }
             case Expr::Kind::Unary:
                 if (strict && e->opc == OPC_NOT) return false;
-                return collectParamPeriodicModuli(e->lhs.get(), paramArgs, indKey, startIv, offset,
+                return collectParamPeriodicModuli(e->lhs.get(), paramArgs, localAliases, indKey, startIv, offset,
                                                   step, changing, frame, mods, strict, depth + 1);
             case Expr::Kind::Binary:
                 if (e->opc == OPC_MOD) {
+                    const Expr *lhs = resolveLocalAliasExpr(e->lhs.get(), localAliases, depth + 1);
                     int key = -1;
                     int32_t off = 0;
                     int32_t m = 0;
                     if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
                     if (m < 0) m = -m;
-                    if (extractInductionPlusConstWithParams(e->lhs.get(), paramArgs, changing, frame,
+                    if (extractInductionPlusConstWithParams(lhs, paramArgs, changing, frame,
                                                             key, off) && key == indKey) {
                         if (m > 1) mods.push_back(m);
                         return true;
                     }
-                    if (e->lhs && e->lhs->kind == Expr::Kind::Binary && e->lhs->opc == OPC_DIV) {
+                    if (lhs && lhs->kind == Expr::Kind::Binary && lhs->opc == OPC_DIV) {
                         int32_t divv = 0;
-                        if (!extractInductionPlusConstWithParams(e->lhs->lhs.get(), paramArgs, changing,
+                        if (!extractInductionPlusConstWithParams(lhs->lhs.get(), paramArgs, changing,
                                                                  frame, key, off) || key != indKey ||
-                            !evalExprNoChanging(e->lhs->rhs.get(), changing, frame, divv) || divv <= 0 ||
+                            !evalExprNoChanging(lhs->rhs.get(), changing, frame, divv) || divv <= 0 ||
                             step <= 0) {
                             return false;
                         }
@@ -5620,9 +5673,9 @@ private:
                 }
                 if (strict && e->opc == OPC_DIV) return false;
                 if (strict && !(e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL)) return false;
-                return collectParamPeriodicModuli(e->lhs.get(), paramArgs, indKey, startIv, offset,
+                return collectParamPeriodicModuli(e->lhs.get(), paramArgs, localAliases, indKey, startIv, offset,
                                                   step, changing, frame, mods, strict, depth + 1) &&
-                       collectParamPeriodicModuli(e->rhs.get(), paramArgs, indKey, startIv, offset,
+                       collectParamPeriodicModuli(e->rhs.get(), paramArgs, localAliases, indKey, startIv, offset,
                                                   step, changing, frame, mods, strict, depth + 1);
         }
         return false;
@@ -5640,7 +5693,7 @@ private:
                 return key != indKey && !changing.count(key);
             }
             case Expr::Kind::Call:
-                return collectParamPeriodicModuli(e, {}, indKey, startIv, offset, step,
+                return collectParamPeriodicModuli(e, {}, {}, indKey, startIv, offset, step,
                                                   changing, frame, mods, true, 0);
             case Expr::Kind::Unary:
                 return e->opc != OPC_NOT &&
@@ -5699,7 +5752,7 @@ private:
                 return key != indKey && !changing.count(key);
             }
             case Expr::Kind::Call:
-                return collectParamPeriodicModuli(e, {}, indKey, startIv, 0, step,
+                return collectParamPeriodicModuli(e, {}, {}, indKey, startIv, 0, step,
                                                   changing, frame, mods, false, 0);
             case Expr::Kind::Unary:
                 return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step, changing, frame, mods);
@@ -5765,7 +5818,8 @@ private:
                 auto found = funcs.find(e->name);
                 if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
                 const Expr *ret = nullptr;
-                if (!simpleReturnFunctionExpr(found->second, ret)) return false;
+                vector<pair<int, const Expr *>> aliases;
+                if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) return false;
                 unordered_map<int, int32_t> calleeLocals;
                 for (size_t i = 0; i < e->args.size(); ++i) {
                     int32_t v = 0;
@@ -5774,6 +5828,14 @@ private:
                         return false;
                     }
                     calleeLocals[static_cast<int>(i)] = v;
+                }
+                for (auto &alias : aliases) {
+                    int32_t v = 0;
+                    if (!evalExprWithInductionValueLocal(alias.second, indKey, indValue, changing,
+                                                         frame, calleeLocals, depth + 1, v)) {
+                        return false;
+                    }
+                    calleeLocals[alias.first] = v;
                 }
                 return evalExprWithInductionValueLocal(ret, indKey, indValue, changing, frame,
                                                        calleeLocals, depth + 1, out);
@@ -5903,14 +5965,18 @@ private:
                           int32_t step, uint64_t niter, const unordered_set<int> &changing,
                           const int32_t *frame, uint32_t &out) const {
         vector<const Expr *> paramArgs;
+        unordered_map<int, const Expr *> localAliases;
         const Expr *target = e;
         if (e && e->kind == Expr::Kind::Call) {
             auto found = funcs.find(e->name);
             if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
-            if (!simpleReturnFunctionExpr(found->second, target)) return false;
+            vector<pair<int, const Expr *>> aliases;
+            if (!simpleReturnFunctionExprWithLocalDecls(found->second, target, aliases)) return false;
+            localAliases = aliasMapFromList(aliases);
             paramArgs.reserve(e->args.size());
             for (auto &arg : e->args) paramArgs.push_back(arg.get());
         }
+        target = resolveLocalAliasExpr(target, localAliases);
         if (!target || target->kind != Expr::Kind::Binary || target->opc != OPC_DIV) return false;
         int key = -1;
         int32_t innerOffset = 0;
