@@ -3970,7 +3970,7 @@ private:
             case Stmt::Kind::While:
                 return collectAffineNames(s->body.get(), vars, seen, transient);
             case Stmt::Kind::If:
-                return isTopBreakIf(s);
+                return isTopBreakIf(s) || isTopContinueIf(s);
             case Stmt::Kind::Empty:
                 return true;
             default:
@@ -3996,6 +3996,28 @@ private:
                isBreakOnlyStmt(s->thenStmt.get());
     }
 
+    bool hasTailContinue(const Stmt *s) const {
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::Continue) return true;
+        if (s->kind != Stmt::Kind::Block) return false;
+        bool sawContinue = false;
+        for (auto &child : s->stmts) {
+            if (!child || child->kind == Stmt::Kind::Empty) continue;
+            if (sawContinue) return false;
+            if (child->kind == Stmt::Kind::Continue) {
+                sawContinue = true;
+                continue;
+            }
+            if (child->kind != Stmt::Kind::Assign && child->kind != Stmt::Kind::DeclStmt) return false;
+        }
+        return sawContinue;
+    }
+
+    bool isTopContinueIf(const Stmt *s) const {
+        return s && s->kind == Stmt::Kind::If && s->expr && !s->elseStmt &&
+               hasTailContinue(s->thenStmt.get());
+    }
+
     bool topBreakInBlock(const Stmt *s, const Expr *&cond, const Stmt *&skip) const {
         cond = nullptr;
         skip = nullptr;
@@ -4011,6 +4033,30 @@ private:
             if (!isTopBreakIf(child.get())) return false;
             cond = child->expr.get();
             skip = child.get();
+            return true;
+        }
+        return false;
+    }
+
+    bool topContinueInBlock(const Stmt *s, const Expr *&cond, const Stmt *&skip,
+                            const Stmt *&thenStmt) const {
+        cond = nullptr;
+        skip = nullptr;
+        thenStmt = nullptr;
+        if (!s) return false;
+        if (isTopContinueIf(s)) {
+            cond = s->expr.get();
+            skip = s;
+            thenStmt = s->thenStmt.get();
+            return true;
+        }
+        if (s->kind != Stmt::Kind::Block) return false;
+        for (auto &child : s->stmts) {
+            if (!child || child->kind == Stmt::Kind::Empty) continue;
+            if (!isTopContinueIf(child.get())) return false;
+            cond = child->expr.get();
+            skip = child.get();
+            thenStmt = child->thenStmt.get();
             return true;
         }
         return false;
@@ -4393,6 +4439,30 @@ private:
         }
     }
 
+    bool processAffineTransformUntilContinue(const Stmt *s, const unordered_map<int, int> &idx,
+                                             vector<vector<uint32_t>> &cur, const int32_t *frame,
+                                             bool &sawContinue) {
+        if (!s) return true;
+        if (sawContinue) return s->kind == Stmt::Kind::Empty;
+        if (s->kind == Stmt::Kind::Continue) {
+            sawContinue = true;
+            return true;
+        }
+        if (s->kind == Stmt::Kind::Block) {
+            for (auto &child : s->stmts) {
+                if (!child || child->kind == Stmt::Kind::Empty) continue;
+                if (sawContinue) return false;
+                if (!processAffineTransformUntilContinue(child.get(), idx, cur, frame, sawContinue)) return false;
+            }
+            return sawContinue;
+        }
+        if (s->kind == Stmt::Kind::If || s->kind == Stmt::Kind::Break ||
+            s->kind == Stmt::Kind::Return) {
+            return false;
+        }
+        return processAffineTransformStmt(s, idx, cur, frame);
+    }
+
     bool processNestedAffineWhile(const Stmt *s, const unordered_map<int, int> &idx,
                                   vector<vector<uint32_t>> &cur, const int32_t *frame) {
         int indKey = -1;
@@ -4411,6 +4481,94 @@ private:
         const Expr *breakCond = nullptr;
         const Stmt *breakSkip = nullptr;
         bool hasTopBreak = topBreakInBlock(s->body.get(), breakCond, breakSkip);
+
+        const Expr *continueCond = nullptr;
+        const Stmt *continueSkip = nullptr;
+        const Stmt *continueThen = nullptr;
+        bool hasTopContinue = !hasTopBreak &&
+            topContinueInBlock(s->body.get(), continueCond, continueSkip, continueThen);
+
+        auto inductionStepFromMat = [&](const vector<vector<uint32_t>> &mat, int32_t &outStep) {
+            const auto &row = mat[indIdx];
+            for (int j = 0; j + 1 < d; ++j) {
+                uint32_t want = j == indIdx ? 1u : 0u;
+                if (row[j] != want) return false;
+            }
+            outStep = static_cast<int32_t>(row[d - 1]);
+            return outStep != 0;
+        };
+
+        if (hasTopContinue) {
+            vector<vector<uint32_t>> restMat = idmat;
+            if (!processAffineTransformStmt(s->body.get(), idx, restMat, frame, continueSkip)) return false;
+            vector<vector<uint32_t>> continueMat = idmat;
+            bool sawContinue = false;
+            if (!processAffineTransformUntilContinue(continueThen, idx, continueMat, frame, sawContinue) ||
+                !sawContinue) {
+                return false;
+            }
+
+            int32_t restStep = 0, continueStep = 0;
+            if (!inductionStepFromMat(restMat, restStep) ||
+                !inductionStepFromMat(continueMat, continueStep) ||
+                restStep != continueStep) {
+                return false;
+            }
+            int32_t step = restStep;
+            if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return false;
+            if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return false;
+
+            vector<uint32_t> boundRow;
+            if (!affineExpr(boundExpr, idx, cur, boundRow, frame)) return false;
+            boundRow[d - 1] += static_cast<uint32_t>(boundAdjust);
+            auto iv = constRowValue(cur[indIdx]);
+            auto bound = constRowValue(boundRow);
+            if (!iv || !bound) return false;
+
+            auto niterOpt = countIterationsMaybe(cmp, step, *iv, *bound);
+            if (!niterOpt) return false;
+            uint64_t remaining = *niterOpt;
+            if (remaining == 0) return true;
+
+            vector<vector<uint32_t>> guardMat = cur;
+            guardMat[indIdx] = idmat[indIdx];
+            unordered_set<int> continueVars;
+            collectExprVarKeys(continueCond, continueVars);
+            for (int key : continueVars) {
+                if (key == indKey) continue;
+                auto it = idx.find(key);
+                if (it == idx.end()) continue;
+                int varIdx = it->second;
+                for (int j = 0; j < d; ++j) {
+                    uint32_t want = j == varIdx ? 1u : 0u;
+                    if (restMat[varIdx][j] != want || continueMat[varIdx][j] != want) return false;
+                }
+            }
+
+            Guard continueGuard;
+            bool hasGuard = false;
+            if (!guardFromCondition(continueCond, idx, guardMat, frame, indIdx, continueGuard, hasGuard) ||
+                !hasGuard) {
+                return false;
+            }
+
+            vector<vector<uint32_t>> combined = idmat;
+            int32_t segIv = *iv;
+            for (int segment = 0; remaining > 0 && segment < 8; ++segment) {
+                Guard g = continueGuard;
+                g.truth = cmpHolds(g.cmp, segIv, g.bound);
+                uint64_t span = min(remaining, guardSameTruthSpan(g, step, segIv));
+                if (span == 0) return false;
+                const vector<vector<uint32_t>> &mat = g.truth ? continueMat : restMat;
+                combined = matMul(cachedMatPow(s->fastLoopId, mat, span), combined);
+                segIv = static_cast<int32_t>(static_cast<uint32_t>(segIv) +
+                                             static_cast<uint32_t>(step) * static_cast<uint32_t>(span));
+                remaining -= span;
+            }
+            if (remaining != 0) return false;
+            cur = matMul(combined, cur);
+            return true;
+        }
 
         vector<vector<uint32_t>> bodyMat = idmat;
         if (!processAffineTransformStmt(s->body.get(), idx, bodyMat, frame, breakSkip)) return false;
