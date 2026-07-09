@@ -5913,12 +5913,24 @@ private:
     bool sumLinearDivExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
                           int32_t step, uint64_t niter, const unordered_set<int> &changing,
                           const int32_t *frame, uint32_t &out) const {
-        if (!e || e->kind != Expr::Kind::Binary || e->opc != OPC_DIV) return false;
+        vector<const Expr *> paramArgs;
+        const Expr *target = e;
+        if (e && e->kind == Expr::Kind::Call) {
+            auto found = funcs.find(e->name);
+            if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+            if (!simpleReturnFunctionExpr(found->second, target)) return false;
+            paramArgs.reserve(e->args.size());
+            for (auto &arg : e->args) paramArgs.push_back(arg.get());
+        }
+        if (!target || target->kind != Expr::Kind::Binary || target->opc != OPC_DIV) return false;
         int key = -1;
         int32_t innerOffset = 0;
-        if (!extractInductionPlusConst(e->lhs.get(), key, innerOffset) || key != indKey) return false;
+        if (!extractInductionPlusConstWithParams(target->lhs.get(), paramArgs, changing, frame,
+                                                 key, innerOffset) || key != indKey) {
+            return false;
+        }
         int32_t divv = 0;
-        if (!evalExprNoChanging(e->rhs.get(), changing, frame, divv) || divv == 0) return false;
+        if (!evalExprNoChanging(target->rhs.get(), changing, frame, divv) || divv == 0) return false;
         bool neg = divv < 0;
         uint64_t m = static_cast<uint64_t>(neg ? -static_cast<int64_t>(divv) : divv);
         int64_t first = static_cast<int64_t>(startIv) + static_cast<int64_t>(offset) + static_cast<int64_t>(innerOffset);
