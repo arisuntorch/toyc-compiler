@@ -4178,6 +4178,65 @@ private:
         return false;
     }
 
+    bool evalAffineAliasConstExpr(const Expr *e, const unordered_map<int, vector<uint32_t>> &aliases,
+                                  int d, int32_t &out) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Unary && e->opc == OPC_NOT) {
+            int32_t v = 0;
+            if (!evalAffineAliasConstExpr(e->lhs.get(), aliases, d, v)) return false;
+            out = !truthy(v);
+            return true;
+        }
+        if (e->kind == Expr::Kind::Binary) {
+            if (e->opc == OPC_AND) {
+                int32_t l = 0;
+                if (!evalAffineAliasConstExpr(e->lhs.get(), aliases, d, l)) return false;
+                if (!truthy(l)) {
+                    out = 0;
+                    return true;
+                }
+                int32_t r = 0;
+                if (!evalAffineAliasConstExpr(e->rhs.get(), aliases, d, r)) return false;
+                out = truthy(r);
+                return true;
+            }
+            if (e->opc == OPC_OR) {
+                int32_t l = 0;
+                if (!evalAffineAliasConstExpr(e->lhs.get(), aliases, d, l)) return false;
+                if (truthy(l)) {
+                    out = 1;
+                    return true;
+                }
+                int32_t r = 0;
+                if (!evalAffineAliasConstExpr(e->rhs.get(), aliases, d, r)) return false;
+                out = truthy(r);
+                return true;
+            }
+            if (isRelOpc(e->opc)) {
+                vector<uint32_t> lrow, rrow;
+                if (!affineExprAliases(e->lhs.get(), aliases, d, lrow) ||
+                    !affineExprAliases(e->rhs.get(), aliases, d, rrow)) return false;
+                auto l = constRowValue(lrow);
+                auto r = constRowValue(rrow);
+                if (!l || !r) return false;
+                switch (e->opc) {
+                    case OPC_LT: out = *l < *r; return true;
+                    case OPC_GT: out = *l > *r; return true;
+                    case OPC_LE: out = *l <= *r; return true;
+                    case OPC_GE: out = *l >= *r; return true;
+                    case OPC_EQ: out = *l == *r; return true;
+                    case OPC_NE: out = *l != *r; return true;
+                }
+            }
+        }
+        vector<uint32_t> row;
+        if (!affineExprAliases(e, aliases, d, row)) return false;
+        auto v = constRowValue(row);
+        if (!v) return false;
+        out = *v;
+        return true;
+    }
+
     bool affinePureStmt(const Stmt *s, unordered_map<int, vector<uint32_t>> &aliases,
                         int d, vector<uint32_t> &out, bool &returned) const {
         if (!s || returned) return true;
@@ -4209,6 +4268,15 @@ private:
             }
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::While:
+                for (int iter = 0; iter < 10000; ++iter) {
+                    int32_t cond = 0;
+                    if (!evalAffineAliasConstExpr(s->expr.get(), aliases, d, cond)) return false;
+                    if (!truthy(cond)) return true;
+                    if (!affinePureStmt(s->body.get(), aliases, d, out, returned)) return false;
+                    if (returned) return true;
+                }
+                return false;
             case Stmt::Kind::Return:
                 if (!s->expr) out.assign(d, 0);
                 else if (!affineExprAliases(s->expr.get(), aliases, d, out)) return false;
@@ -5524,6 +5592,13 @@ private:
         return out;
     }
 
+    static optional<int32_t> polyConstValue(const PolyS &p) {
+        for (int i = 1; i < 4; ++i) {
+            if (p.c[i] != 0) return nullopt;
+        }
+        return static_cast<int32_t>(p.c[0]);
+    }
+
     bool polyExprFromAliases(const Expr *e, unordered_map<int, PolyS> &aliases,
                              const int32_t *frame, PolyS &out, int depth) const {
         if (!e || depth > 8) return false;
@@ -5583,6 +5658,65 @@ private:
         return false;
     }
 
+    bool evalPolyAliasConstExpr(const Expr *e, unordered_map<int, PolyS> &aliases,
+                                const int32_t *frame, int depth, int32_t &out) const {
+        if (!e || depth > 8) return false;
+        if (e->kind == Expr::Kind::Unary && e->opc == OPC_NOT) {
+            int32_t v = 0;
+            if (!evalPolyAliasConstExpr(e->lhs.get(), aliases, frame, depth + 1, v)) return false;
+            out = !truthy(v);
+            return true;
+        }
+        if (e->kind == Expr::Kind::Binary) {
+            if (e->opc == OPC_AND) {
+                int32_t l = 0;
+                if (!evalPolyAliasConstExpr(e->lhs.get(), aliases, frame, depth + 1, l)) return false;
+                if (!truthy(l)) {
+                    out = 0;
+                    return true;
+                }
+                int32_t r = 0;
+                if (!evalPolyAliasConstExpr(e->rhs.get(), aliases, frame, depth + 1, r)) return false;
+                out = truthy(r);
+                return true;
+            }
+            if (e->opc == OPC_OR) {
+                int32_t l = 0;
+                if (!evalPolyAliasConstExpr(e->lhs.get(), aliases, frame, depth + 1, l)) return false;
+                if (truthy(l)) {
+                    out = 1;
+                    return true;
+                }
+                int32_t r = 0;
+                if (!evalPolyAliasConstExpr(e->rhs.get(), aliases, frame, depth + 1, r)) return false;
+                out = truthy(r);
+                return true;
+            }
+            if (isRelOpc(e->opc)) {
+                PolyS lp, rp;
+                if (!polyExprFromAliases(e->lhs.get(), aliases, frame, lp, depth + 1) ||
+                    !polyExprFromAliases(e->rhs.get(), aliases, frame, rp, depth + 1)) return false;
+                auto l = polyConstValue(lp);
+                auto r = polyConstValue(rp);
+                if (!l || !r) return false;
+                switch (e->opc) {
+                    case OPC_LT: out = *l < *r; return true;
+                    case OPC_GT: out = *l > *r; return true;
+                    case OPC_LE: out = *l <= *r; return true;
+                    case OPC_GE: out = *l >= *r; return true;
+                    case OPC_EQ: out = *l == *r; return true;
+                    case OPC_NE: out = *l != *r; return true;
+                }
+            }
+        }
+        PolyS p;
+        if (!polyExprFromAliases(e, aliases, frame, p, depth + 1)) return false;
+        auto v = polyConstValue(p);
+        if (!v) return false;
+        out = *v;
+        return true;
+    }
+
     bool polyPureStmt(const Stmt *s, unordered_map<int, PolyS> &aliases,
                       const int32_t *frame, PolyS &out, bool &returned, int depth) const {
         if (!s || returned) return true;
@@ -5614,6 +5748,15 @@ private:
             }
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::While:
+                for (int iter = 0; iter < 10000; ++iter) {
+                    int32_t cond = 0;
+                    if (!evalPolyAliasConstExpr(s->expr.get(), aliases, frame, depth + 1, cond)) return false;
+                    if (!truthy(cond)) return true;
+                    if (!polyPureStmt(s->body.get(), aliases, frame, out, returned, depth + 1)) return false;
+                    if (returned) return true;
+                }
+                return false;
             case Stmt::Kind::Return:
                 if (!s->expr) out = polyConst(0);
                 else if (!polyExprFromAliases(s->expr.get(), aliases, frame, out, depth)) return false;
