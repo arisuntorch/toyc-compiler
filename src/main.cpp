@@ -5502,6 +5502,143 @@ private:
     }
 
 
+    bool simpleReturnExpr(const Stmt *s, const Expr *&ret) const {
+        if (!s) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                const Expr *found = nullptr;
+                for (auto &child : s->stmts) {
+                    if (!child || child->kind == Stmt::Kind::Empty) continue;
+                    const Expr *childRet = nullptr;
+                    if (!simpleReturnExpr(child.get(), childRet)) return false;
+                    if (found) return false;
+                    found = childRet;
+                }
+                if (!found) return false;
+                ret = found;
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr) return false;
+                ret = s->expr.get();
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool simpleReturnFunctionExpr(const Function *f, const Expr *&ret) const {
+        return f && !f->returnsVoid && simpleReturnExpr(f->body.get(), ret);
+    }
+
+    bool extractInductionPlusConstWithParams(const Expr *e, const vector<const Expr *> &paramArgs,
+                                             const unordered_set<int> &changing, const int32_t *frame,
+                                             int &key, int32_t &offset) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var) {
+            int k = exprSlotKey(e);
+            if (k >= 0 && k < static_cast<int>(paramArgs.size())) {
+                return extractInductionPlusConstWithParams(paramArgs[static_cast<size_t>(k)],
+                                                           {}, changing, frame, key, offset);
+            }
+            key = k;
+            offset = 0;
+            return true;
+        }
+        if (e->kind != Expr::Kind::Binary) return false;
+        if (e->opc == OPC_ADD || e->opc == OPC_SUB) {
+            int lhsKey = -1;
+            int32_t lhsOff = 0;
+            int32_t c = 0;
+            if (extractInductionPlusConstWithParams(e->lhs.get(), paramArgs, changing, frame, lhsKey, lhsOff) &&
+                evalExprNoChanging(e->rhs.get(), changing, frame, c)) {
+                key = lhsKey;
+                offset = e->opc == OPC_ADD ? add32(lhsOff, c) : sub32(lhsOff, c);
+                return true;
+            }
+            if (e->opc == OPC_ADD &&
+                evalExprNoChanging(e->lhs.get(), changing, frame, c) &&
+                extractInductionPlusConstWithParams(e->rhs.get(), paramArgs, changing, frame, lhsKey, lhsOff)) {
+                key = lhsKey;
+                offset = add32(c, lhsOff);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool collectParamPeriodicModuli(const Expr *e, const vector<const Expr *> &paramArgs,
+                                    int indKey, int32_t startIv, int32_t offset, int32_t step,
+                                    const unordered_set<int> &changing, const int32_t *frame,
+                                    vector<int32_t> &mods, bool strict, int depth) const {
+        if (!e || depth > 4) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                if (key >= 0 && key < static_cast<int>(paramArgs.size())) {
+                    return collectParamPeriodicModuli(paramArgs[static_cast<size_t>(key)], {}, indKey,
+                                                      startIv, offset, step, changing, frame,
+                                                      mods, strict, depth + 1);
+                }
+                return key != indKey && !changing.count(key);
+            }
+            case Expr::Kind::Call: {
+                if (!paramArgs.empty()) return false;
+                auto found = funcs.find(e->name);
+                if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+                const Expr *ret = nullptr;
+                if (!simpleReturnFunctionExpr(found->second, ret)) return false;
+                vector<const Expr *> args;
+                args.reserve(e->args.size());
+                for (auto &arg : e->args) args.push_back(arg.get());
+                return collectParamPeriodicModuli(ret, args, indKey, startIv, offset, step,
+                                                  changing, frame, mods, strict, depth + 1);
+            }
+            case Expr::Kind::Unary:
+                if (strict && e->opc == OPC_NOT) return false;
+                return collectParamPeriodicModuli(e->lhs.get(), paramArgs, indKey, startIv, offset,
+                                                  step, changing, frame, mods, strict, depth + 1);
+            case Expr::Kind::Binary:
+                if (e->opc == OPC_MOD) {
+                    int key = -1;
+                    int32_t off = 0;
+                    int32_t m = 0;
+                    if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m < 0) m = -m;
+                    if (extractInductionPlusConstWithParams(e->lhs.get(), paramArgs, changing, frame,
+                                                            key, off) && key == indKey) {
+                        if (m > 1) mods.push_back(m);
+                        return true;
+                    }
+                    if (e->lhs && e->lhs->kind == Expr::Kind::Binary && e->lhs->opc == OPC_DIV) {
+                        int32_t divv = 0;
+                        if (!extractInductionPlusConstWithParams(e->lhs->lhs.get(), paramArgs, changing,
+                                                                 frame, key, off) || key != indKey ||
+                            !evalExprNoChanging(e->lhs->rhs.get(), changing, frame, divv) || divv <= 0 ||
+                            step <= 0) {
+                            return false;
+                        }
+                        int64_t first = static_cast<int64_t>(startIv) + offset + off;
+                        if (first < 0) return false;
+                        uint64_t period = static_cast<uint64_t>(divv) * static_cast<uint64_t>(m);
+                        if (period > static_cast<uint64_t>(INT32_MAX)) return false;
+                        if (m > 1 && period > 1) mods.push_back(static_cast<int32_t>(period));
+                        return true;
+                    }
+                    return false;
+                }
+                if (strict && e->opc == OPC_DIV) return false;
+                if (strict && !(e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL)) return false;
+                return collectParamPeriodicModuli(e->lhs.get(), paramArgs, indKey, startIv, offset,
+                                                  step, changing, frame, mods, strict, depth + 1) &&
+                       collectParamPeriodicModuli(e->rhs.get(), paramArgs, indKey, startIv, offset,
+                                                  step, changing, frame, mods, strict, depth + 1);
+        }
+        return false;
+    }
+
     bool collectStrictPeriodicModuli(const Expr *e, int indKey, int32_t startIv, int32_t offset,
                                      int32_t step, const unordered_set<int> &changing,
                                      const int32_t *frame, vector<int32_t> &mods) const {
@@ -5514,7 +5651,8 @@ private:
                 return key != indKey && !changing.count(key);
             }
             case Expr::Kind::Call:
-                return false;
+                return collectParamPeriodicModuli(e, {}, indKey, startIv, offset, step,
+                                                  changing, frame, mods, true, 0);
             case Expr::Kind::Unary:
                 return e->opc != OPC_NOT &&
                        collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset, step,
@@ -5572,7 +5710,8 @@ private:
                 return key != indKey && !changing.count(key);
             }
             case Expr::Kind::Call:
-                return false;
+                return collectParamPeriodicModuli(e, {}, indKey, startIv, 0, step,
+                                                  changing, frame, mods, false, 0);
             case Expr::Kind::Unary:
                 return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step, changing, frame, mods);
             case Expr::Kind::Binary:
@@ -5608,16 +5747,23 @@ private:
         return false;
     }
 
-    bool evalExprWithInductionValue(const Expr *e, int indKey, int32_t indValue,
-                                    const unordered_set<int> &changing, const int32_t *frame,
-                                    int32_t &out) const {
+    bool evalExprWithInductionValueLocal(const Expr *e, int indKey, int32_t indValue,
+                                         const unordered_set<int> &changing, const int32_t *frame,
+                                         const unordered_map<int, int32_t> &locals,
+                                         int depth, int32_t &out) const {
         if (!e) return false;
+        if (depth > 8) return false;
         switch (e->kind) {
             case Expr::Kind::Number:
                 out = wrap32(e->value);
                 return true;
             case Expr::Kind::Var: {
                 int key = exprSlotKey(e);
+                auto local = locals.find(key);
+                if (local != locals.end()) {
+                    out = local->second;
+                    return true;
+                }
                 if (key == indKey) {
                     out = indValue;
                     return true;
@@ -5626,11 +5772,27 @@ private:
                 out = readSlot(key, frame);
                 return true;
             }
-            case Expr::Kind::Call:
-                return false;
+            case Expr::Kind::Call: {
+                auto found = funcs.find(e->name);
+                if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+                const Expr *ret = nullptr;
+                if (!simpleReturnFunctionExpr(found->second, ret)) return false;
+                unordered_map<int, int32_t> calleeLocals;
+                for (size_t i = 0; i < e->args.size(); ++i) {
+                    int32_t v = 0;
+                    if (!evalExprWithInductionValueLocal(e->args[i].get(), indKey, indValue, changing,
+                                                         frame, locals, depth + 1, v)) {
+                        return false;
+                    }
+                    calleeLocals[static_cast<int>(i)] = v;
+                }
+                return evalExprWithInductionValueLocal(ret, indKey, indValue, changing, frame,
+                                                       calleeLocals, depth + 1, out);
+            }
             case Expr::Kind::Unary: {
                 int32_t v = 0;
-                if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, v)) return false;
+                if (!evalExprWithInductionValueLocal(e->lhs.get(), indKey, indValue, changing,
+                                                     frame, locals, depth + 1, v)) return false;
                 if (e->opc == OPC_PLUS) out = v;
                 else if (e->opc == OPC_NEG) out = sub32(0, v);
                 else if (e->opc == OPC_NOT) out = !truthy(v);
@@ -5640,25 +5802,31 @@ private:
             case Expr::Kind::Binary: {
                 if (e->opc == OPC_AND) {
                     int32_t l = 0;
-                    if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l)) return false;
+                    if (!evalExprWithInductionValueLocal(e->lhs.get(), indKey, indValue, changing,
+                                                         frame, locals, depth + 1, l)) return false;
                     if (!truthy(l)) { out = 0; return true; }
                     int32_t r = 0;
-                    if (!evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
+                    if (!evalExprWithInductionValueLocal(e->rhs.get(), indKey, indValue, changing,
+                                                         frame, locals, depth + 1, r)) return false;
                     out = truthy(r);
                     return true;
                 }
                 if (e->opc == OPC_OR) {
                     int32_t l = 0;
-                    if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l)) return false;
+                    if (!evalExprWithInductionValueLocal(e->lhs.get(), indKey, indValue, changing,
+                                                         frame, locals, depth + 1, l)) return false;
                     if (truthy(l)) { out = 1; return true; }
                     int32_t r = 0;
-                    if (!evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
+                    if (!evalExprWithInductionValueLocal(e->rhs.get(), indKey, indValue, changing,
+                                                         frame, locals, depth + 1, r)) return false;
                     out = truthy(r);
                     return true;
                 }
                 int32_t l = 0, r = 0;
-                if (!evalExprWithInductionValue(e->lhs.get(), indKey, indValue, changing, frame, l) ||
-                    !evalExprWithInductionValue(e->rhs.get(), indKey, indValue, changing, frame, r)) return false;
+                if (!evalExprWithInductionValueLocal(e->lhs.get(), indKey, indValue, changing,
+                                                     frame, locals, depth + 1, l) ||
+                    !evalExprWithInductionValueLocal(e->rhs.get(), indKey, indValue, changing,
+                                                     frame, locals, depth + 1, r)) return false;
                 switch (e->opc) {
                     case OPC_ADD: out = add32(l, r); return true;
                     case OPC_SUB: out = sub32(l, r); return true;
@@ -5676,6 +5844,13 @@ private:
             }
         }
         return false;
+    }
+
+    bool evalExprWithInductionValue(const Expr *e, int indKey, int32_t indValue,
+                                    const unordered_set<int> &changing, const int32_t *frame,
+                                    int32_t &out) const {
+        unordered_map<int, int32_t> locals;
+        return evalExprWithInductionValueLocal(e, indKey, indValue, changing, frame, locals, 0, out);
     }
 
     bool sumStrictPeriodicExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
