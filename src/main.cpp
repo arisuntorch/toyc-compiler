@@ -1656,6 +1656,7 @@ public:
 
 private:
     struct TooHard {};
+    struct InlineFail {};
     struct Flow {
         enum class Kind { Normal, Break, Continue, Return } kind = Kind::Normal;
         int32_t value = 0;
@@ -2511,6 +2512,7 @@ private:
                 else if (e->fastIndex != dst) emit(VM_MOV, dst, e->fastIndex, 0);
                 return;
             case Expr::Kind::Call: {
+                if (tryCompileInlineCall(e, dst, nullptr, 0)) return;
                 auto it = funcIndex.find(e->name);
                 if (it == funcIndex.end()) throw TooHard();
                 if (static_cast<int>(e->args.size()) != vmFuncs[it->second].nparams) throw TooHard();
@@ -2615,6 +2617,161 @@ private:
             }
         }
         throw TooHard();
+    }
+
+    int compileExprMapped(const Expr *e, const unordered_map<int, int> &slotMap, int depth) {
+        if (e->kind == Expr::Kind::Var && !e->fastGlobal) {
+            auto it = slotMap.find(e->fastIndex);
+            if (it == slotMap.end()) throw InlineFail();
+            return it->second;
+        }
+        int t = allocTemp();
+        compileExprIntoMapped(e, t, slotMap, depth);
+        return t;
+    }
+
+    void compileExprIntoMapped(const Expr *e, int dst, const unordered_map<int, int> &slotMap, int depth) {
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                emit(VM_LI, dst, 0, wrap32(e->value));
+                return;
+            case Expr::Kind::Var: {
+                if (e->fastGlobal) {
+                    emit(VM_GLD, dst, 0, e->fastIndex);
+                    return;
+                }
+                auto it = slotMap.find(e->fastIndex);
+                if (it == slotMap.end()) throw InlineFail();
+                if (it->second != dst) emit(VM_MOV, dst, it->second, 0);
+                return;
+            }
+            case Expr::Kind::Call:
+                if (!tryCompileInlineCall(e, dst, &slotMap, depth + 1)) throw InlineFail();
+                return;
+            case Expr::Kind::Unary: {
+                int save = cTempTop;
+                int v = compileExprMapped(e->lhs.get(), slotMap, depth);
+                if (e->opc == OPC_PLUS) {
+                    if (v != dst) emit(VM_MOV, dst, v, 0);
+                } else if (e->opc == OPC_NEG) {
+                    emit(VM_NEG, dst, v, 0);
+                } else if (e->opc == OPC_NOT) {
+                    emit(VM_SEQZ, dst, v, 0);
+                } else {
+                    throw InlineFail();
+                }
+                cTempTop = save;
+                return;
+            }
+            case Expr::Kind::Binary: {
+                int opc = e->opc;
+                if (opc == OPC_AND || opc == OPC_OR) {
+                    int save = cTempTop;
+                    int l = compileExprMapped(e->lhs.get(), slotMap, depth);
+                    emit(VM_SNEZ, dst, l, 0);
+                    cTempTop = save;
+                    int jidx = emit(opc == OPC_AND ? VM_JZ : VM_JNZ, 0, dst, 0);
+                    int r = compileExprMapped(e->rhs.get(), slotMap, depth);
+                    emit(VM_SNEZ, dst, r, 0);
+                    cTempTop = save;
+                    patchC(jidx, here());
+                    return;
+                }
+                int save = cTempTop;
+                if (e->rhs->kind == Expr::Kind::Number) {
+                    int32_t imm = wrap32(e->rhs->value);
+                    int l = compileExprMapped(e->lhs.get(), slotMap, depth);
+                    switch (opc) {
+                        case OPC_ADD: emit(VM_ADDI, dst, l, imm); break;
+                        case OPC_SUB: emit(VM_ADDI, dst, l, wrap32(-static_cast<long long>(imm))); break;
+                        case OPC_MUL: emit(VM_MULI, dst, l, imm); break;
+                        case OPC_DIV: emit(VM_DIVI, dst, l, imm); break;
+                        case OPC_MOD: emit(VM_MODI, dst, l, imm); break;
+                        case OPC_LT: emit(VM_SLTI, dst, l, imm); break;
+                        case OPC_GT: emit(VM_SGTI, dst, l, imm); break;
+                        case OPC_LE: emit(VM_SLEI, dst, l, imm); break;
+                        case OPC_GE: emit(VM_SGEI, dst, l, imm); break;
+                        case OPC_EQ: emit(VM_SEQI, dst, l, imm); break;
+                        case OPC_NE: emit(VM_SNEI, dst, l, imm); break;
+                        default: throw InlineFail();
+                    }
+                    cTempTop = save;
+                    return;
+                }
+                if (e->lhs->kind == Expr::Kind::Number) {
+                    int32_t imm = wrap32(e->lhs->value);
+                    int r = compileExprMapped(e->rhs.get(), slotMap, depth);
+                    switch (opc) {
+                        case OPC_ADD: emit(VM_ADDI, dst, r, imm); break;
+                        case OPC_SUB: emit(VM_RSUBI, dst, r, imm); break;
+                        case OPC_MUL: emit(VM_MULI, dst, r, imm); break;
+                        case OPC_DIV: emit(VM_RDIVI, dst, r, imm); break;
+                        case OPC_MOD: emit(VM_RMODI, dst, r, imm); break;
+                        case OPC_LT: emit(VM_SGTI, dst, r, imm); break;
+                        case OPC_GT: emit(VM_SLTI, dst, r, imm); break;
+                        case OPC_LE: emit(VM_SGEI, dst, r, imm); break;
+                        case OPC_GE: emit(VM_SLEI, dst, r, imm); break;
+                        case OPC_EQ: emit(VM_SEQI, dst, r, imm); break;
+                        case OPC_NE: emit(VM_SNEI, dst, r, imm); break;
+                        default: throw InlineFail();
+                    }
+                    cTempTop = save;
+                    return;
+                }
+                int l = compileExprMapped(e->lhs.get(), slotMap, depth);
+                int r = compileExprMapped(e->rhs.get(), slotMap, depth);
+                switch (opc) {
+                    case OPC_ADD: emit(VM_ADD, dst, l, r); break;
+                    case OPC_SUB: emit(VM_SUB, dst, l, r); break;
+                    case OPC_MUL: emit(VM_MUL, dst, l, r); break;
+                    case OPC_DIV: emit(VM_DIV, dst, l, r); break;
+                    case OPC_MOD: emit(VM_MOD, dst, l, r); break;
+                    case OPC_LT: emit(VM_SLT, dst, l, r); break;
+                    case OPC_GT: emit(VM_SGT, dst, l, r); break;
+                    case OPC_LE: emit(VM_SLE, dst, l, r); break;
+                    case OPC_GE: emit(VM_SGE, dst, l, r); break;
+                    case OPC_EQ: emit(VM_SEQ, dst, l, r); break;
+                    case OPC_NE: emit(VM_SNE, dst, l, r); break;
+                    default: throw InlineFail();
+                }
+                cTempTop = save;
+                return;
+            }
+        }
+        throw InlineFail();
+    }
+
+    bool tryCompileInlineCall(const Expr *e, int dst, const unordered_map<int, int> *outerMap, int depth) {
+        if (!e || e->kind != Expr::Kind::Call || depth > 4) return false;
+        auto found = funcs.find(e->name);
+        if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
+        const Expr *ret = nullptr;
+        vector<pair<int, const Expr *>> aliases;
+        if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) return false;
+
+        int save = cTempTop;
+        size_t codeSave = cf ? cf->code.size() : 0;
+        try {
+            unordered_map<int, int> slotMap;
+            for (size_t i = 0; i < e->args.size(); ++i) {
+                int t = allocTemp();
+                if (outerMap) compileExprIntoMapped(e->args[i].get(), t, *outerMap, depth + 1);
+                else compileExprInto(e->args[i].get(), t);
+                slotMap[static_cast<int>(i)] = t;
+            }
+            for (auto &alias : aliases) {
+                int t = allocTemp();
+                compileExprIntoMapped(alias.second, t, slotMap, depth + 1);
+                slotMap[alias.first] = t;
+            }
+            compileExprIntoMapped(ret, dst, slotMap, depth + 1);
+            cTempTop = save;
+            return true;
+        } catch (const InlineFail &) {
+            if (cf) cf->code.resize(codeSave);
+            cTempTop = save;
+            return false;
+        }
     }
 
     void compileStmt(const Stmt *s) {
