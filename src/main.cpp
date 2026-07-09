@@ -4213,19 +4213,29 @@ private:
                 return true;
             }
             if (isRelOpc(e->opc)) {
-                vector<uint32_t> lrow, rrow;
-                if (!affineExprAliases(e->lhs.get(), aliases, d, lrow) ||
-                    !affineExprAliases(e->rhs.get(), aliases, d, rrow)) return false;
-                auto l = constRowValue(lrow);
-                auto r = constRowValue(rrow);
-                if (!l || !r) return false;
+                int32_t l = 0, r = 0;
+                if (!evalAffineAliasConstExpr(e->lhs.get(), aliases, d, l) ||
+                    !evalAffineAliasConstExpr(e->rhs.get(), aliases, d, r)) return false;
                 switch (e->opc) {
-                    case OPC_LT: out = *l < *r; return true;
-                    case OPC_GT: out = *l > *r; return true;
-                    case OPC_LE: out = *l <= *r; return true;
-                    case OPC_GE: out = *l >= *r; return true;
-                    case OPC_EQ: out = *l == *r; return true;
-                    case OPC_NE: out = *l != *r; return true;
+                    case OPC_LT: out = l < r; return true;
+                    case OPC_GT: out = l > r; return true;
+                    case OPC_LE: out = l <= r; return true;
+                    case OPC_GE: out = l >= r; return true;
+                    case OPC_EQ: out = l == r; return true;
+                    case OPC_NE: out = l != r; return true;
+                }
+            }
+            if (e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL ||
+                e->opc == OPC_DIV || e->opc == OPC_MOD) {
+                int32_t l = 0, r = 0;
+                if (!evalAffineAliasConstExpr(e->lhs.get(), aliases, d, l) ||
+                    !evalAffineAliasConstExpr(e->rhs.get(), aliases, d, r)) return false;
+                switch (e->opc) {
+                    case OPC_ADD: out = add32(l, r); return true;
+                    case OPC_SUB: out = sub32(l, r); return true;
+                    case OPC_MUL: out = mul32(l, r); return true;
+                    case OPC_DIV: if (r == 0) return false; out = div32(l, r); return true;
+                    case OPC_MOD: if (r == 0) return false; out = mod32(l, r); return true;
                 }
             }
         }
@@ -4268,6 +4278,13 @@ private:
             }
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                if (!evalAffineAliasConstExpr(s->expr.get(), aliases, d, cond)) return false;
+                return truthy(cond)
+                    ? affinePureStmt(s->thenStmt.get(), aliases, d, out, returned)
+                    : affinePureStmt(s->elseStmt.get(), aliases, d, out, returned);
+            }
             case Stmt::Kind::While:
                 for (int iter = 0; iter < 10000; ++iter) {
                     int32_t cond = 0;
@@ -5693,19 +5710,29 @@ private:
                 return true;
             }
             if (isRelOpc(e->opc)) {
-                PolyS lp, rp;
-                if (!polyExprFromAliases(e->lhs.get(), aliases, frame, lp, depth + 1) ||
-                    !polyExprFromAliases(e->rhs.get(), aliases, frame, rp, depth + 1)) return false;
-                auto l = polyConstValue(lp);
-                auto r = polyConstValue(rp);
-                if (!l || !r) return false;
+                int32_t l = 0, r = 0;
+                if (!evalPolyAliasConstExpr(e->lhs.get(), aliases, frame, depth + 1, l) ||
+                    !evalPolyAliasConstExpr(e->rhs.get(), aliases, frame, depth + 1, r)) return false;
                 switch (e->opc) {
-                    case OPC_LT: out = *l < *r; return true;
-                    case OPC_GT: out = *l > *r; return true;
-                    case OPC_LE: out = *l <= *r; return true;
-                    case OPC_GE: out = *l >= *r; return true;
-                    case OPC_EQ: out = *l == *r; return true;
-                    case OPC_NE: out = *l != *r; return true;
+                    case OPC_LT: out = l < r; return true;
+                    case OPC_GT: out = l > r; return true;
+                    case OPC_LE: out = l <= r; return true;
+                    case OPC_GE: out = l >= r; return true;
+                    case OPC_EQ: out = l == r; return true;
+                    case OPC_NE: out = l != r; return true;
+                }
+            }
+            if (e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL ||
+                e->opc == OPC_DIV || e->opc == OPC_MOD) {
+                int32_t l = 0, r = 0;
+                if (!evalPolyAliasConstExpr(e->lhs.get(), aliases, frame, depth + 1, l) ||
+                    !evalPolyAliasConstExpr(e->rhs.get(), aliases, frame, depth + 1, r)) return false;
+                switch (e->opc) {
+                    case OPC_ADD: out = add32(l, r); return true;
+                    case OPC_SUB: out = sub32(l, r); return true;
+                    case OPC_MUL: out = mul32(l, r); return true;
+                    case OPC_DIV: if (r == 0) return false; out = div32(l, r); return true;
+                    case OPC_MOD: if (r == 0) return false; out = mod32(l, r); return true;
                 }
             }
         }
@@ -5748,6 +5775,13 @@ private:
             }
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                if (!evalPolyAliasConstExpr(s->expr.get(), aliases, frame, depth + 1, cond)) return false;
+                return truthy(cond)
+                    ? polyPureStmt(s->thenStmt.get(), aliases, frame, out, returned, depth + 1)
+                    : polyPureStmt(s->elseStmt.get(), aliases, frame, out, returned, depth + 1);
+            }
             case Stmt::Kind::While:
                 for (int iter = 0; iter < 10000; ++iter) {
                     int32_t cond = 0;
