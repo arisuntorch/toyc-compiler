@@ -6822,6 +6822,23 @@ private:
         }
     }
 
+    bool runQuadraticModLoopBudgeted(uint64_t n, uint32_t x, uint32_t step, int32_t modv,
+                                     uint32_t &out) const {
+        constexpr uint64_t chunkSize = 1ull << 20;
+        uint32_t total = 0;
+        while (n > 0) {
+            auto elapsed = chrono::duration_cast<chrono::milliseconds>(
+                chrono::steady_clock::now() - startTime).count();
+            if (elapsed > timeLimit) return false;
+            uint64_t chunk = min(n, chunkSize);
+            total += runQuadraticModLoop(chunk, x, step, modv);
+            x += static_cast<uint32_t>(static_cast<uint64_t>(step) * chunk);
+            n -= chunk;
+        }
+        out = total;
+        return true;
+    }
+
     bool sumQuadraticModExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
                              int32_t step, uint64_t niter, const unordered_set<int> &changing,
                              const int32_t *frame, uint32_t &out) const {
@@ -6841,8 +6858,7 @@ private:
         uint32_t x = static_cast<uint32_t>(startIv);
         x += static_cast<uint32_t>(offset);
         x += static_cast<uint32_t>(lhsOff);
-        out = runQuadraticModLoop(niter, x, static_cast<uint32_t>(step), modv);
-        return true;
+        return runQuadraticModLoopBudgeted(niter, x, static_cast<uint32_t>(step), modv, out);
     }
 
     bool sumQuadraticModExprWithPolyAliases(const Expr *e, unordered_map<int, PolyS> &aliases,
@@ -6859,8 +6875,7 @@ private:
             if (a.c[i] != b.c[i]) return false;
         }
         if (a.c[2] != 0 || a.c[3] != 0) return false;
-        out = runQuadraticModLoop(niter, a.c[0], a.c[1], modv);
-        return true;
+        return runQuadraticModLoopBudgeted(niter, a.c[0], a.c[1], modv, out);
     }
 
     bool exprReferencesHelperExtra(const Expr *e,
@@ -6875,7 +6890,8 @@ private:
         return false;
     }
 
-    bool stmtReadsChangingGlobal(const Stmt *root, const unordered_set<int> &changing) const {
+    bool exprReadsChangingGlobalTransitively(const Expr *root,
+                                             const unordered_set<int> &changing) const {
         unordered_set<const Function *> visiting;
         function<bool(const Expr *)> scanExpr;
         function<bool(const Stmt *)> scanStmt;
@@ -6910,7 +6926,7 @@ private:
             }
             return false;
         };
-        return scanStmt(root);
+        return scanExpr(root);
     }
 
     bool addHelperSummaryTerm(const Expr *term, int sign, unordered_map<int, PolyS> &aliases,
@@ -7000,6 +7016,7 @@ private:
         auto found = funcs.find(e->name);
         if (found == funcs.end() || !found->second || found->second->returnsVoid ||
             e->args.size() != found->second->params.size()) return false;
+        if (exprReadsChangingGlobalTransitively(e, changing)) return false;
 
         unordered_map<int, PolyS> aliases;
         unordered_map<int, PolyS> noAliases;
@@ -7012,7 +7029,6 @@ private:
 
         const Stmt *body = found->second->body.get();
         if (!body || body->kind != Stmt::Kind::Block) return false;
-        if (stmtReadsChangingGlobal(body, changing)) return false;
         unordered_map<int, uint32_t> extraByKey;
         for (auto &child : body->stmts) {
             if (!child || child->kind == Stmt::Kind::Empty) continue;
@@ -7545,6 +7561,16 @@ static bool exprHasCall(const Expr *e) {
     if (exprHasCall(e->lhs.get()) || exprHasCall(e->rhs.get())) return true;
     for (auto &arg : e->args) {
         if (exprHasCall(arg.get())) return true;
+    }
+    return false;
+}
+
+static bool exprHasDivMod(const Expr *e) {
+    if (!e) return false;
+    if (e->kind == Expr::Kind::Binary && (e->op == "/" || e->op == "%")) return true;
+    if (exprHasDivMod(e->lhs.get()) || exprHasDivMod(e->rhs.get())) return true;
+    for (auto &arg : e->args) {
+        if (exprHasDivMod(arg.get())) return true;
     }
     return false;
 }
@@ -10110,15 +10136,16 @@ private:
             return;
         }
         bool argsHaveCall = false;
+        bool argsHaveDivMod = false;
         for (auto &arg : e->args) {
             if (hasCall(arg.get())) {
                 argsHaveCall = true;
-                break;
             }
+            if (exprHasDivMod(arg.get())) argsHaveDivMod = true;
         }
         static const vector<string> tailTemps = {"t0", "t1", "t2", "t3", "t4", "t5"};
-        // Division and modulo strength reduction can require two scratch registers.
-        if (!argsHaveCall && n + 2 <= static_cast<int>(tailTemps.size())) {
+        // Nested division/modulo strength reduction may escape the provided scratch pool.
+        if (!argsHaveCall && !argsHaveDivMod && n + 2 <= static_cast<int>(tailTemps.size())) {
             for (int i = 0; i < n; ++i) {
                 vector<string> regs;
                 for (int j = 0; j < static_cast<int>(tailTemps.size()); ++j) {
