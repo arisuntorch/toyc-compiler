@@ -309,6 +309,17 @@ static int32_t mod32(int32_t a, int32_t b) {
     return a % b;
 }
 
+static constexpr uint64_t kMaxPeriodicPhases = 8192;
+
+static uint64_t periodicMatrixPhaseLimit(int dimension) {
+    constexpr uint64_t baseline = 4096;
+    constexpr uint64_t maxMatrixCells = 4ull * 1024 * 1024;
+    if (dimension <= 0) return baseline;
+    uint64_t d = static_cast<uint64_t>(dimension);
+    uint64_t bySize = maxMatrixCells / (d * d);
+    return max(baseline, min(kMaxPeriodicPhases, bySize));
+}
+
 class ConstEvaluator {
 public:
     explicit ConstEvaluator(Program &program, long long budget = 300000000, int timeLimitMs = 2500)
@@ -1526,14 +1537,15 @@ private:
         if (niter < 100000) return false;
 
         uint64_t period = 1;
+        uint64_t periodLimit = periodicMatrixPhaseLimit(d);
         uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
         for (int32_t mod : moduli) {
             uint64_t m = static_cast<uint64_t>(mod);
             uint64_t reduced = m / gcd64(m, absStep % m);
-            period = lcmCapped(period, reduced, 4096);
-            if (period > 4096) return false;
+            period = lcmCapped(period, reduced, periodLimit);
+            if (period > periodLimit) return false;
         }
-        if (period == 0 || period > 4096) return false;
+        if (period == 0 || period > periodLimit) return false;
 
         vector<vector<vector<uint32_t>>> iterMats;
         iterMats.reserve(static_cast<size_t>(period));
@@ -4859,15 +4871,16 @@ private:
                     if (collectIfPeriodicModuli(s->body.get(), indKey, *iv, firstStep, changing,
                                                 frame, moduli, sawIf) && sawIf) {
                         uint64_t period = 1;
+                        uint64_t periodLimit = periodicMatrixPhaseLimit(d);
                         uint64_t absStep = firstStep < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(firstStep))
                                                          : static_cast<uint64_t>(firstStep);
                         for (int32_t mod : moduli) {
                             uint64_t m = static_cast<uint64_t>(mod);
                             uint64_t reduced = m / gcd64(m, absStep % m);
-                            period = lcmCapped(period, reduced, 4096);
-                            if (period > 4096) break;
+                            period = lcmCapped(period, reduced, periodLimit);
+                            if (period > periodLimit) break;
                         }
-                        if (period > 0 && period <= 4096) {
+                        if (period > 0 && period <= periodLimit) {
                             vector<vector<vector<uint32_t>>> iterMats;
                             iterMats.reserve(static_cast<size_t>(period));
                             vector<uint32_t> phaseSample = sample;
@@ -5533,14 +5546,15 @@ private:
         if (niter < 100000) return FoldValueFail;
 
         uint64_t period = 1;
+        uint64_t periodLimit = periodicMatrixPhaseLimit(d);
         uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step)) : static_cast<uint64_t>(step);
         for (int32_t mod : moduli) {
             uint64_t m = static_cast<uint64_t>(mod);
             uint64_t reduced = m / gcd64(m, absStep % m);
-            period = lcmCapped(period, reduced, 4096);
-            if (period > 4096) return FoldValueFail;
+            period = lcmCapped(period, reduced, periodLimit);
+            if (period > periodLimit) return FoldValueFail;
         }
-        if (period == 0 || period > 4096) return FoldValueFail;
+        if (period == 0 || period > periodLimit) return FoldValueFail;
 
         vector<vector<vector<uint32_t>>> iterMats;
         iterMats.reserve(static_cast<size_t>(period));
@@ -6795,10 +6809,10 @@ private:
         for (int32_t mod : mods) {
             uint64_t m = static_cast<uint64_t>(mod);
             uint64_t reduced = m / gcd64(m, absStep % m);
-            period = lcmCapped(period, reduced, 4096);
-            if (period > 4096) return false;
+            period = lcmCapped(period, reduced, kMaxPeriodicPhases);
+            if (period > kMaxPeriodicPhases) return false;
         }
-        if (period == 0 || period > 4096) return false;
+        if (period == 0 || period > kMaxPeriodicPhases) return false;
         vector<uint32_t> vals;
         vals.reserve(static_cast<size_t>(period));
         uint32_t cycle = 0;
@@ -7414,10 +7428,10 @@ private:
         for (int32_t mod : moduli) {
             uint64_t m = static_cast<uint64_t>(mod);
             uint64_t reduced = m / gcd64(m, absStep % m);
-            period = lcmCapped(period, reduced, 4096);
-            if (period > 4096) return FoldValueFail;
+            period = lcmCapped(period, reduced, kMaxPeriodicPhases);
+            if (period > kMaxPeriodicPhases) return FoldValueFail;
         }
-        if (period == 0 || period > 4096) return FoldValueFail;
+        if (period == 0 || period > kMaxPeriodicPhases) return FoldValueFail;
 
         unordered_map<int, uint32_t> totalDeltas;
         bool sawAccumulator = false;
