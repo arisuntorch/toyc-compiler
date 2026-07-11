@@ -1678,6 +1678,9 @@ private:
         NO_PERIODIC_POLY = 32,
         NO_LCG_MOD_SUM = 64
     };
+    static constexpr uint8_t kAllLoopStructFlags = NO_PERIODIC | NO_GUARDED | NO_AFFINE |
+                                                   NO_NESTED | NO_POLY_SUM |
+                                                   NO_PERIODIC_POLY | NO_LCG_MOD_SUM;
     enum class TransformFlow { Fail, Normal, Continue, Break };
 
     struct AffineLoopS {
@@ -1756,6 +1759,7 @@ private:
     vector<vector<size_t>> jitInsnAddr;        // machine offset per (func, insn)
     vector<JitFixup> jitBranchFix;
     vector<JitFixup> jitCallFix;
+    vector<uint32_t> jitFoldSkip;
     void *jitMem = nullptr;
     size_t jitMemSize = 0;
     bool jitReady = false;
@@ -3438,7 +3442,22 @@ private:
                 jb(0x48); jb(0x83); jb(0xC4); jb(0x08);
                 jb(0xC3);
                 return;
-            case VM_FOLD:
+            case VM_FOLD: {
+                // Re-entered inner loops can hit this instruction millions of
+                // times. Skip the C++ trampoline between value-dependent
+                // retries, and permanently skip structurally impossible folds.
+                jb(0x48); jb(0xB8);
+                j64(reinterpret_cast<uint64_t>(&jitFoldSkip[static_cast<size_t>(b)])); // mov rax, &skip[id]
+                jb(0x8B); jb(0x08);                                       // mov ecx, [rax]
+                jb(0x85); jb(0xC9);                                       // test ecx, ecx
+                jb(0x74); size_t hCall = jhole8();                         // jz L_call
+                jb(0x83); jb(0xF9); jb(0xFF);                             // cmp ecx, -1
+                jb(0x74); size_t hNoDec = jhole8();                        // je L_done_count
+                jb(0xFF); jb(0xC9);                                       // dec ecx
+                jb(0x89); jb(0x08);                                       // mov [rax], ecx
+                jpatch8(hNoDec);
+                jb(0xE9); size_t hDone = jhole32();                        // jmp L_done
+                jpatch8(hCall);
                 jSyncRegsToMem(cf2);                                        // flush pinned regs to frame
                 jb(0x48); jb(0xBF); j64(reinterpret_cast<uint64_t>(this));  // mov rdi, this
                 jb(0xBE); j32(b);                                           // mov esi, id
@@ -3449,7 +3468,10 @@ private:
                 jSyncRegsFromMem(cf2);                                      // reload pinned regs from frame
                 jb(0x84); jb(0xC9);                                         // test cl, cl
                 jb(0x0F); jb(0x85); { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
+                jset32(hDone, static_cast<int32_t>(static_cast<long>(jitCode.size()) -
+                                                   static_cast<long>(hDone + 4)));
                 return;
+            }
             default:
                 throw TooHard();
         }
@@ -3484,7 +3506,21 @@ private:
 
     static int32_t jitFoldTramp(FastEvaluator *self, int32_t id, int32_t *frame) {
         try {
-            return self->tryFoldWhile(self->foldStmts[static_cast<size_t>(id)], frame) ? 1 : 0;
+            if (id < 0 || static_cast<size_t>(id) >= self->foldStmts.size()) return 0;
+            const Stmt *stmt = self->foldStmts[static_cast<size_t>(id)];
+            bool folded = self->tryFoldWhile(stmt, frame, true);
+            uint32_t delay = 0;
+            if (stmt && stmt->fastLoopId >= 0 &&
+                stmt->fastLoopId < static_cast<int>(self->loopStats.size())) {
+                const LoopStat &st = self->loopStats[static_cast<size_t>(stmt->fastLoopId)];
+                if ((st.structFlags & kAllLoopStructFlags) == kAllLoopStructFlags) {
+                    delay = numeric_limits<uint32_t>::max();
+                } else if (!st.everFolded && st.failCount >= 8) {
+                    delay = 255;
+                }
+            }
+            self->jitFoldSkip[static_cast<size_t>(id)] = delay;
+            return folded ? 1 : 0;
         } catch (...) {
             longjmp(self->jitAbortBuf, 1);
         }
@@ -3505,6 +3541,7 @@ private:
             jitCode.clear();
             jitBranchFix.clear();
             jitCallFix.clear();
+            jitFoldSkip.assign(foldStmts.size(), 0);
             jEmitThunk();
             for (size_t f = 0; f < n; ++f) {
                 jitFuncEntry[f] = jitCode.size();
@@ -5976,27 +6013,96 @@ private:
         return false;
     }
 
+    static uint32_t advanceLcg(uint32_t x, uint32_t mul, uint32_t add, uint64_t n) {
+        uint32_t resultMul = 1;
+        uint32_t resultAdd = 0;
+        uint32_t powerMul = mul;
+        uint32_t powerAdd = add;
+        while (n > 0) {
+            if (n & 1u) {
+                resultAdd = static_cast<uint32_t>(
+                    static_cast<uint64_t>(powerMul) * resultAdd + powerAdd);
+                resultMul = static_cast<uint32_t>(static_cast<uint64_t>(powerMul) * resultMul);
+            }
+            powerAdd = static_cast<uint32_t>(
+                static_cast<uint64_t>(powerMul) * powerAdd + powerAdd);
+            powerMul = static_cast<uint32_t>(static_cast<uint64_t>(powerMul) * powerMul);
+            n >>= 1;
+        }
+        return static_cast<uint32_t>(static_cast<uint64_t>(resultMul) * x + resultAdd);
+    }
+
     bool runLcgModLoop(uint64_t niter, uint32_t &x, uint32_t &acc, uint32_t mul, uint32_t add,
                        int32_t modv, bool addBeforeUpdate) {
         auto timeExceeded = [&]() {
             auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
             return elapsed > timeLimit;
         };
-        if (modv == 100 || modv == -100) {
+        if (modv != 100 && modv != -100) {
             for (uint64_t t = 0; t < niter; ++t) {
                 if ((t & ((1ull << 20) - 1)) == 0 && timeExceeded()) return false;
-                if (addBeforeUpdate) acc += static_cast<uint32_t>(static_cast<int32_t>(x) % 100);
+                if (addBeforeUpdate) acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(x), modv));
                 x = static_cast<uint32_t>(static_cast<uint64_t>(x) * mul + add);
-                if (!addBeforeUpdate) acc += static_cast<uint32_t>(static_cast<int32_t>(x) % 100);
+                if (!addBeforeUpdate) acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(x), modv));
             }
             return true;
         }
-        for (uint64_t t = 0; t < niter; ++t) {
-            if ((t & ((1ull << 20) - 1)) == 0 && timeExceeded()) return false;
+
+        // Each stream covers one contiguous segment of the same LCG. Affine
+        // exponentiation finds the segment starts, then independent chains let
+        // the host CPU overlap the otherwise serial multiply dependency.
+        constexpr int streams = 8;
+        uint64_t block = niter / streams;
+        uint64_t tail = niter - block * streams;
+        array<uint32_t, streams> state{};
+        for (int j = 0; j < streams; ++j) {
+            state[j] = advanceLcg(x, mul, add, block * static_cast<uint64_t>(j));
+        }
+
+#define TOYC_LCG_UPDATE(J) \
+        state[J] = static_cast<uint32_t>(static_cast<uint64_t>(state[J]) * mul + add)
+#define TOYC_LCG_STEP_BEFORE(J, SAMPLE) \
+        do { acc += static_cast<uint32_t>(SAMPLE); TOYC_LCG_UPDATE(J); } while (0)
+#define TOYC_LCG_STEP_AFTER(J, SAMPLE) \
+        do { TOYC_LCG_UPDATE(J); acc += static_cast<uint32_t>(SAMPLE); } while (0)
+
+#define TOYC_LCG_MOD100(J) (static_cast<int32_t>(state[J]) % 100)
+        if (addBeforeUpdate) {
+            for (uint64_t t = 0; t < block; ++t) {
+                if ((t & ((1ull << 17) - 1)) == 0 && timeExceeded()) return false;
+                TOYC_LCG_STEP_BEFORE(0, TOYC_LCG_MOD100(0));
+                TOYC_LCG_STEP_BEFORE(1, TOYC_LCG_MOD100(1));
+                TOYC_LCG_STEP_BEFORE(2, TOYC_LCG_MOD100(2));
+                TOYC_LCG_STEP_BEFORE(3, TOYC_LCG_MOD100(3));
+                TOYC_LCG_STEP_BEFORE(4, TOYC_LCG_MOD100(4));
+                TOYC_LCG_STEP_BEFORE(5, TOYC_LCG_MOD100(5));
+                TOYC_LCG_STEP_BEFORE(6, TOYC_LCG_MOD100(6));
+                TOYC_LCG_STEP_BEFORE(7, TOYC_LCG_MOD100(7));
+            }
+        } else {
+            for (uint64_t t = 0; t < block; ++t) {
+                if ((t & ((1ull << 17) - 1)) == 0 && timeExceeded()) return false;
+                TOYC_LCG_STEP_AFTER(0, TOYC_LCG_MOD100(0));
+                TOYC_LCG_STEP_AFTER(1, TOYC_LCG_MOD100(1));
+                TOYC_LCG_STEP_AFTER(2, TOYC_LCG_MOD100(2));
+                TOYC_LCG_STEP_AFTER(3, TOYC_LCG_MOD100(3));
+                TOYC_LCG_STEP_AFTER(4, TOYC_LCG_MOD100(4));
+                TOYC_LCG_STEP_AFTER(5, TOYC_LCG_MOD100(5));
+                TOYC_LCG_STEP_AFTER(6, TOYC_LCG_MOD100(6));
+                TOYC_LCG_STEP_AFTER(7, TOYC_LCG_MOD100(7));
+            }
+        }
+#undef TOYC_LCG_MOD100
+
+        x = state[streams - 1];
+        for (uint64_t t = 0; t < tail; ++t) {
             if (addBeforeUpdate) acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(x), modv));
             x = static_cast<uint32_t>(static_cast<uint64_t>(x) * mul + add);
             if (!addBeforeUpdate) acc += static_cast<uint32_t>(mod32(static_cast<int32_t>(x), modv));
         }
+#undef TOYC_LCG_STEP_AFTER
+#undef TOYC_LCG_STEP_BEFORE
+#undef TOYC_LCG_UPDATE
         return true;
     }
 
@@ -7457,13 +7563,11 @@ private:
         return true;
     }
 
-    bool tryFoldWhile(const Stmt *s, int32_t *frame) {
+    bool tryFoldWhile(const Stmt *s, int32_t *frame, bool callerThrottles = false) {
         if (s->fastLoopId < 0 || s->fastLoopId >= static_cast<int>(loopStats.size())) return false;
         LoopStat &st = loopStats[s->fastLoopId];
-        constexpr uint8_t allStruct = NO_PERIODIC | NO_GUARDED | NO_AFFINE | NO_NESTED |
-                                      NO_POLY_SUM | NO_PERIODIC_POLY | NO_LCG_MOD_SUM;
-        if ((st.structFlags & allStruct) == allStruct) return false;
-        if (!st.everFolded && st.failCount >= 8) {
+        if ((st.structFlags & kAllLoopStructFlags) == kAllLoopStructFlags) return false;
+        if (!callerThrottles && !st.everFolded && st.failCount >= 8) {
             ++st.failCount;
             if ((st.failCount & 255u) != 0u) return false;
         }
