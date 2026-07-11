@@ -1692,10 +1692,17 @@ private:
         int cmp = CMP_LT;
         int32_t step = 0;
     };
+    struct AffinePlanCache {
+        optional<AffineLoopS> loop;
+        vector<pair<int, int32_t>> deps;
+    };
     struct LoopStat {
         uint8_t structFlags = 0;
         uint32_t failCount = 0;
         bool everFolded = false;
+        vector<AffinePlanCache> affinePlans;
+        uint8_t affinePlanMissStreak = 0;
+        bool affinePlansDisabled = false;
     };
     struct Guard {
         int cmp = CMP_LT;
@@ -4482,6 +4489,13 @@ private:
                 auto found = funcs.find(e->name);
                 if (found == funcs.end()) return false;
                 if (e->args.size() != found->second->params.size()) return false;
+                unordered_set<int> changingGlobals;
+                for (auto [key, unused] : idx) {
+                    (void)unused;
+                    if (key & kGlobalBit) changingGlobals.insert(key);
+                }
+                if (!changingGlobals.empty() &&
+                    functionReadsChangingGlobalTransitively(found->second, changingGlobals)) return false;
                 vector<vector<uint32_t>> args;
                 args.reserve(e->args.size());
                 for (size_t i = 0; i < e->args.size(); ++i) {
@@ -6996,8 +7010,8 @@ private:
         return false;
     }
 
-    bool exprReadsChangingGlobalTransitively(const Expr *root,
-                                             const unordered_set<int> &changing) const {
+    bool readsChangingGlobalTransitively(const Expr *root, const Function *rootFunction,
+                                         const unordered_set<int> &changing) const {
         unordered_set<const Function *> visiting;
         function<bool(const Expr *)> scanExpr;
         function<bool(const Stmt *)> scanStmt;
@@ -7032,7 +7046,21 @@ private:
             }
             return false;
         };
+        if (rootFunction) {
+            visiting.insert(rootFunction);
+            return scanStmt(rootFunction->body.get());
+        }
         return scanExpr(root);
+    }
+
+    bool exprReadsChangingGlobalTransitively(const Expr *root,
+                                             const unordered_set<int> &changing) const {
+        return readsChangingGlobalTransitively(root, nullptr, changing);
+    }
+
+    bool functionReadsChangingGlobalTransitively(const Function *root,
+                                                  const unordered_set<int> &changing) const {
+        return root && readsChangingGlobalTransitively(nullptr, root, changing);
     }
 
     bool addHelperSummaryTerm(const Expr *term, int sign, unordered_map<int, PolyS> &aliases,
@@ -7539,28 +7567,125 @@ private:
 
     // ---- fold driver ----
 
-    bool applyAffineLoop(const Stmt *s, const AffineLoopS &loop, int32_t *frame) {
+    bool applyAffineLoop(const Stmt *s, const AffineLoopS &loop, int32_t *frame,
+                         bool &notWorth, uint64_t maxNativeIterations = 0) {
+        notWorth = false;
         tick(32);
         int k = static_cast<int>(loop.vars.size());
         int d = k + 1;
+        uint64_t boundAcc = loop.bound[d - 1];
+        for (int i = 0; i < k; ++i) {
+            uint32_t value = loop.transient.count(loop.vars[i])
+                                 ? 0u
+                                 : static_cast<uint32_t>(readSlot(loop.vars[i], frame));
+            boundAcc += static_cast<uint64_t>(loop.bound[i]) * value;
+        }
+        int32_t bound = static_cast<int32_t>(static_cast<uint32_t>(boundAcc));
+        int32_t induction = loop.transient.count(loop.vars[loop.induction])
+                                ? 0
+                                : readSlot(loop.vars[loop.induction], frame);
+        auto niterOpt = countIterationsMaybe(loop.cmp, loop.step, induction, bound);
+        if (!niterOpt) return false;
+        uint64_t niter = *niterOpt;
+        if (niter == 0) return true;
+        if (niter <= maxNativeIterations) {
+            notWorth = true;
+            return false;
+        }
         vector<uint32_t> v(d, 0);
         for (int i = 0; i < k; ++i) {
             v[i] = loop.transient.count(loop.vars[i]) ? 0u
                                                       : static_cast<uint32_t>(readSlot(loop.vars[i], frame));
         }
         v[d - 1] = 1;
-        uint64_t boundAcc = 0;
-        for (int i = 0; i < d; ++i) boundAcc += static_cast<uint64_t>(loop.bound[i]) * v[i];
-        int32_t bound = static_cast<int32_t>(static_cast<uint32_t>(boundAcc));
-        auto niterOpt = countIterationsMaybe(loop.cmp, loop.step, static_cast<int32_t>(v[loop.induction]), bound);
-        if (!niterOpt) return false;
-        uint64_t niter = *niterOpt;
-        if (niter == 0) return true;
         v = matVec(cachedMatPow(s->fastLoopId, loop.mat, niter), v);
         for (int i = 0; i < k; ++i) {
             if (!loop.transient.count(loop.vars[i])) writeSlot(loop.vars[i], static_cast<int32_t>(v[i]), frame);
         }
         return true;
+    }
+
+    bool collectAffinePlanDeps(const Stmt *s, unordered_set<int> &deps) const {
+        if (!s) return true;
+        if (s->expr) {
+            if (exprHasCallS(s->expr.get())) return false;
+            collectExprVarKeys(s->expr.get(), deps);
+        }
+        if (s->decl && s->decl->init) {
+            if (exprHasCallS(s->decl->init.get())) return false;
+            collectExprVarKeys(s->decl->init.get(), deps);
+        }
+        for (auto &child : s->stmts) {
+            if (!collectAffinePlanDeps(child.get(), deps)) return false;
+        }
+        return collectAffinePlanDeps(s->thenStmt.get(), deps) &&
+               collectAffinePlanDeps(s->elseStmt.get(), deps) &&
+               collectAffinePlanDeps(s->body.get(), deps);
+    }
+
+    const AffineLoopS *findAffinePlan(const LoopStat &st, const int32_t *frame,
+                                      bool &matched, bool &knownUnsupported) const {
+        matched = false;
+        knownUnsupported = false;
+        for (const AffinePlanCache &entry : st.affinePlans) {
+            bool sameValues = true;
+            for (auto [key, value] : entry.deps) {
+                if (readSlot(key, frame) != value) {
+                    sameValues = false;
+                    break;
+                }
+            }
+            if (!sameValues) continue;
+            matched = true;
+            if (!entry.loop) {
+                knownUnsupported = true;
+                return nullptr;
+            }
+            return &*entry.loop;
+        }
+        return nullptr;
+    }
+
+    bool snapshotAffinePlanDeps(const vector<int> &loopVars, const Stmt *s,
+                                const int32_t *frame,
+                                vector<pair<int, int32_t>> &deps) const {
+        unordered_set<int> depSet;
+        if (!collectAffinePlanDeps(s, depSet)) return false;
+        for (int key : loopVars) depSet.erase(key);
+
+        vector<int> keys(depSet.begin(), depSet.end());
+        sort(keys.begin(), keys.end());
+        deps.clear();
+        deps.reserve(keys.size());
+        for (int key : keys) deps.push_back({key, readSlot(key, frame)});
+        return true;
+    }
+
+    const AffineLoopS *rememberAffinePlan(LoopStat &st, const AffineLoopS &loop,
+                                          const Stmt *s, const int32_t *frame) {
+        constexpr size_t maxPlans = 16;
+        if (st.affinePlansDisabled || st.affinePlans.size() >= maxPlans) return nullptr;
+        AffinePlanCache entry;
+        entry.loop = loop;
+        if (!snapshotAffinePlanDeps(loop.vars, s, frame, entry.deps)) return nullptr;
+        st.affinePlans.push_back(std::move(entry));
+        return &*st.affinePlans.back().loop;
+    }
+
+    void rememberUnsupportedAffinePlan(LoopStat &st, const vector<int> &loopVars,
+                                       const Stmt *s, const int32_t *frame) {
+        constexpr size_t maxPlans = 16;
+        if (st.affinePlansDisabled || st.affinePlans.size() >= maxPlans) return;
+        AffinePlanCache entry;
+        if (!snapshotAffinePlanDeps(loopVars, s, frame, entry.deps)) return;
+        st.affinePlans.push_back(std::move(entry));
+    }
+
+    const vector<int> *cachedAffineLoopVars(const LoopStat &st) const {
+        for (const AffinePlanCache &entry : st.affinePlans) {
+            if (entry.loop) return &entry.loop->vars;
+        }
+        return nullptr;
     }
 
     bool tryFoldWhile(const Stmt *s, int32_t *frame, bool callerThrottles = false) {
@@ -7598,22 +7723,52 @@ private:
             if (r == FoldStructFail) st.structFlags |= NO_GUARDED;
         }
         if (!(st.structFlags & NO_AFFINE)) {
-            AffineLoopS loop;
-            FoldRes r = buildAffineLoop(s, loop, frame);
-            if (r == FoldOk) {
-                if (applyAffineLoop(s, loop, frame)) {
-                    st.everFolded = true;
-                    return true;
+            AffineLoopS fresh;
+            bool cacheMatch = false;
+            bool knownUnsupported = false;
+            const AffineLoopS *loop = nullptr;
+            if (!st.affinePlansDisabled) {
+                loop = findAffinePlan(st, frame, cacheMatch, knownUnsupported);
+                if (cacheMatch) {
+                    st.affinePlanMissStreak = 0;
+                } else if (st.affinePlans.size() >= 16) {
+                    if (++st.affinePlanMissStreak >= 16) st.affinePlansDisabled = true;
                 }
-            } else if (r == FoldStructFail) {
-                st.structFlags |= NO_AFFINE;
+            }
+            if (!knownUnsupported) {
+                FoldRes r = FoldOk;
+                if (!loop) {
+                    r = buildAffineLoop(s, fresh, frame);
+                    if (r == FoldOk) {
+                        loop = rememberAffinePlan(st, fresh, s, frame);
+                        if (!loop) loop = &fresh;
+                    }
+                }
+                if (r == FoldOk && loop) {
+                    bool notWorth = false;
+                    uint64_t maxNativeIterations = loop == &fresh ? 0 : 8;
+                    if (applyAffineLoop(s, *loop, frame, notWorth, maxNativeIterations)) {
+                        st.everFolded = true;
+                        return true;
+                    }
+                    if (notWorth) return false;
+                } else if (r == FoldStructFail) {
+                    if (const vector<int> *vars = cachedAffineLoopVars(st)) {
+                        if (!st.affinePlansDisabled) {
+                            rememberUnsupportedAffinePlan(st, *vars, s, frame);
+                        }
+                    } else {
+                        st.structFlags |= NO_AFFINE;
+                    }
+                }
             }
         }
         if (!(st.structFlags & NO_NESTED)) {
             AffineLoopS loop;
             FoldRes r = buildNestedAffineLoop(s, loop, frame);
             if (r == FoldOk) {
-                if (applyAffineLoop(s, loop, frame)) {
+                bool notWorth = false;
+                if (applyAffineLoop(s, loop, frame, notWorth)) {
                     st.everFolded = true;
                     return true;
                 }
