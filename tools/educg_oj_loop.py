@@ -31,12 +31,14 @@ BUSY_KEYWORDS = ("正在", "等待", "队列", "排队", "处理中", "编译中
 TERMINAL_ERROR_KEYWORDS = (
     "Git Clone 时发生错误",
     "failed to clone",
+    "评测服务器连接失败",
     "鉴权失败",
     "could not read Username",
     "编译器异常",
 )
 RETRYABLE_TERMINAL_KEYWORDS = (
     "Git Clone 时发生错误",
+    "评测服务器连接失败",
     "Failed to connect to github.com",
     "连接超时",
     "Empty reply from server",
