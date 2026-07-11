@@ -6845,6 +6845,212 @@ private:
         return true;
     }
 
+    bool sumQuadraticModExprWithPolyAliases(const Expr *e, unordered_map<int, PolyS> &aliases,
+                                            const int32_t *frame, uint64_t niter,
+                                            uint32_t &out) const {
+        if (!e || e->kind != Expr::Kind::Binary || e->opc != OPC_MOD) return false;
+        int32_t modv = 0;
+        if (!evalPolyAliasConstExpr(e->rhs.get(), aliases, frame, 0, modv) || modv == 0) return false;
+        if (!e->lhs || e->lhs->kind != Expr::Kind::Binary || e->lhs->opc != OPC_MUL) return false;
+        PolyS a, b;
+        if (!polyExprFromAliases(e->lhs->lhs.get(), aliases, frame, a, 0) ||
+            !polyExprFromAliases(e->lhs->rhs.get(), aliases, frame, b, 0)) return false;
+        for (int i = 0; i < 4; ++i) {
+            if (a.c[i] != b.c[i]) return false;
+        }
+        if (a.c[2] != 0 || a.c[3] != 0) return false;
+        out = runQuadraticModLoop(niter, a.c[0], a.c[1], modv);
+        return true;
+    }
+
+    bool exprReferencesHelperExtra(const Expr *e,
+                                   const unordered_map<int, uint32_t> &extraByKey) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var && extraByKey.count(exprSlotKey(e))) return true;
+        if (exprReferencesHelperExtra(e->lhs.get(), extraByKey) ||
+            exprReferencesHelperExtra(e->rhs.get(), extraByKey)) return true;
+        for (auto &arg : e->args) {
+            if (exprReferencesHelperExtra(arg.get(), extraByKey)) return true;
+        }
+        return false;
+    }
+
+    bool stmtReadsChangingGlobal(const Stmt *root, const unordered_set<int> &changing) const {
+        unordered_set<const Function *> visiting;
+        function<bool(const Expr *)> scanExpr;
+        function<bool(const Stmt *)> scanStmt;
+        scanExpr = [&](const Expr *e) {
+            if (!e) return false;
+            if (e->kind == Expr::Kind::Var) {
+                int key = exprSlotKey(e);
+                return static_cast<bool>((key & kGlobalBit) && changing.count(key));
+            }
+            if (scanExpr(e->lhs.get()) || scanExpr(e->rhs.get())) return true;
+            for (auto &arg : e->args) {
+                if (scanExpr(arg.get())) return true;
+            }
+            if (e->kind == Expr::Kind::Call) {
+                auto found = funcs.find(e->name);
+                if (found != funcs.end() && found->second && visiting.insert(found->second).second) {
+                    bool reads = scanStmt(found->second->body.get());
+                    visiting.erase(found->second);
+                    if (reads) return true;
+                }
+            }
+            return false;
+        };
+        scanStmt = [&](const Stmt *s) {
+            if (!s) return false;
+            if (scanExpr(s->expr.get())) return true;
+            if (s->decl && scanExpr(s->decl->init.get())) return true;
+            if (scanStmt(s->thenStmt.get()) || scanStmt(s->elseStmt.get()) ||
+                scanStmt(s->body.get())) return true;
+            for (auto &child : s->stmts) {
+                if (scanStmt(child.get())) return true;
+            }
+            return false;
+        };
+        return scanStmt(root);
+    }
+
+    bool addHelperSummaryTerm(const Expr *term, int sign, unordered_map<int, PolyS> &aliases,
+                              const int32_t *frame, uint64_t niter, PolyS &polyDelta,
+                              uint32_t &extra) const {
+        PolyS p;
+        if (polyExprFromAliases(term, aliases, frame, p, 0)) {
+            if (sign < 0) p = polyNeg(p);
+            polyDelta = polyAdd(polyDelta, p);
+            return true;
+        }
+        uint32_t sum = 0;
+        if (sumQuadraticModExprWithPolyAliases(term, aliases, frame, niter, sum)) {
+            extra += sign < 0 ? 0u - sum : sum;
+            return true;
+        }
+        return false;
+    }
+
+    bool processHelperSummaryStmt(const Stmt *s, unordered_map<int, PolyS> &aliases,
+                                  unordered_map<int, uint32_t> &extraByKey,
+                                  const int32_t *frame, uint64_t niter) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!processHelperSummaryStmt(child.get(), aliases, extraByKey, frame, niter)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
+                if (!s->decl || !s->decl->init) return false;
+                if (exprReferencesHelperExtra(s->decl->init.get(), extraByKey)) return false;
+                PolyS p;
+                if (!polyExprFromAliases(s->decl->init.get(), aliases, frame, p, 0)) return false;
+                aliases[s->decl->fastSlot] = p;
+                extraByKey.erase(s->decl->fastSlot);
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
+                int key = assignSlotKey(s);
+                if (key & kGlobalBit) return false;
+                PolyS p;
+                bool referencesExtra = exprReferencesHelperExtra(s->expr.get(), extraByKey);
+                if (!referencesExtra && polyExprFromAliases(s->expr.get(), aliases, frame, p, 0)) {
+                    aliases[key] = p;
+                    extraByKey.erase(key);
+                    return true;
+                }
+                int accCoeff = 0;
+                vector<pair<int, const Expr *>> terms;
+                if (!collectAccumDeltaTerms(s->expr.get(), key, 1, accCoeff, terms) || accCoeff != 1) return false;
+                PolyS next = aliases.count(key) ? aliases[key] : polyConst(0);
+                uint32_t extra = 0;
+                for (auto &piece : terms) {
+                    if (exprReferencesHelperExtra(piece.second, extraByKey)) return false;
+                    if (!addHelperSummaryTerm(piece.second, piece.first, aliases, frame, niter, next, extra)) {
+                        return false;
+                    }
+                }
+                aliases[key] = next;
+                extraByKey[key] += extra;
+                return true;
+            }
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                if (exprReferencesHelperExtra(s->expr.get(), extraByKey)) return false;
+                if (!evalPolyAliasConstExpr(s->expr.get(), aliases, frame, 0, cond)) return false;
+                return truthy(cond)
+                    ? processHelperSummaryStmt(s->thenStmt.get(), aliases, extraByKey, frame, niter)
+                    : processHelperSummaryStmt(s->elseStmt.get(), aliases, extraByKey, frame, niter);
+            }
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            default:
+                return false;
+        }
+    }
+
+    bool sumPureLoopHelperCall(const Expr *e, int indKey, int32_t startIv, int32_t offset,
+                               int32_t step, uint64_t niter, const unordered_set<int> &changing,
+                               const int32_t *frame, uint32_t &out) const {
+        if (!e || e->kind != Expr::Kind::Call) return false;
+        auto found = funcs.find(e->name);
+        if (found == funcs.end() || !found->second || found->second->returnsVoid ||
+            e->args.size() != found->second->params.size()) return false;
+
+        unordered_map<int, PolyS> aliases;
+        unordered_map<int, PolyS> noAliases;
+        int64_t base = static_cast<int64_t>(startIv) + static_cast<int64_t>(offset);
+        for (size_t i = 0; i < e->args.size(); ++i) {
+            PolyS p;
+            if (!polyExpr(e->args[i].get(), indKey, base, step, changing, noAliases, frame, p)) return false;
+            aliases[static_cast<int>(i)] = p;
+        }
+
+        const Stmt *body = found->second->body.get();
+        if (!body || body->kind != Stmt::Kind::Block) return false;
+        if (stmtReadsChangingGlobal(body, changing)) return false;
+        unordered_map<int, uint32_t> extraByKey;
+        for (auto &child : body->stmts) {
+            if (!child || child->kind == Stmt::Kind::Empty) continue;
+            if (child->kind == Stmt::Kind::Return) {
+                if (!child->expr) return false;
+                if (child->expr->kind == Expr::Kind::Var) {
+                    int key = exprSlotKey(child->expr.get());
+                    auto it = aliases.find(key);
+                    if (it == aliases.end()) return false;
+                    out = sumPoly(it->second, niter) + extraByKey[key];
+                    return true;
+                }
+                if (exprReferencesHelperExtra(child->expr.get(), extraByKey)) return false;
+                PolyS p;
+                if (!polyExprFromAliases(child->expr.get(), aliases, frame, p, 0)) return false;
+                out = sumPoly(p, niter);
+                return true;
+            }
+            if (child->kind == Stmt::Kind::While) {
+                bool stopped = false;
+                for (int iter = 0; iter < 10000; ++iter) {
+                    int32_t cond = 0;
+                    if (exprReferencesHelperExtra(child->expr.get(), extraByKey)) return false;
+                    if (!evalPolyAliasConstExpr(child->expr.get(), aliases, frame, 0, cond)) return false;
+                    if (!truthy(cond)) {
+                        stopped = true;
+                        break;
+                    }
+                    if (!processHelperSummaryStmt(child->body.get(), aliases, extraByKey, frame, niter)) return false;
+                }
+                if (!stopped) return false;
+                continue;
+            }
+            if (!processHelperSummaryStmt(child.get(), aliases, extraByKey, frame, niter)) return false;
+        }
+        return false;
+    }
+
     bool collectIfPeriodicModuli(const Stmt *s, int indKey, int32_t startIv, int32_t step,
                                  const unordered_set<int> &changing, const int32_t *frame,
                                  vector<int32_t> &mods, bool &sawIf) const {
@@ -6983,7 +7189,9 @@ private:
                     if (polyExpr(term, indKey, base, ctx.qStep, changing, ctx.aliases, frame, p)) {
                         sum = sumPoly(p, ctx.count);
                     } else if (ctx.aliases.empty() &&
-                               (sumQuadraticModExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
+                               (sumPureLoopHelperCall(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
+                                                      ctx.count, changing, frame, sum) ||
+                                sumQuadraticModExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                     ctx.count, changing, frame, sum) ||
                                 sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                       ctx.count, changing, frame, sum) ||
@@ -7175,7 +7383,8 @@ private:
                     deltas[key] = polyAdd(deltas[key], p);
                 } else if (aliases.empty()) {
                     uint32_t sum = 0;
-                    if (sumQuadraticModExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
+                    if (sumPureLoopHelperCall(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
+                        sumQuadraticModExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumStrictPeriodicExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumLinearDivExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum)) {
                         periodicDeltas[key] += sign < 0 ? 0u - sum : sum;
@@ -7340,6 +7549,16 @@ static bool exprHasCall(const Expr *e) {
     return false;
 }
 
+static bool exprUsesOnlyVars(const Expr *e, const unordered_set<string> &allowed) {
+    if (!e) return true;
+    if (e->kind == Expr::Kind::Var && !allowed.count(e->name)) return false;
+    if (!exprUsesOnlyVars(e->lhs.get(), allowed) || !exprUsesOnlyVars(e->rhs.get(), allowed)) return false;
+    for (auto &arg : e->args) {
+        if (!exprUsesOnlyVars(arg.get(), allowed)) return false;
+    }
+    return true;
+}
+
 static optional<int32_t> foldConstExpr(const Expr *e) {
     if (!e) return nullopt;
     switch (e->kind) {
@@ -7466,6 +7685,8 @@ private:
             if (!body || body->kind != Stmt::Kind::Block || body->stmts.size() != 1) continue;
             const Stmt *ret = body->stmts[0].get();
             if (ret->kind != Stmt::Kind::Return || !ret->expr || exprHasCall(ret->expr.get())) continue;
+            unordered_set<string> params(item.func->params.begin(), item.func->params.end());
+            if (!exprUsesOnlyVars(ret->expr.get(), params)) continue;
             inlineableFuncs[item.func->name] = item.func.get();
         }
     }
@@ -7573,12 +7794,9 @@ private:
             case Expr::Kind::Number:
                 return;
             case Expr::Kind::Var: {
-                if (auto v = lookupLocalConst(e->name)) {
-                    e = makeNumberExpr(*v);
-                    return;
-                }
-                if (LocalInfo *info = findLocal(e->name); info && !info->copyOf.empty()) {
-                    e->name = info->copyOf;  // copy propagation
+                if (LocalInfo *info = findLocal(e->name)) {
+                    if (info->constVal) e = makeNumberExpr(*info->constVal);
+                    else if (!info->copyOf.empty()) e->name = info->copyOf;  // copy propagation
                     return;
                 }
                 auto g = globalConsts.find(e->name);
@@ -8747,7 +8965,10 @@ private:
                 if (!item.func->returnsVoid && body && body->kind == Stmt::Kind::Block &&
                     body->stmts.size() == 1 && body->stmts[0]->kind == Stmt::Kind::Return &&
                     body->stmts[0]->expr && !exprHasCall(body->stmts[0]->expr.get())) {
-                    inlineableFuncs[item.func->name] = item.func.get();
+                    unordered_set<string> params(item.func->params.begin(), item.func->params.end());
+                    if (exprUsesOnlyVars(body->stmts[0]->expr.get(), params)) {
+                        inlineableFuncs[item.func->name] = item.func.get();
+                    }
                 }
             }
         }
@@ -9896,7 +10117,8 @@ private:
             }
         }
         static const vector<string> tailTemps = {"t0", "t1", "t2", "t3", "t4", "t5"};
-        if (!argsHaveCall && n <= static_cast<int>(tailTemps.size())) {
+        // Division and modulo strength reduction can require two scratch registers.
+        if (!argsHaveCall && n + 2 <= static_cast<int>(tailTemps.size())) {
             for (int i = 0; i < n; ++i) {
                 vector<string> regs;
                 for (int j = 0; j < static_cast<int>(tailTemps.size()); ++j) {
