@@ -17,8 +17,9 @@ The build creates an executable named `main`.
 ./main < input.tc > output.s
 ```
 
-The optional `-opt` argument is accepted by the judge command line contract but
-is currently ignored by this implementation.
+The optional `-opt` argument selects the performance pipeline, including
+bounded whole-program partial evaluation, loop summarization, and optimized
+RISC-V32 fallback code generation.
 
 ## Implemented Language Coverage
 
@@ -33,14 +34,17 @@ is currently ignored by this implementation.
 - Short-circuit code generation for `&&` and `||`.
 - Constant expression folding plus immediate-form code generation for common
   arithmetic, equality, and comparison expressions.
-- A function-level AST optimization pass with local alpha-renaming, constant
-  propagation, copy propagation, conservative dead-code elimination, and
-  constant `if` / `while(0)` simplification.
+- A function-level AST optimization pass with lexically scoped constant and
+  copy propagation, common-subexpression elimination, loop-invariant code
+  motion, conservative dead-code elimination, and constant control-flow
+  simplification.
 - Register-based expression evaluation for call-free expressions, avoiding most
   temporary stack traffic in loop bodies.
-- Simple local variable allocation to `s1`-`s11`, reducing repeated stack loads
-  and stores for loop variables and accumulators.
+- Loop-depth-weighted allocation of hot variables and constants to `s1`-`s11`,
+  reducing stack traffic and repeated immediate materialization.
 - Direct conditional branches for `if` and `while` comparisons.
+- Strength reduction for division and modulo by positive constants, plus
+  branch-helper inlining on the RISC-V32 path.
 - Tail-recursive self calls are rewritten into parameter updates plus a jump.
 
 ## Notes
