@@ -10757,6 +10757,9 @@ private:
     unordered_map<string, Function *> inlineableFuncs;
     unordered_map<string, Function *> branchInlineableFuncs;
     unordered_map<string, Function *> loopInlineableFuncs;
+    unordered_map<string, vector<int>> loopInlineRegisterSlots;
+    unordered_set<string> writableGlobalNames;
+    int globalSlotCount = 0;
     unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
@@ -10779,6 +10782,8 @@ private:
     int nextVarReg = 0;
     int localBaseOffset = -12;
     int frameSize = 0;
+    int loopInlineScratchBaseOffset = 0;
+    int loopInlineScratchSlots = 0;
     bool frameFreeLeaf = false;
 
     static int alignTo(int x, int a) { return (x + a - 1) / a * a; }
@@ -10875,33 +10880,39 @@ private:
         InlineContinue = 8u,
     };
 
-    bool loopInlineExprShape(const Expr *e, int &nodes) const {
+    bool loopInlineExprShape(const Expr *e, int localCount, int &nodes) const {
         if (!e) return true;
-        if (++nodes > 128 || e->kind == Expr::Kind::Call) return false;
-        if (!loopInlineExprShape(e->lhs.get(), nodes) ||
-            !loopInlineExprShape(e->rhs.get(), nodes)) {
+        if (++nodes > 256 || e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Var) {
+            if (e->fastIndex < 0) return false;
+            if (e->fastGlobal) return e->fastIndex < globalSlotCount;
+            return e->fastIndex < localCount;
+        }
+        if (!loopInlineExprShape(e->lhs.get(), localCount, nodes) ||
+            !loopInlineExprShape(e->rhs.get(), localCount, nodes)) {
             return false;
         }
         for (auto &arg : e->args) {
-            if (!loopInlineExprShape(arg.get(), nodes)) return false;
+            if (!loopInlineExprShape(arg.get(), localCount, nodes)) return false;
         }
         return true;
     }
 
-    bool loopInlineStmtShape(const Stmt *s, int loopDepth, int &nodes,
+    bool loopInlineStmtShape(const Stmt *s, int loopDepth, int localCount,
+                             const unordered_set<int> &mutableSlots, int &nodes,
                              bool &hasLoop, unsigned &flow) const {
         if (!s) {
             flow = InlineFallthrough;
             return true;
         }
-        if (++nodes > 128) return false;
+        if (++nodes > 256) return false;
         switch (s->kind) {
             case Stmt::Kind::Block: {
                 unsigned aggregate = InlineFallthrough;
                 for (auto &child : s->stmts) {
                     unsigned childFlow = 0;
-                    if (!loopInlineStmtShape(child.get(), loopDepth, nodes, hasLoop,
-                                             childFlow)) {
+                    if (!loopInlineStmtShape(child.get(), loopDepth, localCount,
+                                             mutableSlots, nodes, hasLoop, childFlow)) {
                         return false;
                     }
                     if (aggregate & InlineFallthrough) {
@@ -10915,45 +10926,55 @@ private:
                 flow = InlineFallthrough;
                 return true;
             case Stmt::Kind::ExprStmt:
-                if (!loopInlineExprShape(s->expr.get(), nodes)) return false;
+                if (!loopInlineExprShape(s->expr.get(), localCount, nodes)) return false;
                 flow = InlineFallthrough;
                 return true;
             case Stmt::Kind::DeclStmt:
-                if (!s->decl || !s->decl->init ||
-                    !loopInlineExprShape(s->decl->init.get(), nodes)) {
+                if (!s->decl || !s->decl->init || s->decl->fastSlot < 0 ||
+                    s->decl->fastSlot >= localCount ||
+                    !loopInlineExprShape(s->decl->init.get(), localCount, nodes)) {
                     return false;
                 }
                 flow = InlineFallthrough;
                 return true;
             case Stmt::Kind::Assign:
-                if (s->fastAssignGlobal ||
-                    !loopInlineExprShape(s->expr.get(), nodes)) {
+                if (s->fastAssignIndex < 0 ||
+                    !loopInlineExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                if (s->fastAssignGlobal) {
+                    if (s->fastAssignIndex >= globalSlotCount ||
+                        !writableGlobalNames.count(s->name)) {
+                        return false;
+                    }
+                } else if (s->fastAssignIndex >= localCount ||
+                           !mutableSlots.count(s->fastAssignIndex)) {
                     return false;
                 }
                 flow = InlineFallthrough;
                 return true;
             case Stmt::Kind::If: {
-                if (!loopInlineExprShape(s->expr.get(), nodes)) return false;
+                if (!loopInlineExprShape(s->expr.get(), localCount, nodes)) return false;
                 unsigned thenFlow = 0;
                 unsigned elseFlow = InlineFallthrough;
-                if (!loopInlineStmtShape(s->thenStmt.get(), loopDepth, nodes, hasLoop,
-                                         thenFlow)) {
+                if (!loopInlineStmtShape(s->thenStmt.get(), loopDepth, localCount,
+                                         mutableSlots, nodes, hasLoop, thenFlow)) {
                     return false;
                 }
                 if (s->elseStmt &&
-                    !loopInlineStmtShape(s->elseStmt.get(), loopDepth, nodes, hasLoop,
-                                         elseFlow)) {
+                    !loopInlineStmtShape(s->elseStmt.get(), loopDepth, localCount,
+                                         mutableSlots, nodes, hasLoop, elseFlow)) {
                     return false;
                 }
                 flow = thenFlow | elseFlow;
                 return true;
             }
             case Stmt::Kind::While: {
-                if (!loopInlineExprShape(s->expr.get(), nodes)) return false;
+                if (!loopInlineExprShape(s->expr.get(), localCount, nodes)) return false;
                 hasLoop = true;
                 unsigned bodyFlow = 0;
-                if (!loopInlineStmtShape(s->body.get(), loopDepth + 1, nodes, hasLoop,
-                                         bodyFlow)) {
+                if (!loopInlineStmtShape(s->body.get(), loopDepth + 1, localCount,
+                                         mutableSlots, nodes, hasLoop, bodyFlow)) {
                     return false;
                 }
                 // The condition may initially be false, and a break may leave
@@ -10971,7 +10992,9 @@ private:
                 flow = InlineContinue;
                 return true;
             case Stmt::Kind::Return:
-                if (!s->expr || !loopInlineExprShape(s->expr.get(), nodes)) return false;
+                if (!s->expr || !loopInlineExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
                 flow = InlineReturn;
                 return true;
         }
@@ -11034,6 +11057,13 @@ private:
     }
 
     void collectFunctions() {
+        writableGlobalNames.clear();
+        globalSlotCount = 0;
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Decl) continue;
+            ++globalSlotCount;
+            if (!item.decl->isConst) writableGlobalNames.insert(item.decl->name);
+        }
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
                 Function *function = item.func.get();
@@ -11058,11 +11088,41 @@ private:
                     nodes = 0;
                     bool hasLoop = false;
                     unsigned flow = 0;
+                    unordered_set<int> mutableSlots;
+                    for (int slot = 0; slot < static_cast<int>(function->params.size());
+                         ++slot) {
+                        mutableSlots.insert(slot);
+                    }
+                    std::function<void(const Stmt *)> collectMutableSlots = [&](const Stmt *stmt) {
+                        if (!stmt) return;
+                        if (stmt->kind == Stmt::Kind::DeclStmt && stmt->decl &&
+                            !stmt->decl->isConst) {
+                            mutableSlots.insert(stmt->decl->fastSlot);
+                        }
+                        for (auto &child : stmt->stmts) collectMutableSlots(child.get());
+                        collectMutableSlots(stmt->thenStmt.get());
+                        collectMutableSlots(stmt->elseStmt.get());
+                        collectMutableSlots(stmt->body.get());
+                    };
+                    collectMutableSlots(body);
                     if (function->fastLocalCount >= static_cast<int>(function->params.size()) &&
-                        function->fastLocalCount <= 7 &&
-                        loopInlineStmtShape(body, 0, nodes, hasLoop, flow) && hasLoop &&
-                        flow == InlineReturn) {
+                        function->fastLocalCount <= 32 &&
+                        loopInlineStmtShape(body, 0, function->fastLocalCount,
+                                            mutableSlots, nodes, hasLoop, flow) &&
+                        hasLoop && flow == InlineReturn) {
                         loopInlineableFuncs[function->name] = function;
+                        vector<uint64_t> weights(
+                            static_cast<size_t>(function->fastLocalCount), 0);
+                        collectSlotUses(body, 0, weights);
+                        vector<int> ranked(mutableSlots.begin(), mutableSlots.end());
+                        sort(ranked.begin(), ranked.end(), [&](int lhs, int rhs) {
+                            uint64_t lhsWeight = weights[static_cast<size_t>(lhs)];
+                            uint64_t rhsWeight = weights[static_cast<size_t>(rhs)];
+                            if (lhsWeight != rhsWeight) return lhsWeight > rhsWeight;
+                            return lhs < rhs;
+                        });
+                        if (ranked.size() > 7) ranked.resize(7);
+                        loopInlineRegisterSlots[function->name] = std::move(ranked);
                     }
                 }
             }
@@ -11296,6 +11356,35 @@ private:
         return result;
     }
 
+    int maxLoopInlineScratch(const Expr *e) const {
+        if (!e) return 0;
+        int result = 0;
+        if (e->kind == Expr::Kind::Call) {
+            auto found = loopInlineableFuncs.find(e->name);
+            if (found != loopInlineableFuncs.end() &&
+                e->args.size() == found->second->params.size()) {
+                bool eligibleArgs = true;
+                for (auto &arg : e->args) eligibleArgs = eligibleArgs && !hasCall(arg.get());
+                if (eligibleArgs) result = found->second->fastLocalCount;
+            }
+        }
+        result = max(result, maxLoopInlineScratch(e->lhs.get()));
+        result = max(result, maxLoopInlineScratch(e->rhs.get()));
+        for (auto &arg : e->args) result = max(result, maxLoopInlineScratch(arg.get()));
+        return result;
+    }
+
+    int maxLoopInlineScratch(const Stmt *s) const {
+        if (!s) return 0;
+        int result = maxLoopInlineScratch(s->expr.get());
+        if (s->decl) result = max(result, maxLoopInlineScratch(s->decl->init.get()));
+        for (auto &child : s->stmts) result = max(result, maxLoopInlineScratch(child.get()));
+        result = max(result, maxLoopInlineScratch(s->thenStmt.get()));
+        result = max(result, maxLoopInlineScratch(s->elseStmt.get()));
+        result = max(result, maxLoopInlineScratch(s->body.get()));
+        return result;
+    }
+
     bool stmtAlwaysJumps(const Stmt *s) const {
         if (!s) return false;
         switch (s->kind) {
@@ -11393,6 +11482,26 @@ private:
         hoistScanBranchInlineStmt(s->elseStmt.get(), mult, w);
     }
 
+    void hoistScanLoopInlineStmt(const Stmt *s, int loopDepth, long long outerMult,
+                                 unordered_map<long long, long long> &w) const {
+        if (!s || s->fastDeadStore) return;
+        long long mult = outerMult * (1LL << (3 * min(loopDepth, 7)));
+        if (s->kind == Stmt::Kind::While) {
+            long long inner = outerMult * (1LL << (3 * min(loopDepth + 1, 7)));
+            hoistScanExpr(s->expr.get(), inner, w);
+            hoistScanLoopInlineStmt(s->body.get(), loopDepth + 1, outerMult, w);
+            return;
+        }
+        if (s->expr) hoistScanExpr(s->expr.get(), mult, w);
+        if (s->decl && s->decl->init) hoistScanExpr(s->decl->init.get(), mult, w);
+        for (auto &child : s->stmts) {
+            hoistScanLoopInlineStmt(child.get(), loopDepth, outerMult, w);
+        }
+        hoistScanLoopInlineStmt(s->thenStmt.get(), loopDepth, outerMult, w);
+        hoistScanLoopInlineStmt(s->elseStmt.get(), loopDepth, outerMult, w);
+        hoistScanLoopInlineStmt(s->body.get(), loopDepth, outerMult, w);
+    }
+
     void hoistScanExpr(const Expr *e, long long mult, unordered_map<long long, long long> &w) const {
         if (!e) return;
         if (e->kind == Expr::Kind::Call) {
@@ -11402,6 +11511,15 @@ private:
                 bool pureArgs = true;
                 for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
                 if (pureArgs) hoistScanBranchInlineStmt(branch->second->body.get(), mult, w);
+            }
+            auto loop = loopInlineableFuncs.find(e->name);
+            if (loop != loopInlineableFuncs.end()) {
+                bool pureArgs = true;
+                for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
+                if (pureArgs) {
+                    hoistScanLoopInlineStmt(loop->second->body.get(), 0,
+                                            max(1LL, mult), w);
+                }
             }
             return;
         }
@@ -11582,6 +11700,7 @@ private:
 
     void genFunction(Function &f) {
         int slots = countSlots(f);
+        loopInlineScratchSlots = maxLoopInlineScratch(f.body.get());
         static const vector<string> allSavedRegs = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
         };
@@ -11677,10 +11796,13 @@ private:
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
         frameSize = frameFreeLeaf
             ? 0
-            : alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
+            : alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 +
+                          (slots + loopInlineScratchSlots) * 4,
+                      16);
         nextSlot = 0;
         nextVarReg = 0;
         localBaseOffset = -12 - static_cast<int>(savedVarRegs.size()) * 4;
+        loopInlineScratchBaseOffset = localBaseOffset - slots * 4;
         scopes.clear();
         breakLabels.clear();
         continueLabels.clear();
@@ -12810,20 +12932,37 @@ private:
         }
     }
 
-    static string loopInlineSlotReg(int slot) {
+    static string loopInlineRegister(int rank) {
         static const vector<string> regs = {"a1", "a2", "a3", "a4", "a5", "a6", "a7"};
-        return slot >= 0 && slot < static_cast<int>(regs.size())
-            ? regs[static_cast<size_t>(slot)]
+        return rank >= 0 && rank < static_cast<int>(regs.size())
+            ? regs[static_cast<size_t>(rank)]
             : string();
     }
 
-    void genInlineLoopStmt(const Stmt *s, const string &endLabel) {
+    unordered_map<int, Symbol> loopInlineSlotHomes(const Function &function) const {
+        unordered_map<int, Symbol> homes;
+        auto ranked = loopInlineRegisterSlots.find(function.name);
+        if (ranked == loopInlineRegisterSlots.end()) return homes;
+        for (int slot = 0; slot < function.fastLocalCount; ++slot) {
+            homes[slot] = Symbol{false, 0, false, "",
+                                 loopInlineScratchBaseOffset - slot * 4, ""};
+        }
+        for (size_t rank = 0; rank < ranked->second.size(); ++rank) {
+            int slot = ranked->second[rank];
+            auto found = homes.find(slot);
+            if (found != homes.end()) found->second.reg = loopInlineRegister(rank);
+        }
+        return homes;
+    }
+
+    void genInlineLoopStmt(const Stmt *s, const string &endLabel,
+                           const unordered_map<int, Symbol> &slotHomes) {
         if (!s) return;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 enterScope();
                 for (auto &child : s->stmts) {
-                    genInlineLoopStmt(child.get(), endLabel);
+                    genInlineLoopStmt(child.get(), endLabel, slotHomes);
                     if (stmtAlwaysJumps(child.get())) break;
                 }
                 leaveScope();
@@ -12838,30 +12977,36 @@ private:
                     scopes.back()[decl.name] = Symbol{true, value, false, "", 0, ""};
                     return;
                 }
-                string reg = loopInlineSlotReg(decl.fastSlot);
-                if (reg.empty()) throw logic_error("invalid loop-inline local slot");
-                scopes.back()[decl.name] = Symbol{false, 0, false, "", 0, reg};
-                genExprNoCall(decl.init.get(), reg, {"t0", "t1", "t2", "t3", "t4", "t5"});
+                auto home = slotHomes.find(decl.fastSlot);
+                if (home == slotHomes.end() || home->second.isConst ||
+                    home->second.isGlobal) {
+                    throw logic_error("invalid loop-inline local slot");
+                }
+                scopes.back()[decl.name] = home->second;
+                genExprNoCall(decl.init.get(), "a0",
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                storeVarFrom(decl.name, "a0");
                 return;
             }
             case Stmt::Kind::Assign: {
                 auto symbol = lookup(s->name);
-                if (!symbol || symbol->isConst || symbol->isGlobal || symbol->reg.empty()) {
+                if (!symbol || symbol->isConst) {
                     throw logic_error("invalid loop-inline assignment");
                 }
-                genExprNoCall(s->expr.get(), symbol->reg,
+                genExprNoCall(s->expr.get(), "a0",
                               {"t0", "t1", "t2", "t3", "t4", "t5"});
+                storeVarFrom(s->name, "a0");
                 return;
             }
             case Stmt::Kind::If: {
                 string elseLabel = newLabel("loop_inline_else");
                 string afterLabel = newLabel("loop_inline_endif");
                 genCondFalse(s->expr.get(), elseLabel);
-                genInlineLoopStmt(s->thenStmt.get(), endLabel);
+                genInlineLoopStmt(s->thenStmt.get(), endLabel, slotHomes);
                 if (s->elseStmt) {
                     emit("j " + afterLabel);
                     emitLabel(elseLabel);
-                    genInlineLoopStmt(s->elseStmt.get(), endLabel);
+                    genInlineLoopStmt(s->elseStmt.get(), endLabel, slotHomes);
                     emitLabel(afterLabel);
                 } else {
                     emitLabel(elseLabel);
@@ -12878,7 +13023,7 @@ private:
                 emitLabel(bodyLabel);
                 breakLabels.push_back(afterLabel);
                 continueLabels.push_back(condLabel);
-                genInlineLoopStmt(s->body.get(), endLabel);
+                genInlineLoopStmt(s->body.get(), endLabel, slotHomes);
                 continueLabels.pop_back();
                 breakLabels.pop_back();
                 emitLabel(condLabel);
@@ -12910,37 +13055,33 @@ private:
         Function *function = found->second;
         if (e->args.size() != function->params.size()) return false;
         for (auto &arg : e->args) {
-            // The existing call ABI path owns the sequencing rules for nested
-            // calls. Keeping loop-inline arguments call-free also ensures the
-            // a1-a7 helper homes cannot be clobbered during materialization.
             if (hasCall(arg.get())) return false;
         }
 
-        // Evaluate every argument exactly once before any helper slot becomes
-        // visible. A temporary stack home keeps later argument evaluation from
-        // clobbering earlier values through a1-a7 scratch allocation.
-        for (auto &arg : e->args) {
-            genExprNoCall(arg.get(), "a0", {"t0", "t1", "t2", "t3", "t4", "t5"});
-            pushA0();
+        unordered_map<int, Symbol> slotHomes = loopInlineSlotHomes(*function);
+        if (static_cast<int>(slotHomes.size()) != function->fastLocalCount) {
+            return false;
         }
         for (size_t i = 0; i < e->args.size(); ++i) {
-            int offset = 16 * (static_cast<int>(e->args.size()) - 1 - static_cast<int>(i)) + 12;
-            loadMem("t0", "sp", offset);
-            string reg = loopInlineSlotReg(static_cast<int>(i));
-            if (reg.empty()) return false;
-            emit("mv " + reg + ", t0");
+            const Symbol &home = slotHomes[static_cast<int>(i)];
+            if (!home.reg.empty()) {
+                genExprNoCall(e->args[i].get(), home.reg,
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+            } else {
+                genExprNoCall(e->args[i].get(), "a0",
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                storeMem("a0", "s0", home.offset);
+            }
         }
-        adjustSp(16 * static_cast<int>(e->args.size()));
 
         auto callerScopes = std::move(scopes);
         scopes.clear();
         enterScope();
         for (size_t i = 0; i < function->params.size(); ++i) {
-            scopes.back()[function->params[i]] =
-                Symbol{false, 0, false, "", 0, loopInlineSlotReg(static_cast<int>(i))};
+            scopes.back()[function->params[i]] = slotHomes[static_cast<int>(i)];
         }
         string endLabel = newLabel("loop_inline_return");
-        genInlineLoopStmt(function->body.get(), endLabel);
+        genInlineLoopStmt(function->body.get(), endLabel, slotHomes);
         emitLabel(endLabel);
         leaveScope();
         scopes = std::move(callerScopes);
