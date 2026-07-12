@@ -10773,6 +10773,14 @@ private:
     int varRegCap = 0;
     unordered_map<long long, string> constRegMap;
     vector<pair<long long, string>> hoistedConsts;
+    struct CachedGlobal {
+        string name;
+        string label;
+        string reg;
+        bool written = false;
+    };
+    vector<CachedGlobal> cachedGlobals;
+    unordered_map<string, string> cachedGlobalRegs;
     int labelId = 0;
     int nextSlot = 0;
     int nextVarReg = 0;
@@ -10976,7 +10984,15 @@ private:
             if (found != it->end()) return found->second;
         }
         auto g = globals.find(name);
-        if (g != globals.end()) return g->second;
+        if (g != globals.end()) {
+            auto cached = cachedGlobalRegs.find(name);
+            if (cached != cachedGlobalRegs.end() && !g->second.isConst) {
+                Symbol symbol = g->second;
+                symbol.reg = cached->second;
+                return symbol;
+            }
+            return g->second;
+        }
         return nullopt;
     }
 
@@ -11375,6 +11391,93 @@ private:
         }
     }
 
+    struct GlobalUse {
+        uint64_t weight = 0;
+        bool written = false;
+    };
+
+    void noteGlobalUse(unordered_map<string, GlobalUse> &uses, const string &name,
+                       int loopDepth, bool written) const {
+        auto found = globals.find(name);
+        if (found == globals.end() || found->second.isConst) return;
+        GlobalUse &use = uses[name];
+        uint64_t amount = slotUseWeight(loopDepth);
+        use.weight = numeric_limits<uint64_t>::max() - use.weight < amount
+            ? numeric_limits<uint64_t>::max()
+            : use.weight + amount;
+        use.written = use.written || written;
+    }
+
+    void collectGlobalUses(const Expr *e, int loopDepth,
+                           unordered_map<string, GlobalUse> &uses) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var && e->fastGlobal) {
+            noteGlobalUse(uses, e->name, loopDepth, false);
+        }
+        collectGlobalUses(e->lhs.get(), loopDepth, uses);
+        collectGlobalUses(e->rhs.get(), loopDepth, uses);
+        for (auto &arg : e->args) collectGlobalUses(arg.get(), loopDepth, uses);
+    }
+
+    void collectGlobalUses(const Stmt *s, int loopDepth,
+                           unordered_map<string, GlobalUse> &uses) const {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) collectGlobalUses(child.get(), loopDepth, uses);
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+            case Stmt::Kind::ExprStmt:
+                if (!s->fastDeadStore && hasCall(s->expr.get())) {
+                    collectGlobalUses(s->expr.get(), loopDepth, uses);
+                }
+                return;
+            case Stmt::Kind::Return:
+                collectGlobalUses(s->expr.get(), loopDepth, uses);
+                return;
+            case Stmt::Kind::Assign:
+                if (s->fastDeadStore) return;
+                if (s->fastAssignGlobal) noteGlobalUse(uses, s->name, loopDepth, true);
+                collectGlobalUses(s->expr.get(), loopDepth, uses);
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (!s->fastDeadStore && s->decl) {
+                    collectGlobalUses(s->decl->init.get(), loopDepth, uses);
+                }
+                return;
+            case Stmt::Kind::If:
+                collectGlobalUses(s->expr.get(), loopDepth, uses);
+                collectGlobalUses(s->thenStmt.get(), loopDepth, uses);
+                collectGlobalUses(s->elseStmt.get(), loopDepth, uses);
+                return;
+            case Stmt::Kind::While:
+                if (s->fastDeadStore) return;
+                collectGlobalUses(s->expr.get(), loopDepth + 1, uses);
+                collectGlobalUses(s->body.get(), loopDepth + 1, uses);
+                return;
+        }
+    }
+
+    vector<pair<string, GlobalUse>> rankGlobalCacheCandidates(const Function &f) const {
+        unordered_map<string, GlobalUse> uses;
+        collectGlobalUses(f.body.get(), 0, uses);
+        vector<pair<string, GlobalUse>> ranked;
+        ranked.reserve(uses.size());
+        for (auto &entry : uses) {
+            if (entry.second.weight >= slotUseWeight(1)) ranked.push_back(entry);
+        }
+        sort(ranked.begin(), ranked.end(), [](const auto &lhs, const auto &rhs) {
+            if (lhs.second.weight != rhs.second.weight) {
+                return lhs.second.weight > rhs.second.weight;
+            }
+            return lhs.first < rhs.first;
+        });
+        return ranked;
+    }
+
     void collectAllocatableSlots(const Stmt *s, int fastLocalCount,
                                  vector<int> &slots, bool &valid) const {
         if (!s || !valid) return;
@@ -11428,6 +11531,8 @@ private:
     }
 
     void genFunction(Function &f) {
+        cachedGlobals.clear();
+        cachedGlobalRegs.clear();
         int slots = countSlots(f);
         static const vector<string> allSavedRegs = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
@@ -11496,6 +11601,22 @@ private:
             hoistedConsts.push_back({hoistVals[i], reg});
         }
         int usedRegCount = varRegCap + inlineArgCount + static_cast<int>(hoistVals.size());
+        if (!stmtContainsCall(f.body.get()) && usedRegCount < registerCount) {
+            auto rankedGlobals = rankGlobalCacheCandidates(f);
+            int cacheCount = min(registerCount - usedRegCount,
+                                 static_cast<int>(rankedGlobals.size()));
+            cachedGlobals.reserve(static_cast<size_t>(cacheCount));
+            for (int i = 0; i < cacheCount; ++i) {
+                auto global = globals.find(rankedGlobals[static_cast<size_t>(i)].first);
+                if (global == globals.end() || global->second.isConst) continue;
+                const string &reg = allVarRegs[static_cast<size_t>(usedRegCount++)];
+                cachedGlobalRegs[global->first] = reg;
+                cachedGlobals.push_back(CachedGlobal{
+                    global->first, global->second.label, reg,
+                    rankedGlobals[static_cast<size_t>(i)].second.written,
+                });
+            }
+        }
         int savedRegCount = min(usedRegCount, static_cast<int>(allSavedRegs.size()));
         savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + savedRegCount);
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
@@ -11563,11 +11684,20 @@ private:
         for (auto &[value, reg] : hoistedConsts) {
             emit("li " + reg + ", " + to_string(value));
         }
+        for (const CachedGlobal &global : cachedGlobals) {
+            emit("la t0, " + global.label);
+            loadMem(global.reg, "t0", 0);
+        }
 
         emitLabel(functionBodyLabel);
         genStmt(f.body.get());
         emit("li a0, 0");
         emitLabel(returnLabel);
+        for (const CachedGlobal &global : cachedGlobals) {
+            if (!global.written) continue;
+            emit("la t0, " + global.label);
+            storeMem(global.reg, "t0", 0);
+        }
         for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
             loadMem(savedVarRegs[i], "s0", -12 - i * 4);
         }
