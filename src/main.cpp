@@ -2856,8 +2856,10 @@ private:
             case Stmt::Kind::DeclStmt:
                 return s->decl && s->decl->init && !exprHasCallS(s->decl->init.get());
             case Stmt::Kind::Assign:
-                if (s->fastAssignGlobal || exprHasCallS(s->expr.get())) return false;
-                assigned.insert(s->fastAssignIndex);
+                if (s->fastAssignIndex < 0 || exprHasCallS(s->expr.get())) return false;
+                if (s->fastAssignGlobal &&
+                    static_cast<size_t>(s->fastAssignIndex) >= globals.size()) return false;
+                if (!s->fastAssignGlobal) assigned.insert(s->fastAssignIndex);
                 return true;
             case Stmt::Kind::If: {
                 if (exprHasCallS(s->expr.get())) return false;
@@ -2901,8 +2903,15 @@ private:
                 return;
             }
             case Stmt::Kind::Assign: {
+                if (s->fastAssignGlobal) {
+                    int save = cTempTop;
+                    int value = compileExprMapped(s->expr.get(), slotMap, depth + 1);
+                    emit(VM_GST, 0, value, s->fastAssignIndex);
+                    cTempTop = save;
+                    return;
+                }
                 auto target = slotMap.find(s->fastAssignIndex);
-                if (s->fastAssignGlobal || target == slotMap.end()) throw InlineFail();
+                if (target == slotMap.end()) throw InlineFail();
                 compileExprIntoMapped(s->expr.get(), target->second, slotMap, depth + 1);
                 return;
             }
