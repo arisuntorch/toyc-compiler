@@ -10970,7 +10970,7 @@ private:
                     }
                     nodes = 0;
                     alwaysReturns = false;
-                    if (function->fastLocalCount >= 0 && function->fastLocalCount <= 7 &&
+                    if (function->fastLocalCount >= 0 && function->fastLocalCount <= 64 &&
                         function->fastLocalCount >= static_cast<int>(function->params.size()) &&
                         leafInlineStmtShape(body, function->fastLocalCount, nodes, alwaysReturns) &&
                         alwaysReturns) {
@@ -11186,12 +11186,7 @@ private:
 
     bool exprContainsRuntimeCall(const Expr *e) const {
         if (!e) return false;
-        if (e->kind == Expr::Kind::Call) {
-            if (!callWillInline(e)) return true;
-            // General leaf inlining owns a1-a7 for its private slot homes.
-            // Keep those registers unavailable to long-lived caller values.
-            return !inlineableFuncs.count(e->name) && !branchInlineableFuncs.count(e->name);
-        }
+        if (e->kind == Expr::Kind::Call) return !callWillInline(e);
         if (exprContainsRuntimeCall(e->lhs.get()) || exprContainsRuntimeCall(e->rhs.get())) {
             return true;
         }
@@ -11327,13 +11322,6 @@ private:
 
     int inlineSlotOffset(int slot) const {
         return inlineScratchBaseOffset - slot * 4;
-    }
-
-    static string leafInlineSlotReg(int slot) {
-        static const vector<string> regs = {"a1", "a2", "a3", "a4", "a5", "a6", "a7"};
-        return slot >= 0 && slot < static_cast<int>(regs.size())
-            ? regs[static_cast<size_t>(slot)]
-            : string();
     }
 
     string allocVarReg() {
@@ -12791,13 +12779,9 @@ private:
                     return;
                 }
                 int off = inlineSlotOffset(decl.fastSlot);
-                string reg = leafInlineSlotReg(decl.fastSlot);
                 if (!s->fastDeadStore) genExpr(decl.init.get());
-                scopes.back()[decl.name] = Symbol{false, 0, false, "", off, reg};
-                if (!s->fastDeadStore) {
-                    if (!reg.empty()) emit("mv " + reg + ", a0");
-                    else storeMem("a0", "s0", off);
-                }
+                scopes.back()[decl.name] = Symbol{false, 0, false, "", off, ""};
+                if (!s->fastDeadStore) storeMem("a0", "s0", off);
                 return;
             }
             case Stmt::Kind::Assign:
@@ -12842,17 +12826,14 @@ private:
 
         for (size_t i = 0; i < e->args.size(); ++i) {
             genExpr(e->args[i].get());
-            string reg = leafInlineSlotReg(static_cast<int>(i));
-            if (!reg.empty()) emit("mv " + reg + ", a0");
-            else storeMem("a0", "s0", inlineSlotOffset(static_cast<int>(i)));
+            storeMem("a0", "s0", inlineSlotOffset(static_cast<int>(i)));
         }
         auto callerScopes = std::move(scopes);
         scopes.clear();
         enterScope();
         for (size_t i = 0; i < function->params.size(); ++i) {
-            string reg = leafInlineSlotReg(static_cast<int>(i));
             scopes.back()[function->params[i]] =
-                Symbol{false, 0, false, "", inlineSlotOffset(static_cast<int>(i)), reg};
+                Symbol{false, 0, false, "", inlineSlotOffset(static_cast<int>(i)), ""};
         }
         string endLabel = newLabel("leaf_inline_return");
         genInlineLeafStmt(function->body.get(), endLabel);
