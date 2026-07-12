@@ -108,6 +108,23 @@ def starts_block(lines, index):
     )
 
 
+def join_wrapped_lines(parts):
+    result = ""
+    for raw in parts:
+        part = raw.strip()
+        if not part:
+            continue
+        if result:
+            left = result[-1]
+            right = part[0]
+            left_word = left.isascii() and (left.isalnum() or left in "`_)")
+            right_word = right.isascii() and (right.isalnum() or right in "`_(")
+            if left_word or right_word:
+                result += " "
+        result += part
+    return result
+
+
 def render_markdown(doc, source):
     lines = source.splitlines()
     index = 0
@@ -170,7 +187,7 @@ def render_markdown(doc, source):
             while index < len(lines) and not starts_block(lines, index):
                 parts.append(lines[index].strip())
                 index += 1
-            paragraph.add_run("".join(parts).replace("`", ""))
+            paragraph.add_run(join_wrapped_lines(parts).replace("`", ""))
             continue
 
         numbered = re.match(r"^\d+\.\s+(.*)$", line)
@@ -181,7 +198,7 @@ def render_markdown(doc, source):
             while index < len(lines) and not starts_block(lines, index):
                 parts.append(lines[index].strip())
                 index += 1
-            paragraph.add_run("".join(parts).replace("`", ""))
+            paragraph.add_run(join_wrapped_lines(parts).replace("`", ""))
             continue
 
         paragraph_lines = [line]
@@ -189,7 +206,7 @@ def render_markdown(doc, source):
         while index < len(lines) and not starts_block(lines, index):
             paragraph_lines.append(lines[index].strip())
             index += 1
-        paragraph = doc.add_paragraph("".join(paragraph_lines).replace("`", ""))
+        paragraph = doc.add_paragraph(join_wrapped_lines(paragraph_lines).replace("`", ""))
         paragraph.style = doc.styles["Normal"]
 
 
