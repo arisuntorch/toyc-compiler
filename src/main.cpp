@@ -1697,11 +1697,13 @@ private:
         NO_NESTED = 8,
         NO_POLY_SUM = 16,
         NO_PERIODIC_POLY = 32,
-        NO_LCG_MOD_SUM = 64
+        NO_LCG_MOD_SUM = 64,
+        NO_STATE_CYCLE = 128
     };
     static constexpr uint8_t kAllLoopStructFlags = NO_PERIODIC | NO_GUARDED | NO_AFFINE |
                                                    NO_NESTED | NO_POLY_SUM |
-                                                   NO_PERIODIC_POLY | NO_LCG_MOD_SUM;
+                                                   NO_PERIODIC_POLY | NO_LCG_MOD_SUM |
+                                                   NO_STATE_CYCLE;
     enum class TransformFlow { Fail, Normal, Continue, Break };
 
     struct AffineLoopS {
@@ -6393,6 +6395,440 @@ private:
         return true;
     }
 
+    enum class StateCycleFlow { Fail, Normal, Continue };
+
+    struct StateCycleVectorHash {
+        size_t operator()(const vector<int32_t> &values) const noexcept {
+            size_t h = 1469598103934665603ull;
+            for (int32_t value : values) {
+                h ^= static_cast<uint32_t>(value);
+                h *= 1099511628211ull;
+            }
+            return h;
+        }
+    };
+
+    bool collectStateCycleAssignedInfo(const Stmt *s, int indKey,
+                                       unordered_set<int> &assigned,
+                                       unordered_map<int, bool> &additive) const {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectStateCycleAssignedInfo(child.get(), indKey, assigned,
+                                                       additive)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::If:
+                return !exprHasCallS(s->expr.get()) &&
+                       collectStateCycleAssignedInfo(s->thenStmt.get(), indKey, assigned,
+                                                     additive) &&
+                       collectStateCycleAssignedInfo(s->elseStmt.get(), indKey, assigned,
+                                                     additive);
+            case Stmt::Kind::Assign: {
+                int key = assignSlotKey(s);
+                if (key & kGlobalBit) return false;
+                assigned.insert(key);
+                if (key == indKey) return !exprHasCallS(s->expr.get());
+                int accCoeff = 0;
+                vector<pair<int, const Expr *>> terms;
+                bool isAdditive = collectAccumDeltaTerms(s->expr.get(), key, 1,
+                                                          accCoeff, terms) &&
+                                  accCoeff == 1 && !exprHasCallS(s->expr.get());
+                auto [it, inserted] = additive.emplace(key, isAdditive);
+                if (!inserted) it->second = it->second && isAdditive;
+                return true;
+            }
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool collectStateCycleExternalReads(const Stmt *s, int indKey,
+                                        const unordered_map<int, bool> &additive,
+                                        unordered_set<int> &external) const {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectStateCycleExternalReads(child.get(), indKey, additive,
+                                                        external)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::ExprStmt:
+                return true;
+            case Stmt::Kind::If:
+                collectExprVarKeys(s->expr.get(), external);
+                return collectStateCycleExternalReads(s->thenStmt.get(), indKey, additive,
+                                                      external) &&
+                       collectStateCycleExternalReads(s->elseStmt.get(), indKey, additive,
+                                                      external);
+            case Stmt::Kind::Assign: {
+                int key = assignSlotKey(s);
+                auto it = additive.find(key);
+                if (key != indKey && it != additive.end() && it->second) {
+                    int accCoeff = 0;
+                    vector<pair<int, const Expr *>> terms;
+                    if (!collectAccumDeltaTerms(s->expr.get(), key, 1, accCoeff, terms) ||
+                        accCoeff != 1) return false;
+                    for (auto &term : terms) collectExprVarKeys(term.second, external);
+                } else {
+                    collectExprVarKeys(s->expr.get(), external);
+                }
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    bool stateCycleExprAllowed(const Expr *e, int indKey,
+                               const unordered_set<int> &accKeys) const {
+        if (!e || exprHasCallS(e)) return false;
+        unordered_set<int> vars;
+        collectExprVarKeys(e, vars);
+        if (vars.count(indKey)) return false;
+        for (int key : accKeys) {
+            if (vars.count(key)) return false;
+        }
+        return true;
+    }
+
+    bool validateStateCycleStmt(const Stmt *s, int indKey, int32_t step,
+                                const unordered_set<int> &stateKeys,
+                                const unordered_set<int> &accKeys) const {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!validateStateCycleStmt(child.get(), indKey, step, stateKeys,
+                                                accKeys)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::If:
+                return stateCycleExprAllowed(s->expr.get(), indKey, accKeys) &&
+                       validateStateCycleStmt(s->thenStmt.get(), indKey, step, stateKeys,
+                                              accKeys) &&
+                       validateStateCycleStmt(s->elseStmt.get(), indKey, step, stateKeys,
+                                              accKeys);
+            case Stmt::Kind::Assign: {
+                int key = assignSlotKey(s);
+                if (key & kGlobalBit) return false;
+                if (key == indKey) {
+                    int rhsKey = -1;
+                    int32_t off = 0;
+                    return !exprHasCallS(s->expr.get()) &&
+                           extractInductionPlusConst(s->expr.get(), rhsKey, off) &&
+                           rhsKey == indKey && off == step;
+                }
+                if (accKeys.count(key)) {
+                    int accCoeff = 0;
+                    vector<pair<int, const Expr *>> terms;
+                    if (!collectAccumDeltaTerms(s->expr.get(), key, 1, accCoeff, terms) ||
+                        accCoeff != 1) return false;
+                    for (auto &term : terms) {
+                        if (!stateCycleExprAllowed(term.second, indKey, accKeys)) return false;
+                    }
+                    return true;
+                }
+                return stateKeys.count(key) &&
+                       stateCycleExprAllowed(s->expr.get(), indKey, accKeys);
+            }
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool evalStateCycleExpr(const Expr *e, const unordered_map<int, int32_t> &values,
+                            const int32_t *frame, int depth, int32_t &out) const {
+        if (!e || depth > 32) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out = wrap32(e->value);
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                auto it = values.find(key);
+                out = it == values.end() ? readSlot(key, frame) : it->second;
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                int32_t value = 0;
+                if (!evalStateCycleExpr(e->lhs.get(), values, frame, depth + 1,
+                                        value)) return false;
+                if (e->opc == OPC_PLUS) out = value;
+                else if (e->opc == OPC_NEG) out = sub32(0, value);
+                else if (e->opc == OPC_NOT) out = !truthy(value);
+                else return false;
+                return true;
+            }
+            case Expr::Kind::Binary: {
+                if (e->opc == OPC_AND) {
+                    int32_t lhs = 0;
+                    if (!evalStateCycleExpr(e->lhs.get(), values, frame, depth + 1,
+                                            lhs)) return false;
+                    if (!truthy(lhs)) { out = 0; return true; }
+                    int32_t rhs = 0;
+                    if (!evalStateCycleExpr(e->rhs.get(), values, frame, depth + 1,
+                                            rhs)) return false;
+                    out = truthy(rhs);
+                    return true;
+                }
+                if (e->opc == OPC_OR) {
+                    int32_t lhs = 0;
+                    if (!evalStateCycleExpr(e->lhs.get(), values, frame, depth + 1,
+                                            lhs)) return false;
+                    if (truthy(lhs)) { out = 1; return true; }
+                    int32_t rhs = 0;
+                    if (!evalStateCycleExpr(e->rhs.get(), values, frame, depth + 1,
+                                            rhs)) return false;
+                    out = truthy(rhs);
+                    return true;
+                }
+                int32_t lhs = 0, rhs = 0;
+                if (!evalStateCycleExpr(e->lhs.get(), values, frame, depth + 1, lhs) ||
+                    !evalStateCycleExpr(e->rhs.get(), values, frame, depth + 1, rhs)) return false;
+                switch (e->opc) {
+                    case OPC_ADD: out = add32(lhs, rhs); return true;
+                    case OPC_SUB: out = sub32(lhs, rhs); return true;
+                    case OPC_MUL: out = mul32(lhs, rhs); return true;
+                    case OPC_DIV: out = div32(lhs, rhs); return true;
+                    case OPC_MOD: out = mod32(lhs, rhs); return true;
+                    case OPC_LT: out = lhs < rhs; return true;
+                    case OPC_GT: out = lhs > rhs; return true;
+                    case OPC_LE: out = lhs <= rhs; return true;
+                    case OPC_GE: out = lhs >= rhs; return true;
+                    case OPC_EQ: out = lhs == rhs; return true;
+                    case OPC_NE: out = lhs != rhs; return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    StateCycleFlow evalStateCycleStmt(const Stmt *s, unordered_map<int, int32_t> &values,
+                                      const int32_t *frame, int depth) const {
+        if (!s || depth > 64) return StateCycleFlow::Fail;
+        if (s->fastDeadStore) return StateCycleFlow::Normal;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    StateCycleFlow flow = evalStateCycleStmt(child.get(), values, frame, depth);
+                    if (flow != StateCycleFlow::Normal) return flow;
+                }
+                return StateCycleFlow::Normal;
+            case Stmt::Kind::Empty:
+                return StateCycleFlow::Normal;
+            case Stmt::Kind::Continue:
+                return StateCycleFlow::Continue;
+            case Stmt::Kind::ExprStmt:
+                return exprHasCallS(s->expr.get()) ? StateCycleFlow::Fail
+                                                   : StateCycleFlow::Normal;
+            case Stmt::Kind::Assign: {
+                int32_t value = 0;
+                if (!evalStateCycleExpr(s->expr.get(), values, frame, depth + 1,
+                                        value)) return StateCycleFlow::Fail;
+                values[assignSlotKey(s)] = value;
+                return StateCycleFlow::Normal;
+            }
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                if (!evalStateCycleExpr(s->expr.get(), values, frame, depth + 1,
+                                        cond)) return StateCycleFlow::Fail;
+                const Stmt *branch = truthy(cond) ? s->thenStmt.get() : s->elseStmt.get();
+                return branch ? evalStateCycleStmt(branch, values, frame, depth + 1)
+                              : StateCycleFlow::Normal;
+            }
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Return:
+                return StateCycleFlow::Fail;
+        }
+        return StateCycleFlow::Fail;
+    }
+
+    FoldRes tryRunAutonomousStateCycleLoop(const Stmt *s, int32_t *frame) {
+        int indKey = -1;
+        int cmp = CMP_LT;
+        const Expr *boundExpr = nullptr;
+        int32_t boundAdjust = 0;
+        if (!extractLoopCondition(s->expr.get(), indKey, cmp, boundExpr,
+                                  boundAdjust)) return FoldStructFail;
+        if ((indKey & kGlobalBit) || boundAdjust != 0) return FoldStructFail;
+
+        unordered_set<int> assigned;
+        unordered_map<int, bool> additive;
+        if (!collectStateCycleAssignedInfo(s->body.get(), indKey, assigned, additive) ||
+            !assigned.count(indKey)) return FoldStructFail;
+        if (exprHasCallS(boundExpr)) return FoldStructFail;
+        unordered_set<int> boundReads;
+        collectExprVarKeys(boundExpr, boundReads);
+        for (int key : boundReads) {
+            if (assigned.count(key)) return FoldStructFail;
+        }
+        int32_t bound = 0;
+        if (!evalExprNoChanging(boundExpr, assigned, frame, bound)) return FoldValueFail;
+
+        optional<int32_t> stepOpt;
+        if (!extractSingleInductionStep(s->body.get(), indKey, stepOpt) || !stepOpt) {
+            return FoldStructFail;
+        }
+        int32_t step = *stepOpt;
+        if ((cmp == CMP_LT || cmp == CMP_LE) && step <= 0) return FoldValueFail;
+        if ((cmp == CMP_GT || cmp == CMP_GE) && step >= 0) return FoldValueFail;
+        int32_t startIv = readSlot(indKey, frame);
+        auto niterOpt = countIterationsMaybe(cmp, step, startIv, bound);
+        if (!niterOpt) return FoldValueFail;
+        uint64_t niter = *niterOpt;
+        if (niter == 0) return FoldOk;
+        if (niter < 100000) return FoldValueFail;
+        uint64_t maxSafeIterations = 0;
+        if (step > 0) {
+            maxSafeIterations = static_cast<uint64_t>(
+                (static_cast<int64_t>(numeric_limits<int32_t>::max()) - startIv) / step);
+        } else {
+            maxSafeIterations = static_cast<uint64_t>(
+                (static_cast<int64_t>(startIv) - numeric_limits<int32_t>::min()) /
+                -static_cast<int64_t>(step));
+        }
+        if (niter > maxSafeIterations) return FoldValueFail;
+
+        unordered_set<int> external;
+        if (!collectStateCycleExternalReads(s->body.get(), indKey, additive,
+                                            external)) return FoldStructFail;
+        unordered_set<int> accSet;
+        unordered_set<int> stateSet;
+        for (int key : assigned) {
+            if (key == indKey) continue;
+            auto it = additive.find(key);
+            if (it != additive.end() && it->second && !external.count(key)) accSet.insert(key);
+            else stateSet.insert(key);
+        }
+        if (stateSet.empty() || stateSet.size() > 8 || accSet.size() > 8) {
+            return FoldStructFail;
+        }
+        if (!validateStateCycleStmt(s->body.get(), indKey, step, stateSet,
+                                    accSet)) return FoldStructFail;
+
+        vector<int> stateKeys(stateSet.begin(), stateSet.end());
+        vector<int> accKeys(accSet.begin(), accSet.end());
+        sort(stateKeys.begin(), stateKeys.end());
+        sort(accKeys.begin(), accKeys.end());
+        unordered_map<int, int32_t> values;
+        values[indKey] = startIv;
+        for (int key : stateKeys) values[key] = readSlot(key, frame);
+        vector<int32_t> initialAcc;
+        initialAcc.reserve(accKeys.size());
+        for (int key : accKeys) {
+            initialAcc.push_back(readSlot(key, frame));
+            values[key] = 0;
+        }
+
+        auto getState = [&]() {
+            vector<int32_t> out;
+            out.reserve(stateKeys.size());
+            for (int key : stateKeys) out.push_back(values[key]);
+            return out;
+        };
+        auto getTotals = [&]() {
+            vector<uint32_t> out;
+            out.reserve(accKeys.size());
+            for (int key : accKeys) out.push_back(static_cast<uint32_t>(values[key]));
+            return out;
+        };
+
+        constexpr uint64_t maxCycleStates = 131072;
+        unordered_map<vector<int32_t>, uint64_t, StateCycleVectorHash> seen;
+        vector<vector<int32_t>> states;
+        vector<vector<uint32_t>> totals;
+        seen.reserve(static_cast<size_t>(maxCycleStates + 1));
+        states.reserve(static_cast<size_t>(maxCycleStates + 1));
+        totals.reserve(static_cast<size_t>(maxCycleStates + 1));
+        states.push_back(getState());
+        totals.push_back(getTotals());
+        seen.emplace(states.back(), 0);
+        uint64_t simulated = 0;
+        uint64_t cycleStart = 0;
+        uint64_t cycleEnd = 0;
+        bool foundCycle = false;
+        while (simulated < niter && simulated < maxCycleStates) {
+            if ((simulated & 255u) == 0u && pastDeadline()) throw TooHard();
+            tick(8);
+            int32_t beforeIv = values[indKey];
+            StateCycleFlow flow = evalStateCycleStmt(s->body.get(), values, frame, 0);
+            if (flow == StateCycleFlow::Fail ||
+                values[indKey] != add32(beforeIv, step)) return FoldValueFail;
+            ++simulated;
+            states.push_back(getState());
+            totals.push_back(getTotals());
+            auto [it, inserted] = seen.emplace(states.back(), simulated);
+            if (!inserted) {
+                cycleStart = it->second;
+                cycleEnd = simulated;
+                foundCycle = true;
+                break;
+            }
+        }
+
+        vector<int32_t> finalState;
+        vector<uint32_t> totalDelta(accKeys.size(), 0);
+        if (simulated == niter) {
+            finalState = states.back();
+            totalDelta = totals.back();
+        } else {
+            if (!foundCycle || cycleEnd <= cycleStart) return FoldValueFail;
+            uint64_t cycleLen = cycleEnd - cycleStart;
+            uint64_t remaining = niter - cycleStart;
+            uint64_t whole = remaining / cycleLen;
+            uint64_t rem = remaining % cycleLen;
+            finalState = states[static_cast<size_t>(cycleStart + rem)];
+            for (size_t i = 0; i < accKeys.size(); ++i) {
+                uint32_t prefix = totals[static_cast<size_t>(cycleStart)][i];
+                uint32_t cycle = totals[static_cast<size_t>(cycleEnd)][i] - prefix;
+                uint32_t tail = totals[static_cast<size_t>(cycleStart + rem)][i] - prefix;
+                totalDelta[i] = prefix +
+                                static_cast<uint32_t>(static_cast<uint64_t>(cycle) *
+                                                      static_cast<uint32_t>(whole)) +
+                                tail;
+            }
+        }
+
+        int64_t finalIv = static_cast<int64_t>(startIv) +
+                          static_cast<int64_t>(step) * static_cast<int64_t>(niter);
+        writeSlot(indKey, static_cast<int32_t>(finalIv), frame);
+        for (size_t i = 0; i < stateKeys.size(); ++i) {
+            writeSlot(stateKeys[i], finalState[i], frame);
+        }
+        for (size_t i = 0; i < accKeys.size(); ++i) {
+            writeSlot(accKeys[i], add32(initialAcc[i], wrap32(totalDelta[i])), frame);
+        }
+        return FoldOk;
+    }
+
 
     bool simpleReturnExpr(const Stmt *s, const Expr *&ret) const {
         if (!s) return false;
@@ -8208,6 +8644,14 @@ private:
                 return true;
             }
             if (r == FoldStructFail) st.structFlags |= NO_PERIODIC_POLY;
+        }
+        if (!(st.structFlags & NO_STATE_CYCLE)) {
+            FoldRes r = tryRunAutonomousStateCycleLoop(s, frame);
+            if (r == FoldOk) {
+                st.everFolded = true;
+                return true;
+            }
+            if (r == FoldStructFail) st.structFlags |= NO_STATE_CYCLE;
         }
         ++st.failCount;
         return false;
