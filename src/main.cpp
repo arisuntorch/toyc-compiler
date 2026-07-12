@@ -2882,6 +2882,211 @@ private:
         return false;
     }
 
+    // Loop helpers are expanded into the caller's bytecode frame. Keep this
+    // eligibility check deliberately conservative: the helper must be a
+    // non-void, call-free fragment with an explicit return on every reachable
+    // path. In particular, loop instructions are handled by the inline
+    // emitter below and must never enter foldStmts/VM_FOLD metadata.
+    bool loopInlineStmtShape(const Stmt *s, int &nodes, bool &alwaysReturns,
+                             bool &hasLoop) const {
+        alwaysReturns = false;
+        if (!s || s->fastDeadStore) return true;
+        if (++nodes > 160) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool guaranteed = false;
+                for (auto &child : s->stmts) {
+                    bool childReturns = false;
+                    if (!loopInlineStmtShape(child.get(), nodes, childReturns, hasLoop)) {
+                        return false;
+                    }
+                    if (!guaranteed) guaranteed = childReturns;
+                }
+                alwaysReturns = guaranteed;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::DeclStmt:
+                return s->decl && s->decl->init && !exprHasCallS(s->decl->init.get());
+            case Stmt::Kind::Assign:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::If: {
+                if (exprHasCallS(s->expr.get())) return false;
+                bool thenReturns = false;
+                bool elseReturns = false;
+                if (!loopInlineStmtShape(s->thenStmt.get(), nodes, thenReturns, hasLoop) ||
+                    !loopInlineStmtShape(s->elseStmt.get(), nodes, elseReturns, hasLoop)) {
+                    return false;
+                }
+                alwaysReturns = thenReturns && s->elseStmt && elseReturns;
+                return true;
+            }
+            case Stmt::Kind::While: {
+                if (exprHasCallS(s->expr.get())) return false;
+                hasLoop = true;
+                bool bodyReturns = false;
+                if (!loopInlineStmtShape(s->body.get(), nodes, bodyReturns, hasLoop)) {
+                    return false;
+                }
+                // A loop may execute zero times; only a following return can
+                // establish that the helper itself always returns.
+                (void)bodyReturns;
+                return true;
+            }
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::Return:
+                if (!s->expr || exprHasCallS(s->expr.get())) return false;
+                alwaysReturns = true;
+                return true;
+        }
+        return false;
+    }
+
+    void compileInlineLoopStmt(const Stmt *s, const unordered_map<int, int> &slotMap,
+                               int dst, vector<int> &returnPatches,
+                               vector<vector<int>> &breakPatches,
+                               vector<int> &continueTargets, int depth) {
+        if (!s || s->fastDeadStore) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    compileInlineLoopStmt(child.get(), slotMap, dst, returnPatches,
+                                          breakPatches, continueTargets, depth);
+                }
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) throw InlineFail();
+                auto target = slotMap.find(s->decl->fastSlot);
+                if (target == slotMap.end()) throw InlineFail();
+                compileExprIntoMapped(s->decl->init.get(), target->second, slotMap,
+                                      depth + 1);
+                return;
+            }
+            case Stmt::Kind::Assign: {
+                int save = cTempTop;
+                if (s->fastAssignGlobal) {
+                    int value = compileExprMapped(s->expr.get(), slotMap, depth + 1);
+                    emit(VM_GST, 0, value, s->fastAssignIndex);
+                } else {
+                    auto target = slotMap.find(s->fastAssignIndex);
+                    if (target == slotMap.end()) throw InlineFail();
+                    compileExprIntoMapped(s->expr.get(), target->second, slotMap,
+                                          depth + 1);
+                }
+                cTempTop = save;
+                return;
+            }
+            case Stmt::Kind::If: {
+                vector<int> elsePatches;
+                compileCondJumpMapped(s->expr.get(), false, elsePatches, slotMap,
+                                      depth + 1);
+                compileInlineLoopStmt(s->thenStmt.get(), slotMap, dst, returnPatches,
+                                      breakPatches, continueTargets, depth + 1);
+                if (s->elseStmt) {
+                    int endPatch = emit(VM_JMP, 0, 0, 0);
+                    for (int patch : elsePatches) patchC(patch, here());
+                    compileInlineLoopStmt(s->elseStmt.get(), slotMap, dst, returnPatches,
+                                          breakPatches, continueTargets, depth + 1);
+                    patchC(endPatch, here());
+                } else {
+                    for (int patch : elsePatches) patchC(patch, here());
+                }
+                return;
+            }
+            case Stmt::Kind::While: {
+                int condStart = here();
+                vector<int> exitPatches;
+                compileCondJumpMapped(s->expr.get(), false, exitPatches, slotMap,
+                                      depth + 1);
+                breakPatches.push_back({});
+                continueTargets.push_back(condStart);
+                compileInlineLoopStmt(s->body.get(), slotMap, dst, returnPatches,
+                                      breakPatches, continueTargets, depth + 1);
+                emit(VM_JMP, 0, 0, condStart);
+                int end = here();
+                for (int patch : exitPatches) patchC(patch, end);
+                for (int patch : breakPatches.back()) patchC(patch, end);
+                breakPatches.pop_back();
+                continueTargets.pop_back();
+                return;
+            }
+            case Stmt::Kind::Break:
+                if (breakPatches.empty()) throw InlineFail();
+                breakPatches.back().push_back(emit(VM_JMP, 0, 0, 0));
+                return;
+            case Stmt::Kind::Continue:
+                if (continueTargets.empty()) throw InlineFail();
+                emit(VM_JMP, 0, 0, continueTargets.back());
+                return;
+            case Stmt::Kind::Return:
+                if (!s->expr) throw InlineFail();
+                compileExprIntoMapped(s->expr.get(), dst, slotMap, depth + 1);
+                returnPatches.push_back(emit(VM_JMP, 0, 0, 0));
+                return;
+        }
+        throw InlineFail();
+    }
+
+    bool tryCompileLoopInlineCall(const Expr *e, Function *function, int dst,
+                                  const unordered_map<int, int> *outerMap, int depth) {
+        if (!function || function->returnsVoid || function->fastLocalCount < 0 ||
+            function->fastLocalCount > 32 || e->args.size() != function->params.size()) {
+            return false;
+        }
+        int nodes = 0;
+        bool alwaysReturns = false;
+        bool hasLoop = false;
+        if (!loopInlineStmtShape(function->body.get(), nodes, alwaysReturns, hasLoop) ||
+            !hasLoop || !alwaysReturns) {
+            return false;
+        }
+
+        int save = cTempTop;
+        int maxSave = cMaxTemp;
+        size_t codeSave = cf ? cf->code.size() : 0;
+        try {
+            unordered_map<int, int> slotMap;
+            // Give every helper slot a private caller-frame home. This avoids
+            // aliasing arguments with mutable helper locals and keeps nested
+            // control-flow writes independent of the caller.
+            for (size_t i = 0; i < e->args.size(); ++i) {
+                int target = allocTemp();
+                if (outerMap) compileExprIntoMapped(e->args[i].get(), target, *outerMap,
+                                                    depth + 1);
+                else compileExprInto(e->args[i].get(), target);
+                slotMap[static_cast<int>(i)] = target;
+            }
+            for (int slot = static_cast<int>(e->args.size());
+                 slot < function->fastLocalCount; ++slot) {
+                slotMap[slot] = allocTemp();
+            }
+            vector<int> returnPatches;
+            vector<vector<int>> breakPatches;
+            vector<int> continueTargets;
+            compileInlineLoopStmt(function->body.get(), slotMap, dst, returnPatches,
+                                  breakPatches, continueTargets, depth + 1);
+            if (returnPatches.empty() || !breakPatches.empty() || !continueTargets.empty()) {
+                throw InlineFail();
+            }
+            for (int patch : returnPatches) patchC(patch, here());
+            cTempTop = save;
+            return true;
+        } catch (const InlineFail &) {
+            if (cf) cf->code.resize(codeSave);
+            cTempTop = save;
+            cMaxTemp = maxSave;
+            return false;
+        }
+    }
+
     void compileInlineBranchStmt(const Stmt *s, const unordered_map<int, int> &slotMap,
                                  int dst, vector<int> &returnPatches, int depth) {
         if (!s || s->fastDeadStore) return;
@@ -3000,6 +3205,9 @@ private:
         const Expr *ret = nullptr;
         vector<pair<int, const Expr *>> aliases;
         if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) {
+            if (tryCompileLoopInlineCall(e, found->second, dst, outerMap, depth)) {
+                return true;
+            }
             return tryCompileBranchInlineCall(e, found->second, dst, outerMap, depth);
         }
 
