@@ -10778,6 +10778,7 @@ private:
     int nextVarReg = 0;
     int localBaseOffset = -12;
     int frameSize = 0;
+    bool frameFreeLeaf = false;
 
     static int alignTo(int x, int a) { return (x + a - 1) / a * a; }
     static bool fits12(long long x) { return x >= -2048 && x <= 2047; }
@@ -10789,6 +10790,38 @@ private:
 
     void emit(const string &s) { out << "    " << s << "\n"; }
     void emitLabel(const string &s) { out << s << ":\n"; }
+
+    // Move incoming argument registers into arbitrary leaf homes without
+    // clobbering a source that is still needed by a later move.
+    void emitParallelMoves(vector<pair<string, string>> moves) {
+        moves.erase(remove_if(moves.begin(), moves.end(),
+                               [](const auto &m) { return m.first == m.second; }),
+                    moves.end());
+        while (!moves.empty()) {
+            bool emitted = false;
+            for (size_t i = 0; i < moves.size(); ++i) {
+                const string &dst = moves[i].first;
+                bool usedAsSource = false;
+                for (const auto &move : moves) {
+                    if (move.second == dst) {
+                        usedAsSource = true;
+                        break;
+                    }
+                }
+                if (usedAsSource) continue;
+                emit("mv " + dst + ", " + moves[i].second);
+                moves.erase(moves.begin() + static_cast<ptrdiff_t>(i));
+                emitted = true;
+                break;
+            }
+            if (emitted) continue;
+
+            // The remaining moves form a cycle. t6 is reserved as a scratch
+            // register by this backend and is never a leaf home.
+            emit("mv t6, " + moves.front().second);
+            moves.front().second = "t6";
+        }
+    }
 
     void adjustSp(int bytes) {
         if (bytes == 0) return;
@@ -11432,27 +11465,48 @@ private:
         static const vector<string> allSavedRegs = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
         };
-        static const vector<string> callFreeExtraRegs = {
+        static const vector<string> leafRegs = {
             "a1", "a2", "a3", "a4", "a5", "a6", "a7"
         };
-        vector<string> allVarRegs = allSavedRegs;
-        if (!stmtContainsCall(f.body.get())) {
-            allVarRegs.insert(allVarRegs.end(), callFreeExtraRegs.begin(), callFreeExtraRegs.end());
+        bool callFree = !stmtContainsCall(f.body.get());
+        frameFreeLeaf = false;
+        vector<string> allVarRegs;
+
+        // A small leaf can keep every mutable slot in caller-saved registers.
+        // Probe the normal slot metadata first; any uncertainty falls back to
+        // the existing framed ABI.
+        if (callFree && slots <= static_cast<int>(leafRegs.size()) &&
+            f.params.size() <= leafRegs.size()) {
+            allVarRegs = leafRegs;
+            varRegCap = slots;
+            buildSlotRegisterMap(f, slots, allVarRegs);
+            frameFreeLeaf = useSlotRegMap && varRegCap == slots;
+        }
+        if (!frameFreeLeaf) {
+            allVarRegs = allSavedRegs;
+            if (callFree) {
+                allVarRegs.insert(allVarRegs.end(), leafRegs.begin(), leafRegs.end());
+            }
+            varRegCap = min(static_cast<int>(allVarRegs.size()), slots);
+            buildSlotRegisterMap(f, slots, allVarRegs);
         }
         int registerCount = static_cast<int>(allVarRegs.size());
-        varRegCap = min(registerCount, slots);
-        buildSlotRegisterMap(f, slots, allVarRegs);
         int desiredInlineArgs = maxBranchInlineArgs(f.body.get());
-        int inlineArgCount = min(desiredInlineArgs, max(0, registerCount - slots));
+        int inlineArgCount = frameFreeLeaf
+            ? 0
+            : min(desiredInlineArgs, max(0, registerCount - slots));
         vector<long long> hoistVals;
-        auto rankedConsts = rankHoistConsts(f);
-        rankedConsts.erase(
-            remove_if(rankedConsts.begin(), rankedConsts.end(),
-                      [](const auto &entry) { return entry.second < 8; }),
-            rankedConsts.end());
-        if (rankedConsts.size() > 4) rankedConsts.resize(4);
+        vector<pair<long long, long long>> rankedConsts;
+        if (!frameFreeLeaf) {
+            rankedConsts = rankHoistConsts(f);
+            rankedConsts.erase(
+                remove_if(rankedConsts.begin(), rankedConsts.end(),
+                          [](const auto &entry) { return entry.second < 8; }),
+                rankedConsts.end());
+            if (rankedConsts.size() > 4) rankedConsts.resize(4);
+        }
 
-        if (useSlotRegMap) {
+        if (!frameFreeLeaf && useSlotRegMap) {
             struct RegChoice {
                 uint64_t score;
                 bool isConst;
@@ -11479,7 +11533,7 @@ private:
                 else ++varRegCap;
             }
             buildSlotRegisterMap(f, slots, allVarRegs);
-        } else {
+        } else if (!frameFreeLeaf) {
             varRegCap = min(registerCount, slots);
             inlineArgCount = min(desiredInlineArgs, registerCount - varRegCap);
             int hoistCount = min({4, registerCount - varRegCap - inlineArgCount,
@@ -11496,10 +11550,14 @@ private:
             hoistedConsts.push_back({hoistVals[i], reg});
         }
         int usedRegCount = varRegCap + inlineArgCount + static_cast<int>(hoistVals.size());
-        int savedRegCount = min(usedRegCount, static_cast<int>(allSavedRegs.size()));
+        int savedRegCount = frameFreeLeaf
+            ? 0
+            : min(usedRegCount, static_cast<int>(allSavedRegs.size()));
         savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + savedRegCount);
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
-        frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
+        frameSize = frameFreeLeaf
+            ? 0
+            : alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
         nextSlot = 0;
         nextVarReg = 0;
         localBaseOffset = -12 - static_cast<int>(savedVarRegs.size()) * 4;
@@ -11513,20 +11571,32 @@ private:
 
         out << ".globl " << f.name << "\n";
         emitLabel(f.name);
-        adjustSp(-frameSize);
-        storeMem("ra", "sp", frameSize - 4);
-        storeMem("s0", "sp", frameSize - 8);
-        for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
-            storeMem(savedVarRegs[i], "sp", frameSize - 12 - i * 4);
-        }
-        if (fits12(frameSize)) emit("addi s0, sp, " + to_string(frameSize));
-        else {
-            emit("li t6, " + to_string(frameSize));
-            emit("add s0, sp, t6");
+        if (!frameFreeLeaf) {
+            adjustSp(-frameSize);
+            storeMem("ra", "sp", frameSize - 4);
+            storeMem("s0", "sp", frameSize - 8);
+            for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
+                storeMem(savedVarRegs[i], "sp", frameSize - 12 - i * 4);
+            }
+            if (fits12(frameSize)) emit("addi s0, sp, " + to_string(frameSize));
+            else {
+                emit("li t6, " + to_string(frameSize));
+                emit("add s0, sp, t6");
+            }
         }
 
         enterScope();
-        if (varRegCap > static_cast<int>(allSavedRegs.size())) {
+        if (frameFreeLeaf) {
+            vector<pair<string, string>> moves;
+            moves.reserve(f.params.size());
+            for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
+                string reg = allocVarRegForSlot(i);
+                if (reg.empty() || i >= 8) throw logic_error("invalid frame-free leaf parameter home");
+                scopes.back()[f.params[i]] = Symbol{false, 0, false, "", 0, reg};
+                moves.push_back({reg, "a" + to_string(i)});
+            }
+            emitParallelMoves(std::move(moves));
+        } else if (varRegCap > static_cast<int>(allSavedRegs.size())) {
             vector<pair<string, int>> paramHomes;
             paramHomes.reserve(f.params.size());
             for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
@@ -11568,12 +11638,14 @@ private:
         genStmt(f.body.get());
         emit("li a0, 0");
         emitLabel(returnLabel);
-        for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
-            loadMem(savedVarRegs[i], "s0", -12 - i * 4);
+        if (!frameFreeLeaf) {
+            for (int i = 0; i < static_cast<int>(savedVarRegs.size()); ++i) {
+                loadMem(savedVarRegs[i], "s0", -12 - i * 4);
+            }
+            loadMem("ra", "s0", -4);
+            loadMem("s0", "s0", -8);
+            adjustSp(frameSize);
         }
-        loadMem("ra", "s0", -4);
-        loadMem("s0", "s0", -8);
-        adjustSp(frameSize);
         emit("ret");
         leaveScope();
         out << "\n";
