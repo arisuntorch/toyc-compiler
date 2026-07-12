@@ -10765,6 +10765,7 @@ private:
     string functionBodyLabel;
     vector<string> currentParams;
     vector<string> savedVarRegs;
+    vector<string> allocableVarRegs;
     vector<string> inlineArgRegs;
     unordered_map<int, string> slotRegMap;
     vector<pair<int, uint64_t>> rankedSlotCandidates;
@@ -11099,6 +11100,17 @@ private:
         return false;
     }
 
+    bool stmtContainsCall(const Stmt *s) const {
+        if (!s) return false;
+        if (hasCall(s->expr.get()) || (s->decl && hasCall(s->decl->init.get()))) return true;
+        for (auto &child : s->stmts) {
+            if (stmtContainsCall(child.get())) return true;
+        }
+        return stmtContainsCall(s->thenStmt.get()) ||
+               stmtContainsCall(s->elseStmt.get()) ||
+               stmtContainsCall(s->body.get());
+    }
+
     int maxBranchInlineArgs(const Expr *e) const {
         if (!e) return 0;
         int result = 0;
@@ -11183,8 +11195,8 @@ private:
     }
 
     string allocVarReg() {
-        if (nextVarReg >= varRegCap) return "";
-        return savedVarRegs[nextVarReg++];
+        if (nextVarReg >= static_cast<int>(allocableVarRegs.size())) return "";
+        return allocableVarRegs[nextVarReg++];
     }
 
     string allocVarRegForSlot(int slot) {
@@ -11417,7 +11429,16 @@ private:
 
     void genFunction(Function &f) {
         int slots = countSlots(f);
-        static const vector<string> allVarRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+        static const vector<string> allSavedRegs = {
+            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
+        };
+        static const vector<string> callFreeExtraRegs = {
+            "a1", "a2", "a3", "a4", "a5", "a6", "a7"
+        };
+        vector<string> allVarRegs = allSavedRegs;
+        if (!stmtContainsCall(f.body.get())) {
+            allVarRegs.insert(allVarRegs.end(), callFreeExtraRegs.begin(), callFreeExtraRegs.end());
+        }
         int registerCount = static_cast<int>(allVarRegs.size());
         varRegCap = min(registerCount, slots);
         buildSlotRegisterMap(f, slots, allVarRegs);
@@ -11474,9 +11495,10 @@ private:
             constRegMap[hoistVals[i]] = reg;
             hoistedConsts.push_back({hoistVals[i], reg});
         }
-        savedVarRegs.assign(allVarRegs.begin(),
-                            allVarRegs.begin() + varRegCap + inlineArgCount +
-                                static_cast<int>(hoistVals.size()));
+        int usedRegCount = varRegCap + inlineArgCount + static_cast<int>(hoistVals.size());
+        int savedRegCount = min(usedRegCount, static_cast<int>(allSavedRegs.size()));
+        savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + savedRegCount);
+        allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
         frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
         nextSlot = 0;
         nextVarReg = 0;
@@ -11504,17 +11526,37 @@ private:
         }
 
         enterScope();
-        for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
-            string reg = allocVarRegForSlot(i);
-            int off = reg.empty() ? allocSlot() : 0;
-            scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off, reg};
-            if (i < 8) {
-                if (!reg.empty()) emit("mv " + reg + ", a" + to_string(i));
-                else storeMem("a" + to_string(i), "s0", off);
-            } else {
-                loadMem("t0", "s0", (i - 8) * 4);
-                if (!reg.empty()) emit("mv " + reg + ", t0");
-                else storeMem("t0", "s0", off);
+        if (varRegCap > static_cast<int>(allSavedRegs.size())) {
+            vector<pair<string, int>> paramHomes;
+            paramHomes.reserve(f.params.size());
+            for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
+                string reg = allocVarRegForSlot(i);
+                int off = allocSlot();
+                scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off, reg};
+                paramHomes.push_back({reg, off});
+                if (i < 8) {
+                    storeMem("a" + to_string(i), "s0", off);
+                } else {
+                    loadMem("t0", "s0", (i - 8) * 4);
+                    storeMem("t0", "s0", off);
+                }
+            }
+            for (auto &[reg, off] : paramHomes) {
+                if (!reg.empty()) loadMem(reg, "s0", off);
+            }
+        } else {
+            for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
+                string reg = allocVarRegForSlot(i);
+                int off = reg.empty() ? allocSlot() : 0;
+                scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off, reg};
+                if (i < 8) {
+                    if (!reg.empty()) emit("mv " + reg + ", a" + to_string(i));
+                    else storeMem("a" + to_string(i), "s0", off);
+                } else {
+                    loadMem("t0", "s0", (i - 8) * 4);
+                    if (!reg.empty()) emit("mv " + reg + ", t0");
+                    else storeMem("t0", "s0", off);
+                }
             }
         }
 
