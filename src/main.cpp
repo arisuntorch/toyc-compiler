@@ -10756,6 +10756,7 @@ private:
     unordered_map<string, FuncInfo> funcs;
     unordered_map<string, Function *> inlineableFuncs;
     unordered_map<string, Function *> branchInlineableFuncs;
+    unordered_map<string, Function *> loopInlineableFuncs;
     unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
@@ -10867,6 +10868,116 @@ private:
         adjustSp(16);
     }
 
+    enum InlineFlow : unsigned {
+        InlineFallthrough = 1u,
+        InlineReturn = 2u,
+        InlineBreak = 4u,
+        InlineContinue = 8u,
+    };
+
+    bool loopInlineExprShape(const Expr *e, int &nodes) const {
+        if (!e) return true;
+        if (++nodes > 128 || e->kind == Expr::Kind::Call) return false;
+        if (!loopInlineExprShape(e->lhs.get(), nodes) ||
+            !loopInlineExprShape(e->rhs.get(), nodes)) {
+            return false;
+        }
+        for (auto &arg : e->args) {
+            if (!loopInlineExprShape(arg.get(), nodes)) return false;
+        }
+        return true;
+    }
+
+    bool loopInlineStmtShape(const Stmt *s, int loopDepth, int &nodes,
+                             bool &hasLoop, unsigned &flow) const {
+        if (!s) {
+            flow = InlineFallthrough;
+            return true;
+        }
+        if (++nodes > 128) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                unsigned aggregate = InlineFallthrough;
+                for (auto &child : s->stmts) {
+                    unsigned childFlow = 0;
+                    if (!loopInlineStmtShape(child.get(), loopDepth, nodes, hasLoop,
+                                             childFlow)) {
+                        return false;
+                    }
+                    if (aggregate & InlineFallthrough) {
+                        aggregate = (aggregate & ~InlineFallthrough) | childFlow;
+                    }
+                }
+                flow = aggregate;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::ExprStmt:
+                if (!loopInlineExprShape(s->expr.get(), nodes)) return false;
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::DeclStmt:
+                if (!s->decl || !s->decl->init ||
+                    !loopInlineExprShape(s->decl->init.get(), nodes)) {
+                    return false;
+                }
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::Assign:
+                if (s->fastAssignGlobal ||
+                    !loopInlineExprShape(s->expr.get(), nodes)) {
+                    return false;
+                }
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::If: {
+                if (!loopInlineExprShape(s->expr.get(), nodes)) return false;
+                unsigned thenFlow = 0;
+                unsigned elseFlow = InlineFallthrough;
+                if (!loopInlineStmtShape(s->thenStmt.get(), loopDepth, nodes, hasLoop,
+                                         thenFlow)) {
+                    return false;
+                }
+                if (s->elseStmt &&
+                    !loopInlineStmtShape(s->elseStmt.get(), loopDepth, nodes, hasLoop,
+                                         elseFlow)) {
+                    return false;
+                }
+                flow = thenFlow | elseFlow;
+                return true;
+            }
+            case Stmt::Kind::While: {
+                if (!loopInlineExprShape(s->expr.get(), nodes)) return false;
+                hasLoop = true;
+                unsigned bodyFlow = 0;
+                if (!loopInlineStmtShape(s->body.get(), loopDepth + 1, nodes, hasLoop,
+                                         bodyFlow)) {
+                    return false;
+                }
+                // The condition may initially be false, and a break may leave
+                // the loop. Returns inside the body remain visible to the
+                // enclosing function; break/continue are consumed here.
+                flow = InlineFallthrough | (bodyFlow & InlineReturn);
+                return true;
+            }
+            case Stmt::Kind::Break:
+                if (loopDepth <= 0) return false;
+                flow = InlineBreak;
+                return true;
+            case Stmt::Kind::Continue:
+                if (loopDepth <= 0) return false;
+                flow = InlineContinue;
+                return true;
+            case Stmt::Kind::Return:
+                if (!s->expr || !loopInlineExprShape(s->expr.get(), nodes)) return false;
+                flow = InlineReturn;
+                return true;
+        }
+        return false;
+    }
+
     bool branchInlineStmtShape(const Stmt *s, const unordered_set<string> &params,
                                int &nodes, bool &alwaysReturns) const {
         alwaysReturns = false;
@@ -10943,6 +11054,15 @@ private:
                     bool alwaysReturns = false;
                     if (branchInlineStmtShape(body, params, nodes, alwaysReturns) && alwaysReturns) {
                         branchInlineableFuncs[function->name] = function;
+                    }
+                    nodes = 0;
+                    bool hasLoop = false;
+                    unsigned flow = 0;
+                    if (function->fastLocalCount >= static_cast<int>(function->params.size()) &&
+                        function->fastLocalCount <= 7 &&
+                        loopInlineStmtShape(body, 0, nodes, hasLoop, flow) && hasLoop &&
+                        flow == InlineReturn) {
+                        loopInlineableFuncs[function->name] = function;
                     }
                 }
             }
@@ -12690,6 +12810,143 @@ private:
         }
     }
 
+    static string loopInlineSlotReg(int slot) {
+        static const vector<string> regs = {"a1", "a2", "a3", "a4", "a5", "a6", "a7"};
+        return slot >= 0 && slot < static_cast<int>(regs.size())
+            ? regs[static_cast<size_t>(slot)]
+            : string();
+    }
+
+    void genInlineLoopStmt(const Stmt *s, const string &endLabel) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                enterScope();
+                for (auto &child : s->stmts) {
+                    genInlineLoopStmt(child.get(), endLabel);
+                    if (stmtAlwaysJumps(child.get())) break;
+                }
+                leaveScope();
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return;
+            case Stmt::Kind::DeclStmt: {
+                const Decl &decl = *s->decl;
+                if (decl.isConst) {
+                    long long value = evalConst(decl.init.get());
+                    scopes.back()[decl.name] = Symbol{true, value, false, "", 0, ""};
+                    return;
+                }
+                string reg = loopInlineSlotReg(decl.fastSlot);
+                if (reg.empty()) throw logic_error("invalid loop-inline local slot");
+                scopes.back()[decl.name] = Symbol{false, 0, false, "", 0, reg};
+                genExprNoCall(decl.init.get(), reg, {"t0", "t1", "t2", "t3", "t4", "t5"});
+                return;
+            }
+            case Stmt::Kind::Assign: {
+                auto symbol = lookup(s->name);
+                if (!symbol || symbol->isConst || symbol->isGlobal || symbol->reg.empty()) {
+                    throw logic_error("invalid loop-inline assignment");
+                }
+                genExprNoCall(s->expr.get(), symbol->reg,
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                return;
+            }
+            case Stmt::Kind::If: {
+                string elseLabel = newLabel("loop_inline_else");
+                string afterLabel = newLabel("loop_inline_endif");
+                genCondFalse(s->expr.get(), elseLabel);
+                genInlineLoopStmt(s->thenStmt.get(), endLabel);
+                if (s->elseStmt) {
+                    emit("j " + afterLabel);
+                    emitLabel(elseLabel);
+                    genInlineLoopStmt(s->elseStmt.get(), endLabel);
+                    emitLabel(afterLabel);
+                } else {
+                    emitLabel(elseLabel);
+                }
+                return;
+            }
+            case Stmt::Kind::While: {
+                auto constCond = tryConst(s->expr.get());
+                if (constCond && !*constCond) return;
+                string bodyLabel = newLabel("loop_inline_while_body");
+                string condLabel = newLabel("loop_inline_while_cond");
+                string afterLabel = newLabel("loop_inline_while_end");
+                if (!constCond) genCondFalse(s->expr.get(), afterLabel);
+                emitLabel(bodyLabel);
+                breakLabels.push_back(afterLabel);
+                continueLabels.push_back(condLabel);
+                genInlineLoopStmt(s->body.get(), endLabel);
+                continueLabels.pop_back();
+                breakLabels.pop_back();
+                emitLabel(condLabel);
+                if (constCond) emit("j " + bodyLabel);
+                else genCondTrue(s->expr.get(), bodyLabel);
+                emitLabel(afterLabel);
+                return;
+            }
+            case Stmt::Kind::Break:
+                if (breakLabels.empty()) throw logic_error("invalid loop-inline break");
+                emit("j " + breakLabels.back());
+                return;
+            case Stmt::Kind::Continue:
+                if (continueLabels.empty()) throw logic_error("invalid loop-inline continue");
+                emit("j " + continueLabels.back());
+                return;
+            case Stmt::Kind::Return:
+                genExprNoCall(s->expr.get(), "a0", {"t0", "t1", "t2", "t3", "t4", "t5"});
+                emit("j " + endLabel);
+                return;
+        }
+        throw logic_error("invalid loop-inline statement");
+    }
+
+    bool tryGenLoopInlineCall(const Expr *e, const string &dst) {
+        if (dst != "a0") return false;
+        auto found = loopInlineableFuncs.find(e->name);
+        if (found == loopInlineableFuncs.end()) return false;
+        Function *function = found->second;
+        if (e->args.size() != function->params.size()) return false;
+        for (auto &arg : e->args) {
+            // The existing call ABI path owns the sequencing rules for nested
+            // calls. Keeping loop-inline arguments call-free also ensures the
+            // a1-a7 helper homes cannot be clobbered during materialization.
+            if (hasCall(arg.get())) return false;
+        }
+
+        // Evaluate every argument exactly once before any helper slot becomes
+        // visible. A temporary stack home keeps later argument evaluation from
+        // clobbering earlier values through a1-a7 scratch allocation.
+        for (auto &arg : e->args) {
+            genExprNoCall(arg.get(), "a0", {"t0", "t1", "t2", "t3", "t4", "t5"});
+            pushA0();
+        }
+        for (size_t i = 0; i < e->args.size(); ++i) {
+            int offset = 16 * (static_cast<int>(e->args.size()) - 1 - static_cast<int>(i)) + 12;
+            loadMem("t0", "sp", offset);
+            string reg = loopInlineSlotReg(static_cast<int>(i));
+            if (reg.empty()) return false;
+            emit("mv " + reg + ", t0");
+        }
+        adjustSp(16 * static_cast<int>(e->args.size()));
+
+        auto callerScopes = std::move(scopes);
+        scopes.clear();
+        enterScope();
+        for (size_t i = 0; i < function->params.size(); ++i) {
+            scopes.back()[function->params[i]] =
+                Symbol{false, 0, false, "", 0, loopInlineSlotReg(static_cast<int>(i))};
+        }
+        string endLabel = newLabel("loop_inline_return");
+        genInlineLoopStmt(function->body.get(), endLabel);
+        emitLabel(endLabel);
+        leaveScope();
+        scopes = std::move(callerScopes);
+        return true;
+    }
+
     bool tryGenInlineCall(const Expr *e, const string &dst) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
@@ -12715,7 +12972,7 @@ private:
         // destination.
         if (dst != "a0") return false;
         auto branch = branchInlineableFuncs.find(e->name);
-        if (branch == branchInlineableFuncs.end()) return false;
+        if (branch == branchInlineableFuncs.end()) return tryGenLoopInlineCall(e, dst);
         Function *f = branch->second;
         if (e->args.size() != f->params.size()) return false;
         for (auto &arg : e->args) {
