@@ -4883,7 +4883,7 @@ private:
                     vector<int32_t> moduli;
                     bool sawIf = false;
                     if (collectIfPeriodicModuli(s->body.get(), indKey, *iv, firstStep, changing,
-                                                frame, moduli, sawIf) && sawIf) {
+                                                frame, moduli, sawIf, niter) && sawIf) {
                         uint64_t period = 1;
                         uint64_t periodLimit = periodicMatrixPhaseLimit(d);
                         uint64_t absStep = firstStep < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(firstStep))
@@ -6467,6 +6467,7 @@ private:
             if (it == aliases.end()) break;
             e = it->second;
         }
+        if (e && e->kind == Expr::Kind::Var && aliases.count(exprSlotKey(e))) return nullptr;
         return e;
     }
 
@@ -6517,12 +6518,15 @@ private:
         return false;
     }
 
+    enum class PeriodicHelperFlow { Fail, FallsThrough, Returns };
+
     bool collectParamPeriodicModuli(const Expr *e, const vector<const Expr *> &paramArgs,
                                     const unordered_map<int, const Expr *> &localAliases,
                                     int indKey, int32_t startIv, int32_t offset, int32_t step,
                                     const unordered_set<int> &changing, const int32_t *frame,
-                                    vector<int32_t> &mods, bool strict, int depth) const {
-        if (!e || depth > 4) return false;
+                                    vector<int32_t> &mods, bool strict, int depth,
+                                    uint64_t rangeNiter = 0) const {
+        if (!e || depth > 12) return false;
         e = resolveLocalAliasExpr(e, localAliases, depth);
         if (!e) return false;
         switch (e->kind) {
@@ -6533,7 +6537,7 @@ private:
                 if (key >= 0 && key < static_cast<int>(paramArgs.size())) {
                     return collectParamPeriodicModuli(paramArgs[static_cast<size_t>(key)], {}, {}, indKey,
                                                       startIv, offset, step, changing, frame,
-                                                      mods, strict, depth + 1);
+                                                      mods, strict, depth + 1, rangeNiter);
                 }
                 return key != indKey && !changing.count(key);
             }
@@ -6541,20 +6545,17 @@ private:
                 if (!paramArgs.empty()) return false;
                 auto found = funcs.find(e->name);
                 if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
-                const Expr *ret = nullptr;
-                vector<pair<int, const Expr *>> aliases;
-                if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) return false;
                 vector<const Expr *> args;
                 args.reserve(e->args.size());
                 for (auto &arg : e->args) args.push_back(arg.get());
-                return collectParamPeriodicModuli(ret, args, aliasMapFromList(aliases), indKey,
-                                                  startIv, offset, step,
-                                                  changing, frame, mods, strict, depth + 1);
+                return collectPeriodicPureHelperFunction(found->second, args, indKey, startIv,
+                                                         offset, step, changing, frame, mods,
+                                                         true, depth + 1, rangeNiter);
             }
             case Expr::Kind::Unary:
-                if (strict && e->opc == OPC_NOT) return false;
                 return collectParamPeriodicModuli(e->lhs.get(), paramArgs, localAliases, indKey, startIv, offset,
-                                                  step, changing, frame, mods, strict, depth + 1);
+                                                  step, changing, frame, mods, strict, depth + 1,
+                                                  rangeNiter);
             case Expr::Kind::Binary:
                 if (e->opc == OPC_MOD) {
                     const Expr *lhs = resolveLocalAliasExpr(e->lhs.get(), localAliases, depth + 1);
@@ -6562,9 +6563,14 @@ private:
                     int32_t off = 0;
                     int32_t m = 0;
                     if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m == numeric_limits<int32_t>::min()) return false;
                     if (m < 0) m = -m;
                     if (extractInductionPlusConstWithParams(lhs, paramArgs, changing, frame,
                                                             key, off) && key == indKey) {
+                        if (rangeNiter &&
+                            !nonnegativeInductionRange(startIv,
+                                                       static_cast<int64_t>(offset) + off,
+                                                       step, rangeNiter)) return false;
                         if (m > 1) mods.push_back(m);
                         return true;
                     }
@@ -6576,6 +6582,10 @@ private:
                             step <= 0) {
                             return false;
                         }
+                        if (rangeNiter &&
+                            !nonnegativeInductionRange(startIv,
+                                                       static_cast<int64_t>(offset) + off,
+                                                       step, rangeNiter)) return false;
                         int64_t first = static_cast<int64_t>(startIv) + offset + off;
                         if (first < 0) return false;
                         uint64_t period = static_cast<uint64_t>(divv) * static_cast<uint64_t>(m);
@@ -6583,21 +6593,116 @@ private:
                         if (m > 1 && period > 1) mods.push_back(static_cast<int32_t>(period));
                         return true;
                     }
-                    return false;
+                    return collectParamPeriodicModuli(e->lhs.get(), paramArgs, localAliases,
+                                                       indKey, startIv, offset, step, changing,
+                                                       frame, mods, strict, depth + 1, rangeNiter);
                 }
                 if (strict && e->opc == OPC_DIV) return false;
-                if (strict && !(e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL)) return false;
+                if (strict && !(e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL ||
+                                e->opc == OPC_LT || e->opc == OPC_GT || e->opc == OPC_LE ||
+                                e->opc == OPC_GE || e->opc == OPC_EQ || e->opc == OPC_NE ||
+                                e->opc == OPC_AND || e->opc == OPC_OR)) return false;
                 return collectParamPeriodicModuli(e->lhs.get(), paramArgs, localAliases, indKey, startIv, offset,
-                                                  step, changing, frame, mods, strict, depth + 1) &&
+                                                  step, changing, frame, mods, strict, depth + 1,
+                                                  rangeNiter) &&
                        collectParamPeriodicModuli(e->rhs.get(), paramArgs, localAliases, indKey, startIv, offset,
-                                                  step, changing, frame, mods, strict, depth + 1);
+                                                  step, changing, frame, mods, strict, depth + 1,
+                                                  rangeNiter);
         }
         return false;
     }
 
+    PeriodicHelperFlow collectPeriodicPureHelperStmt(
+        const Stmt *s, const vector<const Expr *> &paramArgs,
+        unordered_map<int, const Expr *> &localAliases,
+        int indKey, int32_t startIv, int32_t offset, int32_t step,
+        const unordered_set<int> &changing, const int32_t *frame,
+        vector<int32_t> &mods, bool requirePeriodicReturns, int depth,
+        uint64_t rangeNiter) const {
+        if (!s || depth > 12) return PeriodicHelperFlow::Fail;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                for (auto &child : s->stmts) {
+                    PeriodicHelperFlow flow = collectPeriodicPureHelperStmt(
+                        child.get(), paramArgs, localAliases, indKey, startIv, offset, step,
+                        changing, frame, mods, requirePeriodicReturns, depth, rangeNiter);
+                    if (flow != PeriodicHelperFlow::FallsThrough) return flow;
+                }
+                return PeriodicHelperFlow::FallsThrough;
+            }
+            case Stmt::Kind::Empty:
+                return PeriodicHelperFlow::FallsThrough;
+            case Stmt::Kind::DeclStmt:
+                if (s->fastDeadStore) return PeriodicHelperFlow::FallsThrough;
+                if (!s->decl || !s->decl->init) return PeriodicHelperFlow::Fail;
+                localAliases[s->decl->fastSlot] = s->decl->init.get();
+                return PeriodicHelperFlow::FallsThrough;
+            case Stmt::Kind::If: {
+                if (!collectParamPeriodicModuli(s->expr.get(), paramArgs, localAliases, indKey,
+                                                startIv, offset, step, changing, frame,
+                                                mods, true, depth + 1, rangeNiter)) {
+                    return PeriodicHelperFlow::Fail;
+                }
+                auto thenAliases = localAliases;
+                PeriodicHelperFlow thenFlow = collectPeriodicPureHelperStmt(
+                    s->thenStmt.get(), paramArgs, thenAliases, indKey, startIv, offset, step,
+                    changing, frame, mods, requirePeriodicReturns, depth + 1, rangeNiter);
+                if (thenFlow == PeriodicHelperFlow::Fail) return PeriodicHelperFlow::Fail;
+                PeriodicHelperFlow elseFlow = PeriodicHelperFlow::FallsThrough;
+                if (s->elseStmt) {
+                    auto elseAliases = localAliases;
+                    elseFlow = collectPeriodicPureHelperStmt(
+                        s->elseStmt.get(), paramArgs, elseAliases, indKey, startIv, offset, step,
+                        changing, frame, mods, requirePeriodicReturns, depth + 1, rangeNiter);
+                    if (elseFlow == PeriodicHelperFlow::Fail) return PeriodicHelperFlow::Fail;
+                }
+                return thenFlow == PeriodicHelperFlow::Returns &&
+                               elseFlow == PeriodicHelperFlow::Returns
+                           ? PeriodicHelperFlow::Returns
+                           : PeriodicHelperFlow::FallsThrough;
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr) return PeriodicHelperFlow::Fail;
+                if (requirePeriodicReturns &&
+                    !collectParamPeriodicModuli(s->expr.get(), paramArgs, localAliases,
+                                                indKey, startIv, offset, step, changing, frame,
+                                                mods, true, depth + 1, rangeNiter)) {
+                    return PeriodicHelperFlow::Fail;
+                }
+                return PeriodicHelperFlow::Returns;
+            case Stmt::Kind::ExprStmt:
+                return exprHasCallS(s->expr.get()) ? PeriodicHelperFlow::Fail
+                                                   : PeriodicHelperFlow::FallsThrough;
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return PeriodicHelperFlow::Fail;
+        }
+        return PeriodicHelperFlow::Fail;
+    }
+
+    bool collectPeriodicPureHelperFunction(const Function *f, const vector<const Expr *> &args,
+                                           int indKey, int32_t startIv, int32_t offset, int32_t step,
+                                           const unordered_set<int> &changing, const int32_t *frame,
+                                           vector<int32_t> &mods, bool requirePeriodicReturns,
+                                           int depth, uint64_t rangeNiter = 0) const {
+        if (!f || f->returnsVoid || args.size() != f->params.size() || depth > 8 ||
+            !sefFuncs.count(f) || functionReadsChangingGlobalTransitively(f, changing)) {
+            return false;
+        }
+        unordered_map<int, const Expr *> localAliases;
+        return collectPeriodicPureHelperStmt(f->body.get(), args, localAliases, indKey,
+                                             startIv, offset, step, changing, frame,
+                                             mods, requirePeriodicReturns, depth + 1,
+                                             rangeNiter) ==
+               PeriodicHelperFlow::Returns;
+    }
+
     bool collectStrictPeriodicModuli(const Expr *e, int indKey, int32_t startIv, int32_t offset,
                                      int32_t step, const unordered_set<int> &changing,
-                                     const int32_t *frame, vector<int32_t> &mods) const {
+                                     const int32_t *frame, vector<int32_t> &mods,
+                                     uint64_t rangeNiter = 0) const {
         if (!e) return true;
         switch (e->kind) {
             case Expr::Kind::Number:
@@ -6608,19 +6713,23 @@ private:
             }
             case Expr::Kind::Call:
                 return collectParamPeriodicModuli(e, {}, {}, indKey, startIv, offset, step,
-                                                  changing, frame, mods, true, 0);
+                                                  changing, frame, mods, true, 0, rangeNiter);
             case Expr::Kind::Unary:
-                return e->opc != OPC_NOT &&
-                       collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset, step,
-                                                   changing, frame, mods);
+                return collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset, step,
+                                                   changing, frame, mods, rangeNiter);
             case Expr::Kind::Binary:
                 if (e->opc == OPC_MOD) {
                     int key = -1;
                     int32_t off = 0;
                     int32_t m = 0;
                     if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m == numeric_limits<int32_t>::min()) return false;
                     if (m < 0) m = -m;
                     if (extractInductionPlusConst(e->lhs.get(), key, off) && key == indKey) {
+                        if (rangeNiter &&
+                            !nonnegativeInductionRange(startIv,
+                                                       static_cast<int64_t>(offset) + off,
+                                                       step, rangeNiter)) return false;
                         if (m > 1) mods.push_back(m);
                         return true;
                     }
@@ -6631,6 +6740,10 @@ private:
                             step <= 0) {
                             return false;
                         }
+                        if (rangeNiter &&
+                            !nonnegativeInductionRange(startIv,
+                                                       static_cast<int64_t>(offset) + off,
+                                                       step, rangeNiter)) return false;
                         int64_t first = static_cast<int64_t>(startIv) + offset + off;
                         if (first < 0) return false;
                         uint64_t period = static_cast<uint64_t>(divv) * static_cast<uint64_t>(m);
@@ -6638,16 +6751,20 @@ private:
                         if (m > 1 && period > 1) mods.push_back(static_cast<int32_t>(period));
                         return true;
                     }
-                    return false;
+                    return collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset,
+                                                       step, changing, frame, mods, rangeNiter);
                 }
                 if (e->opc == OPC_DIV) {
                     return false;
                 }
-                if (e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL) {
+                if (e->opc == OPC_ADD || e->opc == OPC_SUB || e->opc == OPC_MUL ||
+                    e->opc == OPC_LT || e->opc == OPC_GT || e->opc == OPC_LE ||
+                    e->opc == OPC_GE || e->opc == OPC_EQ || e->opc == OPC_NE ||
+                    e->opc == OPC_AND || e->opc == OPC_OR) {
                     return collectStrictPeriodicModuli(e->lhs.get(), indKey, startIv, offset, step,
-                                                       changing, frame, mods) &&
+                                                       changing, frame, mods, rangeNiter) &&
                            collectStrictPeriodicModuli(e->rhs.get(), indKey, startIv, offset, step,
-                                                       changing, frame, mods);
+                                                       changing, frame, mods, rangeNiter);
                 }
                 return false;
         }
@@ -6656,7 +6773,7 @@ private:
 
     bool collectPeriodicCondModuli(const Expr *e, int indKey, int32_t startIv, int32_t step,
                                    const unordered_set<int> &changing, const int32_t *frame,
-                                   vector<int32_t> &mods) const {
+                                   vector<int32_t> &mods, uint64_t rangeNiter = 0) const {
         if (!e) return true;
         switch (e->kind) {
             case Expr::Kind::Number:
@@ -6665,19 +6782,35 @@ private:
                 int key = exprSlotKey(e);
                 return key != indKey && !changing.count(key);
             }
-            case Expr::Kind::Call:
-                return collectParamPeriodicModuli(e, {}, {}, indKey, startIv, 0, step,
-                                                  changing, frame, mods, false, 0);
+            case Expr::Kind::Call: {
+                if (!collectParamPeriodicModuli(e, {}, {}, indKey, startIv, 0, step,
+                                                changing, frame, mods, false, 0,
+                                                rangeNiter)) return false;
+                if (rangeNiter) {
+                    vector<int32_t> postMods;
+                    if (!collectParamPeriodicModuli(e, {}, {}, indKey, startIv, step, step,
+                                                    changing, frame, postMods, false, 0,
+                                                    rangeNiter)) return false;
+                }
+                return true;
+            }
             case Expr::Kind::Unary:
-                return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step, changing, frame, mods);
+                return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step,
+                                                  changing, frame, mods, rangeNiter);
             case Expr::Kind::Binary:
                 if (e->opc == OPC_MOD) {
                     int key = -1;
                     int32_t off = 0;
                     int32_t m = 0;
                     if (!evalExprNoChanging(e->rhs.get(), changing, frame, m) || m == 0) return false;
+                    if (m == numeric_limits<int32_t>::min()) return false;
                     if (m < 0) m = -m;
                     if (extractInductionPlusConst(e->lhs.get(), key, off) && key == indKey) {
+                        if (rangeNiter &&
+                            (!nonnegativeInductionRange(startIv, off, step, rangeNiter) ||
+                             !nonnegativeInductionRange(startIv,
+                                                        static_cast<int64_t>(step) + off,
+                                                        step, rangeNiter))) return false;
                         if (m > 1) mods.push_back(m);
                         return true;
                     }
@@ -6688,6 +6821,11 @@ private:
                             step <= 0) {
                             return false;
                         }
+                        if (rangeNiter &&
+                            (!nonnegativeInductionRange(startIv, off, step, rangeNiter) ||
+                             !nonnegativeInductionRange(startIv,
+                                                        static_cast<int64_t>(step) + off,
+                                                        step, rangeNiter))) return false;
                         int64_t first = static_cast<int64_t>(startIv) + off;
                         if (first < 0) return false;
                         uint64_t period = static_cast<uint64_t>(divv) * static_cast<uint64_t>(m);
@@ -6697,8 +6835,125 @@ private:
                     }
                     return false;
                 }
-                return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step, changing, frame, mods) &&
-                       collectPeriodicCondModuli(e->rhs.get(), indKey, startIv, step, changing, frame, mods);
+                return collectPeriodicCondModuli(e->lhs.get(), indKey, startIv, step,
+                                                  changing, frame, mods, rangeNiter) &&
+                       collectPeriodicCondModuli(e->rhs.get(), indKey, startIv, step,
+                                                  changing, frame, mods, rangeNiter);
+        }
+        return false;
+    }
+
+    bool evalPureHelperStmtWithInductionValue(const Stmt *s, int indKey, int32_t indValue,
+                                              const unordered_set<int> &changing,
+                                              const int32_t *frame,
+                                              unordered_map<int, int32_t> &locals, int depth,
+                                              bool &returned, int32_t &result) const {
+        if (!s || depth > 12) return false;
+        if (returned) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!evalPureHelperStmtWithInductionValue(child.get(), indKey, indValue,
+                                                              changing, frame, locals, depth,
+                                                              returned, result)) return false;
+                    if (returned) break;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
+                if (!s->decl || !s->decl->init) return false;
+                int32_t value = 0;
+                if (!evalExprWithInductionValueLocal(s->decl->init.get(), indKey, indValue,
+                                                     changing, frame, locals, depth + 1,
+                                                     value)) return false;
+                locals[s->decl->fastSlot] = value;
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                if (s->fastDeadStore) return true;
+                if (s->fastAssignGlobal) return false;
+                int32_t value = 0;
+                if (!evalExprWithInductionValueLocal(s->expr.get(), indKey, indValue,
+                                                     changing, frame, locals, depth + 1,
+                                                     value)) return false;
+                locals[s->fastAssignIndex] = value;
+                return true;
+            }
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                if (!evalExprWithInductionValueLocal(s->expr.get(), indKey, indValue,
+                                                     changing, frame, locals, depth + 1,
+                                                     cond)) return false;
+                const Stmt *branch = truthy(cond) ? s->thenStmt.get() : s->elseStmt.get();
+                return !branch || evalPureHelperStmtWithInductionValue(branch, indKey, indValue,
+                                                                       changing, frame, locals,
+                                                                       depth + 1, returned, result);
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr ||
+                    !evalExprWithInductionValueLocal(s->expr.get(), indKey, indValue,
+                                                     changing, frame, locals, depth + 1,
+                                                     result)) return false;
+                returned = true;
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
+    bool evalPeriodicPolyHelperStmt(const Stmt *s, unordered_map<int, PolyS> &aliases,
+                                    unordered_map<int, int32_t> &concrete,
+                                    const unordered_set<int> &changing, const int32_t *frame,
+                                    int depth, bool &returned, PolyS &result) const {
+        if (!s || depth > 12) return false;
+        if (returned) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!evalPeriodicPolyHelperStmt(child.get(), aliases, concrete, changing,
+                                                    frame, depth, returned, result)) return false;
+                    if (returned) break;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (s->fastDeadStore) return true;
+                if (!s->decl || !s->decl->init) return false;
+                PolyS value;
+                if (!polyExprFromAliases(s->decl->init.get(), aliases, frame, value, 0)) return false;
+                aliases[s->decl->fastSlot] = value;
+                concrete[s->decl->fastSlot] = static_cast<int32_t>(value.c[0]);
+                return true;
+            }
+            case Stmt::Kind::If: {
+                int32_t cond = 0;
+                if (!evalExprWithInductionValueLocal(s->expr.get(), -1, 0, changing, frame,
+                                                     concrete, depth + 1, cond)) return false;
+                const Stmt *branch = truthy(cond) ? s->thenStmt.get() : s->elseStmt.get();
+                return !branch || evalPeriodicPolyHelperStmt(branch, aliases, concrete, changing,
+                                                             frame, depth + 1, returned, result);
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr || !polyExprFromAliases(s->expr.get(), aliases, frame, result, 0)) {
+                    return false;
+                }
+                returned = true;
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
         }
         return false;
     }
@@ -6730,10 +6985,8 @@ private:
             }
             case Expr::Kind::Call: {
                 auto found = funcs.find(e->name);
-                if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
-                const Expr *ret = nullptr;
-                vector<pair<int, const Expr *>> aliases;
-                if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) return false;
+                if (found == funcs.end() || e->args.size() != found->second->params.size() ||
+                    found->second->returnsVoid || !sefFuncs.count(found->second)) return false;
                 unordered_map<int, int32_t> calleeLocals;
                 for (size_t i = 0; i < e->args.size(); ++i) {
                     int32_t v = 0;
@@ -6743,16 +6996,11 @@ private:
                     }
                     calleeLocals[static_cast<int>(i)] = v;
                 }
-                for (auto &alias : aliases) {
-                    int32_t v = 0;
-                    if (!evalExprWithInductionValueLocal(alias.second, indKey, indValue, changing,
-                                                         frame, calleeLocals, depth + 1, v)) {
-                        return false;
-                    }
-                    calleeLocals[alias.first] = v;
-                }
-                return evalExprWithInductionValueLocal(ret, indKey, indValue, changing, frame,
-                                                       calleeLocals, depth + 1, out);
+                bool returned = false;
+                if (!evalPureHelperStmtWithInductionValue(found->second->body.get(), indKey,
+                                                          indValue, changing, frame, calleeLocals,
+                                                          depth + 1, returned, out)) return false;
+                return returned;
             }
             case Expr::Kind::Unary: {
                 int32_t v = 0;
@@ -6818,12 +7066,60 @@ private:
         return evalExprWithInductionValueLocal(e, indKey, indValue, changing, frame, locals, 0, out);
     }
 
+    bool nonnegativeInductionRange(int32_t startIv, int64_t offset, int32_t step,
+                                   uint64_t niter) const {
+        if (niter == 0) return true;
+        int64_t first = 0;
+        if (__builtin_add_overflow(static_cast<int64_t>(startIv), offset, &first)) return false;
+        int64_t delta = 0;
+        if (__builtin_mul_overflow(static_cast<int64_t>(step),
+                                   static_cast<int64_t>(niter - 1), &delta)) return false;
+        int64_t last = 0;
+        if (__builtin_add_overflow(first, delta, &last)) return false;
+        return first >= 0 && first <= numeric_limits<int32_t>::max() &&
+               last >= 0 && last <= numeric_limits<int32_t>::max();
+    }
+
+    bool periodicHelperCallRangesSafe(const Expr *e, int indKey, int32_t startIv,
+                                      int32_t offset, int32_t step, uint64_t niter,
+                                      const unordered_set<int> &changing,
+                                      const int32_t *frame) const {
+        if (!e) return true;
+        if (e->kind == Expr::Kind::Call) {
+            for (auto &arg : e->args) {
+                unordered_set<int> vars;
+                collectExprVarKeys(arg.get(), vars);
+                if (!vars.count(indKey)) continue;
+                int key = -1;
+                int32_t argOffset = 0;
+                if (!extractInductionPlusConstWithParams(arg.get(), {}, changing, frame,
+                                                         key, argOffset) || key != indKey ||
+                    !nonnegativeInductionRange(startIv,
+                                               static_cast<int64_t>(offset) + argOffset,
+                                               step, niter)) return false;
+            }
+        }
+        if (!periodicHelperCallRangesSafe(e->lhs.get(), indKey, startIv, offset, step,
+                                          niter, changing, frame) ||
+            !periodicHelperCallRangesSafe(e->rhs.get(), indKey, startIv, offset, step,
+                                          niter, changing, frame)) return false;
+        for (auto &arg : e->args) {
+            if (!periodicHelperCallRangesSafe(arg.get(), indKey, startIv, offset, step,
+                                              niter, changing, frame)) return false;
+        }
+        return true;
+    }
+
     bool sumStrictPeriodicExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
                                int32_t step, uint64_t niter, const unordered_set<int> &changing,
                                const int32_t *frame, uint32_t &out,
                                uint64_t *workLeft = nullptr) const {
+        if (exprHasCallS(e) &&
+            !periodicHelperCallRangesSafe(e, indKey, startIv, offset, step, niter,
+                                          changing, frame)) return false;
         vector<int32_t> mods;
-        if (!collectStrictPeriodicModuli(e, indKey, startIv, offset, step, changing, frame, mods) ||
+        if (!collectStrictPeriodicModuli(e, indKey, startIv, offset, step, changing, frame,
+                                         mods, niter) ||
             mods.empty()) {
             return false;
         }
@@ -6857,6 +7153,72 @@ private:
         uint64_t rem = niter % period;
         out = static_cast<uint32_t>(static_cast<uint64_t>(cycle) * static_cast<uint32_t>(whole));
         for (uint64_t t = 0; t < rem; ++t) out += vals[static_cast<size_t>(t)];
+        return true;
+    }
+
+    bool sumPeriodicPolynomialHelperCall(const Expr *e, int indKey, int32_t startIv,
+                                         int32_t offset, int32_t step, uint64_t niter,
+                                         const unordered_set<int> &changing, const int32_t *frame,
+                                         uint32_t &out, uint64_t *workLeft = nullptr) const {
+        if (!e || e->kind != Expr::Kind::Call) return false;
+        if (!periodicHelperCallRangesSafe(e, indKey, startIv, offset, step, niter,
+                                          changing, frame)) return false;
+        auto found = funcs.find(e->name);
+        if (found == funcs.end() || !found->second || found->second->returnsVoid ||
+            e->args.size() != found->second->params.size()) return false;
+
+        vector<const Expr *> args;
+        args.reserve(e->args.size());
+        for (auto &arg : e->args) args.push_back(arg.get());
+        vector<int32_t> mods;
+        if (!collectPeriodicPureHelperFunction(found->second, args, indKey, startIv, offset,
+                                               step, changing, frame, mods, false, 0, niter) ||
+            mods.empty()) return false;
+
+        uint64_t period = 1;
+        uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step))
+                                    : static_cast<uint64_t>(step);
+        for (int32_t mod : mods) {
+            uint64_t m = static_cast<uint64_t>(mod);
+            uint64_t reduced = m / gcd64(m, absStep % m);
+            period = lcmCapped(period, reduced, kMaxPeriodicPhases);
+            if (period > kMaxPeriodicPhases) return false;
+        }
+        if (period == 0 || period > kMaxPeriodicPhases) return false;
+        if (workLeft) {
+            if (period > *workLeft) throw TooHard();
+            *workLeft -= period;
+        }
+
+        uint32_t total = 0;
+        uint64_t phases = min(period, niter);
+        int32_t phaseStep = static_cast<int32_t>(static_cast<uint32_t>(step) *
+                                                static_cast<uint32_t>(period));
+        unordered_map<int, PolyS> noAliases;
+        for (uint64_t phase = 0; phase < phases; ++phase) {
+            if ((phase & 255u) == 0u && pastDeadline()) throw TooHard();
+            int32_t phaseIv = static_cast<int32_t>(
+                static_cast<uint32_t>(startIv) + static_cast<uint32_t>(offset) +
+                static_cast<uint32_t>(step) * static_cast<uint32_t>(phase));
+            unordered_map<int, PolyS> aliases;
+            unordered_map<int, int32_t> concrete;
+            for (size_t i = 0; i < e->args.size(); ++i) {
+                PolyS value;
+                if (!polyExpr(e->args[i].get(), indKey, phaseIv, phaseStep, changing,
+                              noAliases, frame, value)) return false;
+                aliases[static_cast<int>(i)] = value;
+                concrete[static_cast<int>(i)] = static_cast<int32_t>(value.c[0]);
+            }
+            bool returned = false;
+            PolyS result;
+            if (!evalPeriodicPolyHelperStmt(found->second->body.get(), aliases, concrete,
+                                            changing, frame, 0, returned, result) || !returned) {
+                return false;
+            }
+            uint64_t count = (niter - 1 - phase) / period + 1;
+            total += sumPoly(result, count);
+        }
+        out = total;
         return true;
     }
 
@@ -7245,13 +7607,14 @@ private:
 
     bool collectIfPeriodicModuli(const Stmt *s, int indKey, int32_t startIv, int32_t step,
                                  const unordered_set<int> &changing, const int32_t *frame,
-                                 vector<int32_t> &mods, bool &sawIf) const {
+                                 vector<int32_t> &mods, bool &sawIf,
+                                 uint64_t rangeNiter = 0) const {
         if (!s) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
                     if (!collectIfPeriodicModuli(child.get(), indKey, startIv, step, changing, frame,
-                                                 mods, sawIf)) {
+                                                 mods, sawIf, rangeNiter)) {
                         return false;
                     }
                 }
@@ -7267,15 +7630,15 @@ private:
                 if (usesInduction) {
                     size_t before = mods.size();
                     if (!collectPeriodicCondModuli(s->expr.get(), indKey, startIv, step,
-                                                   changing, frame, mods)) {
+                                                   changing, frame, mods, rangeNiter)) {
                         return false;
                     }
                     if (mods.size() == before) return false;
                 }
                 return collectIfPeriodicModuli(s->thenStmt.get(), indKey, startIv, step, changing,
-                                               frame, mods, sawIf) &&
+                                               frame, mods, sawIf, rangeNiter) &&
                        collectIfPeriodicModuli(s->elseStmt.get(), indKey, startIv, step, changing,
-                                               frame, mods, sawIf);
+                                               frame, mods, sawIf, rangeNiter);
             }
             case Stmt::Kind::While:
             case Stmt::Kind::Break:
@@ -7384,6 +7747,10 @@ private:
                     } else if (ctx.aliases.empty() &&
                                (sumPureLoopHelperCall(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                       ctx.count, changing, frame, sum) ||
+                                sumPeriodicPolynomialHelperCall(term, indKey, ctx.phaseIv,
+                                                                ctx.indOffset, ctx.qStep,
+                                                                ctx.count, changing, frame, sum,
+                                                                ctx.strictWorkLeft) ||
                                 sumQuadraticModExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                     ctx.count, changing, frame, sum) ||
                                 sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
@@ -7449,7 +7816,8 @@ private:
 
         vector<int32_t> moduli;
         bool sawIf = false;
-        if (!collectIfPeriodicModuli(s->body.get(), indKey, startIv, step, changing, frame, moduli, sawIf) ||
+        if (!collectIfPeriodicModuli(s->body.get(), indKey, startIv, step, changing, frame,
+                                     moduli, sawIf, niter) ||
             !sawIf) {
             return FoldStructFail;
         }
@@ -7581,6 +7949,8 @@ private:
                 } else if (aliases.empty()) {
                     uint32_t sum = 0;
                     if (sumPureLoopHelperCall(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
+                        sumPeriodicPolynomialHelperCall(term, indKey, startIv, iterOffset, step, niter,
+                                                        changing, frame, sum) ||
                         sumQuadraticModExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumStrictPeriodicExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumLinearDivExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum)) {
