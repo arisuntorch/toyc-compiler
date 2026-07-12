@@ -7592,6 +7592,463 @@ private:
         return true;
     }
 
+    // Symbolically execute a pure helper's short loop after splitting the caller by residue phase.
+    bool boundedHelperRemainder(const PolyS &value, int32_t divisor, uint64_t count,
+                                int32_t &out) const {
+        if (divisor == 0 || divisor == numeric_limits<int32_t>::min() || count == 0 ||
+            value.c[2] != 0 || value.c[3] != 0) return false;
+        int32_t first = wrap32(value.c[0]);
+        int32_t delta = wrap32(value.c[1]);
+        int64_t modulus = divisor < 0 ? -static_cast<int64_t>(divisor)
+                                      : static_cast<int64_t>(divisor);
+        if (static_cast<int64_t>(delta) % modulus != 0 ||
+            count - 1 > static_cast<uint64_t>(numeric_limits<int64_t>::max())) return false;
+        int64_t span = 0;
+        if (__builtin_mul_overflow(static_cast<int64_t>(delta),
+                                   static_cast<int64_t>(count - 1), &span)) return false;
+        int64_t last = 0;
+        if (__builtin_add_overflow(static_cast<int64_t>(first), span, &last) ||
+            last < numeric_limits<int32_t>::min() ||
+            last > numeric_limits<int32_t>::max()) return false;
+        int32_t last32 = static_cast<int32_t>(last);
+        if (divisor == -1 &&
+            (first == numeric_limits<int32_t>::min() ||
+             last32 == numeric_limits<int32_t>::min())) return false;
+        int32_t remainder = mod32(first, divisor);
+        bool sameSign = (first >= 0 && last32 >= 0) || (first <= 0 && last32 <= 0);
+        if (!sameSign && remainder != 0) return false;
+        out = remainder;
+        return true;
+    }
+
+    bool boundedHelperPolyExpr(const Expr *e, const unordered_map<int, PolyS> &aliases,
+                               const int32_t *frame, uint64_t count, PolyS &out,
+                               int depth) const {
+        if (!e || depth > 12) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out = polyConst(static_cast<uint32_t>(wrap32(e->value)));
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprSlotKey(e);
+                auto it = aliases.find(key);
+                if (it != aliases.end()) {
+                    out = it->second;
+                    return true;
+                }
+                if (!(key & kGlobalBit)) return false;
+                out = polyConst(static_cast<uint32_t>(readSlot(key, frame)));
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                PolyS value;
+                if (!boundedHelperPolyExpr(e->lhs.get(), aliases, frame, count,
+                                           value, depth + 1)) return false;
+                if (e->opc == OPC_PLUS) {
+                    out = value;
+                    return true;
+                }
+                if (e->opc == OPC_NEG) {
+                    out = polyNeg(value);
+                    return true;
+                }
+                if (e->opc == OPC_NOT) {
+                    auto constant = polyConstValue(value);
+                    if (!constant) return false;
+                    out = polyConst(!truthy(*constant));
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                PolyS lhs;
+                if (!boundedHelperPolyExpr(e->lhs.get(), aliases, frame, count,
+                                           lhs, depth + 1)) return false;
+                if (e->opc == OPC_AND || e->opc == OPC_OR) {
+                    auto lhsConst = polyConstValue(lhs);
+                    if (!lhsConst) return false;
+                    if (e->opc == OPC_AND && !truthy(*lhsConst)) {
+                        out = polyConst(0);
+                        return true;
+                    }
+                    if (e->opc == OPC_OR && truthy(*lhsConst)) {
+                        out = polyConst(1);
+                        return true;
+                    }
+                    PolyS rhs;
+                    if (!boundedHelperPolyExpr(e->rhs.get(), aliases, frame, count,
+                                               rhs, depth + 1)) return false;
+                    auto rhsConst = polyConstValue(rhs);
+                    if (!rhsConst) return false;
+                    out = polyConst(truthy(*rhsConst));
+                    return true;
+                }
+
+                PolyS rhs;
+                if (!boundedHelperPolyExpr(e->rhs.get(), aliases, frame, count,
+                                           rhs, depth + 1)) return false;
+                if (e->opc == OPC_ADD) {
+                    out = polyAdd(lhs, rhs);
+                    return true;
+                }
+                if (e->opc == OPC_SUB) {
+                    out = polySub(lhs, rhs);
+                    return true;
+                }
+                if (e->opc == OPC_MUL) return polyMul(lhs, rhs, out);
+
+                auto lhsConst = polyConstValue(lhs);
+                auto rhsConst = polyConstValue(rhs);
+                if (e->opc == OPC_DIV) {
+                    if (!lhsConst || !rhsConst || *rhsConst == 0 ||
+                        (*lhsConst == numeric_limits<int32_t>::min() && *rhsConst == -1)) {
+                        return false;
+                    }
+                    out = polyConst(static_cast<uint32_t>(div32(*lhsConst, *rhsConst)));
+                    return true;
+                }
+                if (e->opc == OPC_MOD) {
+                    if (!rhsConst) return false;
+                    int32_t remainder = 0;
+                    if (!boundedHelperRemainder(lhs, *rhsConst, count, remainder)) return false;
+                    out = polyConst(static_cast<uint32_t>(remainder));
+                    return true;
+                }
+                if (!lhsConst || !rhsConst) return false;
+                int32_t value = 0;
+                switch (e->opc) {
+                    case OPC_LT: value = *lhsConst < *rhsConst; break;
+                    case OPC_GT: value = *lhsConst > *rhsConst; break;
+                    case OPC_LE: value = *lhsConst <= *rhsConst; break;
+                    case OPC_GE: value = *lhsConst >= *rhsConst; break;
+                    case OPC_EQ: value = *lhsConst == *rhsConst; break;
+                    case OPC_NE: value = *lhsConst != *rhsConst; break;
+                    default: return false;
+                }
+                out = polyConst(static_cast<uint32_t>(value));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool boundedHelperInvariantValue(
+        const Expr *e, const unordered_map<int, const Expr *> &localAliases,
+        const unordered_set<int> &changing, const int32_t *frame, int32_t &out) const {
+        e = resolveLocalAliasExpr(e, localAliases);
+        if (!e || exprHasCallS(e)) return false;
+        unordered_set<int> vars;
+        collectExprVarKeys(e, vars);
+        for (int key : vars) {
+            if (!(key & kGlobalBit) || changing.count(key)) return false;
+        }
+        return evalExprNoChanging(e, changing, frame, out);
+    }
+
+    bool collectBoundedHelperModuliExpr(
+        const Expr *e, const vector<const Expr *> &paramArgs,
+        const unordered_map<int, const Expr *> &localAliases,
+        int indKey, int32_t startIv, int32_t offset, int32_t step,
+        const unordered_set<int> &changing, const int32_t *frame,
+        uint64_t niter, vector<int32_t> &mods, int depth) const {
+        if (!e) return true;
+        if (depth > 16) return false;
+        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Binary && e->opc == OPC_MOD) {
+            const Expr *lhs = resolveLocalAliasExpr(e->lhs.get(), localAliases, depth + 1);
+            int32_t modulus = 0;
+            if (lhs && boundedHelperInvariantValue(e->rhs.get(), localAliases, changing,
+                                                  frame, modulus) && modulus != 0 &&
+                modulus != numeric_limits<int32_t>::min()) {
+                unordered_set<int> vars;
+                collectExprVarKeys(lhs, vars);
+                bool hasHelperLocal = false;
+                for (int key : vars) {
+                    if (!(key & kGlobalBit) &&
+                        key >= static_cast<int>(paramArgs.size())) {
+                        hasHelperLocal = true;
+                        break;
+                    }
+                }
+                int key = -1;
+                int32_t localOffset = 0;
+                if (!hasHelperLocal &&
+                    extractInductionPlusConstWithParams(lhs, paramArgs, changing, frame,
+                                                        key, localOffset) && key == indKey &&
+                    nonnegativeInductionRange(startIv,
+                                               static_cast<int64_t>(offset) + localOffset,
+                                               step, niter)) {
+                    if (modulus < 0) modulus = -modulus;
+                    if (modulus > 1) mods.push_back(modulus);
+                }
+            }
+        }
+        if (!collectBoundedHelperModuliExpr(e->lhs.get(), paramArgs, localAliases, indKey,
+                                            startIv, offset, step, changing, frame, niter,
+                                            mods, depth + 1) ||
+            !collectBoundedHelperModuliExpr(e->rhs.get(), paramArgs, localAliases, indKey,
+                                            startIv, offset, step, changing, frame, niter,
+                                            mods, depth + 1)) return false;
+        for (auto &arg : e->args) {
+            if (!collectBoundedHelperModuliExpr(arg.get(), paramArgs, localAliases, indKey,
+                                                startIv, offset, step, changing, frame, niter,
+                                                mods, depth + 1)) return false;
+        }
+        return true;
+    }
+
+    bool collectBoundedHelperModuliStmt(
+        const Stmt *s, const vector<const Expr *> &paramArgs,
+        unordered_map<int, const Expr *> &localAliases,
+        int indKey, int32_t startIv, int32_t offset, int32_t step,
+        const unordered_set<int> &changing, const int32_t *frame,
+        uint64_t niter, vector<int32_t> &mods, bool &sawWhile, int depth) const {
+        if (!s) return true;
+        if (depth > 16) return false;
+        if (s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectBoundedHelperModuliStmt(child.get(), paramArgs, localAliases,
+                                                       indKey, startIv, offset, step, changing,
+                                                       frame, niter, mods, sawWhile, depth)) {
+                        return false;
+                    }
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::DeclStmt:
+                if (!s->decl || !s->decl->init ||
+                    !collectBoundedHelperModuliExpr(s->decl->init.get(), paramArgs,
+                                                    localAliases, indKey, startIv, offset,
+                                                    step, changing, frame, niter, mods, 0)) {
+                    return false;
+                }
+                localAliases[s->decl->fastSlot] = s->decl->init.get();
+                return true;
+            case Stmt::Kind::Assign: {
+                if (s->fastAssignGlobal ||
+                    !collectBoundedHelperModuliExpr(s->expr.get(), paramArgs, localAliases,
+                                                    indKey, startIv, offset, step, changing,
+                                                    frame, niter, mods, 0)) return false;
+                localAliases.erase(s->fastAssignIndex);
+                return true;
+            }
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                return s->expr && collectBoundedHelperModuliExpr(
+                    s->expr.get(), paramArgs, localAliases, indKey, startIv, offset, step,
+                    changing, frame, niter, mods, 0);
+            case Stmt::Kind::If: {
+                if (!collectBoundedHelperModuliExpr(s->expr.get(), paramArgs, localAliases,
+                                                    indKey, startIv, offset, step, changing,
+                                                    frame, niter, mods, 0)) return false;
+                auto before = localAliases;
+                auto thenAliases = before;
+                auto elseAliases = before;
+                if (!collectBoundedHelperModuliStmt(s->thenStmt.get(), paramArgs, thenAliases,
+                                                    indKey, startIv, offset, step, changing,
+                                                    frame, niter, mods, sawWhile, depth + 1) ||
+                    !collectBoundedHelperModuliStmt(s->elseStmt.get(), paramArgs, elseAliases,
+                                                    indKey, startIv, offset, step, changing,
+                                                    frame, niter, mods, sawWhile, depth + 1)) {
+                    return false;
+                }
+                localAliases.clear();
+                for (auto &kv : before) {
+                    auto thenIt = thenAliases.find(kv.first);
+                    auto elseIt = elseAliases.find(kv.first);
+                    if (thenIt != thenAliases.end() && elseIt != elseAliases.end() &&
+                        thenIt->second == kv.second && elseIt->second == kv.second) {
+                        localAliases.emplace(kv.first, kv.second);
+                    }
+                }
+                return true;
+            }
+            case Stmt::Kind::While: {
+                sawWhile = true;
+                if (!collectBoundedHelperModuliExpr(s->expr.get(), paramArgs, localAliases,
+                                                    indKey, startIv, offset, step, changing,
+                                                    frame, niter, mods, 0)) return false;
+                auto before = localAliases;
+                auto bodyAliases = before;
+                if (!collectBoundedHelperModuliStmt(s->body.get(), paramArgs, bodyAliases,
+                                                    indKey, startIv, offset, step, changing,
+                                                    frame, niter, mods, sawWhile, depth + 1)) {
+                    return false;
+                }
+                localAliases.clear();
+                for (auto &kv : before) {
+                    auto bodyIt = bodyAliases.find(kv.first);
+                    if (bodyIt != bodyAliases.end() && bodyIt->second == kv.second) {
+                        localAliases.emplace(kv.first, kv.second);
+                    }
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    enum class BoundedHelperFlow { Fail, Normal, Continue, Break, Return };
+
+    BoundedHelperFlow evalBoundedHelperStmt(
+        const Stmt *s, unordered_map<int, PolyS> &aliases, const int32_t *frame,
+        uint64_t count, uint64_t &workLeft, int depth, PolyS &result) const {
+        if (!s || depth > 16) return BoundedHelperFlow::Fail;
+        if (s->fastDeadStore) return BoundedHelperFlow::Normal;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    BoundedHelperFlow flow = evalBoundedHelperStmt(
+                        child.get(), aliases, frame, count, workLeft, depth, result);
+                    if (flow != BoundedHelperFlow::Normal) return flow;
+                }
+                return BoundedHelperFlow::Normal;
+            case Stmt::Kind::Empty:
+                return BoundedHelperFlow::Normal;
+            case Stmt::Kind::Break:
+                return BoundedHelperFlow::Break;
+            case Stmt::Kind::Continue:
+                return BoundedHelperFlow::Continue;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || !s->decl->init) return BoundedHelperFlow::Fail;
+                PolyS value;
+                if (!boundedHelperPolyExpr(s->decl->init.get(), aliases, frame, count,
+                                           value, 0)) return BoundedHelperFlow::Fail;
+                aliases[s->decl->fastSlot] = value;
+                return BoundedHelperFlow::Normal;
+            }
+            case Stmt::Kind::Assign: {
+                if (s->fastAssignGlobal) return BoundedHelperFlow::Fail;
+                PolyS value;
+                if (!boundedHelperPolyExpr(s->expr.get(), aliases, frame, count,
+                                           value, 0)) return BoundedHelperFlow::Fail;
+                aliases[s->fastAssignIndex] = value;
+                return BoundedHelperFlow::Normal;
+            }
+            case Stmt::Kind::ExprStmt:
+                return exprHasCallS(s->expr.get()) ? BoundedHelperFlow::Fail
+                                                   : BoundedHelperFlow::Normal;
+            case Stmt::Kind::If: {
+                PolyS condition;
+                if (!boundedHelperPolyExpr(s->expr.get(), aliases, frame, count,
+                                           condition, 0)) return BoundedHelperFlow::Fail;
+                auto constant = polyConstValue(condition);
+                if (!constant) return BoundedHelperFlow::Fail;
+                const Stmt *branch = truthy(*constant) ? s->thenStmt.get()
+                                                      : s->elseStmt.get();
+                return branch ? evalBoundedHelperStmt(branch, aliases, frame, count,
+                                                      workLeft, depth + 1, result)
+                              : BoundedHelperFlow::Normal;
+            }
+            case Stmt::Kind::While:
+                for (uint64_t iter = 0; iter <= 10000; ++iter) {
+                    PolyS condition;
+                    if (!boundedHelperPolyExpr(s->expr.get(), aliases, frame, count,
+                                               condition, 0)) return BoundedHelperFlow::Fail;
+                    auto constant = polyConstValue(condition);
+                    if (!constant) return BoundedHelperFlow::Fail;
+                    if (!truthy(*constant)) return BoundedHelperFlow::Normal;
+                    if (iter == 10000 || workLeft == 0) return BoundedHelperFlow::Fail;
+                    --workLeft;
+                    if ((workLeft & 255u) == 0u && pastDeadline()) return BoundedHelperFlow::Fail;
+                    BoundedHelperFlow flow = evalBoundedHelperStmt(
+                        s->body.get(), aliases, frame, count, workLeft, depth + 1, result);
+                    if (flow == BoundedHelperFlow::Fail || flow == BoundedHelperFlow::Return) {
+                        return flow;
+                    }
+                    if (flow == BoundedHelperFlow::Break) return BoundedHelperFlow::Normal;
+                }
+                return BoundedHelperFlow::Fail;
+            case Stmt::Kind::Return:
+                if (!s->expr || !boundedHelperPolyExpr(s->expr.get(), aliases, frame,
+                                                       count, result, 0)) {
+                    return BoundedHelperFlow::Fail;
+                }
+                return BoundedHelperFlow::Return;
+        }
+        return BoundedHelperFlow::Fail;
+    }
+
+    bool sumBoundedPeriodicHelperCall(
+        const Expr *e, int indKey, int32_t startIv, int32_t offset, int32_t step,
+        uint64_t niter, const unordered_set<int> &changing, const int32_t *frame,
+        uint32_t &out, uint64_t *workLeft = nullptr) const {
+        if (!e || e->kind != Expr::Kind::Call || niter == 0 ||
+            !periodicHelperCallRangesSafe(e, indKey, startIv, offset, step, niter,
+                                          changing, frame)) return false;
+        auto found = funcs.find(e->name);
+        if (found == funcs.end() || !found->second || found->second->returnsVoid ||
+            e->args.size() != found->second->params.size() ||
+            !sefFuncs.count(found->second) ||
+            functionReadsChangingGlobalTransitively(found->second, changing)) return false;
+        vector<const Expr *> args;
+        args.reserve(e->args.size());
+        for (auto &arg : e->args) {
+            if (exprHasCallS(arg.get())) return false;
+            args.push_back(arg.get());
+        }
+
+        vector<int32_t> moduli;
+        unordered_map<int, const Expr *> localAliases;
+        bool sawWhile = false;
+        if (!collectBoundedHelperModuliStmt(found->second->body.get(), args, localAliases,
+                                            indKey, startIv, offset, step, changing, frame,
+                                            niter, moduli, sawWhile, 0) ||
+            !sawWhile || moduli.empty()) return false;
+
+        uint64_t period = 1;
+        uint64_t absStep = step < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(step))
+                                    : static_cast<uint64_t>(step);
+        for (int32_t modulus : moduli) {
+            uint64_t m = static_cast<uint64_t>(modulus);
+            uint64_t reduced = m / gcd64(m, absStep % m);
+            period = lcmCapped(period, reduced, kMaxPeriodicPhases);
+            if (period > kMaxPeriodicPhases) return false;
+        }
+        if (period == 0 || period > kMaxPeriodicPhases) return false;
+        if (workLeft) {
+            if (period > *workLeft) return false;
+            *workLeft -= period;
+        }
+
+        uint64_t localWorkLeft = 256ull * 1024;
+        uint64_t &remainingWork = workLeft ? *workLeft : localWorkLeft;
+        uint64_t phases = min(period, niter);
+        int32_t phaseStep = static_cast<int32_t>(static_cast<uint32_t>(step) *
+                                                static_cast<uint32_t>(period));
+        uint32_t total = 0;
+        unordered_map<int, PolyS> noAliases;
+        for (uint64_t phase = 0; phase < phases; ++phase) {
+            if ((phase & 255u) == 0u && pastDeadline()) return false;
+            int32_t phaseIv = static_cast<int32_t>(
+                static_cast<uint32_t>(startIv) + static_cast<uint32_t>(offset) +
+                static_cast<uint32_t>(step) * static_cast<uint32_t>(phase));
+            uint64_t count = (niter - 1 - phase) / period + 1;
+            unordered_map<int, PolyS> aliases;
+            for (size_t i = 0; i < e->args.size(); ++i) {
+                PolyS value;
+                if (!polyExpr(e->args[i].get(), indKey, phaseIv, phaseStep, changing,
+                              noAliases, frame, value)) return false;
+                aliases[static_cast<int>(i)] = value;
+            }
+            PolyS result;
+            if (evalBoundedHelperStmt(found->second->body.get(), aliases, frame, count,
+                                      remainingWork, 0, result) != BoundedHelperFlow::Return) {
+                return false;
+            }
+            total += sumPoly(result, count);
+        }
+        out = total;
+        return true;
+    }
+
     bool sumPeriodicPolynomialHelperCall(const Expr *e, int indKey, int32_t startIv,
                                          int32_t offset, int32_t step, uint64_t niter,
                                          const unordered_set<int> &changing, const int32_t *frame,
@@ -8187,6 +8644,10 @@ private:
                                                                 ctx.indOffset, ctx.qStep,
                                                                 ctx.count, changing, frame, sum,
                                                                 ctx.strictWorkLeft) ||
+                                sumBoundedPeriodicHelperCall(term, indKey, ctx.phaseIv,
+                                                             ctx.indOffset, ctx.qStep,
+                                                             ctx.count, changing, frame, sum,
+                                                             ctx.strictWorkLeft) ||
                                 sumQuadraticModExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                     ctx.count, changing, frame, sum) ||
                                 sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
@@ -8387,6 +8848,8 @@ private:
                     if (sumPureLoopHelperCall(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumPeriodicPolynomialHelperCall(term, indKey, startIv, iterOffset, step, niter,
                                                         changing, frame, sum) ||
+                        sumBoundedPeriodicHelperCall(term, indKey, startIv, iterOffset, step, niter,
+                                                     changing, frame, sum) ||
                         sumQuadraticModExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumStrictPeriodicExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum) ||
                         sumLinearDivExpr(term, indKey, startIv, iterOffset, step, niter, changing, frame, sum)) {
