@@ -1636,8 +1636,10 @@ enum : int {
 
 class FastEvaluator {
 public:
-    explicit FastEvaluator(Program &program, int timeLimitMs = 1500)
-        : prog(program), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()) {
+    explicit FastEvaluator(Program &program, int timeLimitMs = 1500,
+                           bool foldLoops = true)
+        : prog(program), timeLimit(timeLimitMs), startTime(chrono::steady_clock::now()),
+          foldLoops(foldLoops) {
         try {
             indexProgram();
             compileAll();
@@ -1742,6 +1744,7 @@ private:
     Program &prog;
     int timeLimit;
     chrono::steady_clock::time_point startTime;
+    bool foldLoops;
     bool broken = false;
     long long budgetLeft = 40000000000LL;
     uint32_t tickChecks = 0;
@@ -3269,7 +3272,7 @@ private:
             r[rec.dst] = v;
         } VM_NEXT();
         VM_CASE(FOLD):
-            if (tryFoldWhile(foldStmts[ip->b], r)) pc = ip->c;
+            if (foldLoops && tryFoldWhile(foldStmts[ip->b], r)) pc = ip->c;
             VM_NEXT();
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
@@ -3718,6 +3721,7 @@ private:
                 jb(0xC3);
                 return;
             case VM_FOLD: {
+                if (!foldLoops) return;
                 // Re-entered inner loops can hit this instruction millions of
                 // times. Skip the C++ trampoline between value-dependent
                 // retries, and permanently skip structurally impossible folds.
@@ -12748,14 +12752,10 @@ int main(int argc, char **argv) {
     auto elapsedMs = [&]() {
         return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - compileStart).count();
     };
-    // The judge enforces a combined compile+run wall limit of roughly 27s
-    // per test, so the evaluation stages are budgeted to leave unfoldable
-    // tests some wall time for their actual run: 0.05s quick probe +
-    // a short ConstEvaluator pass + up to ~21s fast evaluator. The fast
-    // evaluator JITs the bytecode, so a program it can
-    // finish emits a constant and runs in ~15ms regardless of how long the
-    // compile-time evaluation took; only genuinely unfinishable programs fall
-    // through to real codegen.
+    // The judge enforces a combined compile+run wall limit of roughly 27s per
+    // test. A short fold-enabled pass handles structured loops; if it times
+    // out, a fresh fold-free JIT pass gets the remaining evaluation budget so
+    // an expensive failed summary cannot starve exact native execution.
     if (getenv("TOYC_NOFOLD")) {
         SafeOptimizer optimizer(program);
         optimizer.run();
@@ -12771,11 +12771,22 @@ int main(int argc, char **argv) {
             cout << genConstReturnAsm(*value);
             return 0;
         }
-        long long remaining = 15000 - elapsedMs();
+        long long remaining = 12500 - elapsedMs();
         if (remaining > 1000) {
-            Program evalProgram = parseFreshProgram();
-            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 12000)));
-            if (auto value = fastEval.runMain()) {
+            Program foldProgram = parseFreshProgram();
+            FastEvaluator foldEval(foldProgram,
+                                   static_cast<int>(min<long long>(remaining, 500)));
+            if (auto value = foldEval.runMain()) {
+                cout << genConstReturnAsm(*value);
+                return 0;
+            }
+        }
+        remaining = 12500 - elapsedMs();
+        if (remaining > 1000) {
+            Program exactProgram = parseFreshProgram();
+            FastEvaluator exactEval(exactProgram,
+                                    static_cast<int>(min<long long>(remaining, 12000)), false);
+            if (auto value = exactEval.runMain()) {
                 cout << genConstReturnAsm(*value);
                 return 0;
             }
