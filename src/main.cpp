@@ -10784,6 +10784,7 @@ private:
     int frameSize = 0;
     int loopInlineScratchBaseOffset = 0;
     int loopInlineScratchSlots = 0;
+    vector<string> loopInlineHomeRegs;
     bool frameFreeLeaf = false;
 
     static int alignTo(int x, int a) { return (x + a - 1) / a * a; }
@@ -11121,7 +11122,6 @@ private:
                             if (lhsWeight != rhsWeight) return lhsWeight > rhsWeight;
                             return lhs < rhs;
                         });
-                        if (ranked.size() > 7) ranked.resize(7);
                         loopInlineRegisterSlots[function->name] = std::move(ranked);
                     }
                 }
@@ -11789,9 +11789,23 @@ private:
             hoistedConsts.push_back({hoistVals[i], reg});
         }
         int usedRegCount = varRegCap + inlineArgCount + static_cast<int>(hoistVals.size());
+        loopInlineHomeRegs.clear();
+        if (!frameFreeLeaf && loopInlineScratchSlots > 0) {
+            for (int index = usedRegCount;
+                 index < static_cast<int>(allSavedRegs.size()); ++index) {
+                loopInlineHomeRegs.push_back(allSavedRegs[static_cast<size_t>(index)]);
+            }
+            loopInlineHomeRegs.insert(loopInlineHomeRegs.end(), leafRegs.begin(),
+                                      leafRegs.end());
+        }
+        int helperSavedRegCount = min(
+            static_cast<int>(allSavedRegs.size()),
+            usedRegCount + min(loopInlineScratchSlots,
+                               max(0, static_cast<int>(allSavedRegs.size()) - usedRegCount)));
         int savedRegCount = frameFreeLeaf
             ? 0
-            : min(usedRegCount, static_cast<int>(allSavedRegs.size()));
+            : max(min(usedRegCount, static_cast<int>(allSavedRegs.size())),
+                  helperSavedRegCount);
         savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + savedRegCount);
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
         frameSize = frameFreeLeaf
@@ -12932,13 +12946,6 @@ private:
         }
     }
 
-    static string loopInlineRegister(int rank) {
-        static const vector<string> regs = {"a1", "a2", "a3", "a4", "a5", "a6", "a7"};
-        return rank >= 0 && rank < static_cast<int>(regs.size())
-            ? regs[static_cast<size_t>(rank)]
-            : string();
-    }
-
     unordered_map<int, Symbol> loopInlineSlotHomes(const Function &function) const {
         unordered_map<int, Symbol> homes;
         auto ranked = loopInlineRegisterSlots.find(function.name);
@@ -12948,9 +12955,10 @@ private:
                                  loopInlineScratchBaseOffset - slot * 4, ""};
         }
         for (size_t rank = 0; rank < ranked->second.size(); ++rank) {
+            if (rank >= loopInlineHomeRegs.size()) break;
             int slot = ranked->second[rank];
             auto found = homes.find(slot);
-            if (found != homes.end()) found->second.reg = loopInlineRegister(rank);
+            if (found != homes.end()) found->second.reg = loopInlineHomeRegs[rank];
         }
         return homes;
     }
