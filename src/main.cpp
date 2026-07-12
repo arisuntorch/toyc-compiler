@@ -2780,15 +2780,231 @@ private:
         throw InlineFail();
     }
 
+    void compileCondJumpMapped(const Expr *e, bool jumpIfTrue, vector<int> &patches,
+                               const unordered_map<int, int> &slotMap, int depth) {
+        if (e->kind == Expr::Kind::Unary && e->opc == OPC_NOT) {
+            compileCondJumpMapped(e->lhs.get(), !jumpIfTrue, patches, slotMap, depth + 1);
+            return;
+        }
+        if (e->kind == Expr::Kind::Binary) {
+            int opc = e->opc;
+            if (opc == OPC_AND || opc == OPC_OR) {
+                bool sequential = (opc == OPC_AND) ? !jumpIfTrue : jumpIfTrue;
+                if (sequential) {
+                    compileCondJumpMapped(e->lhs.get(), jumpIfTrue, patches, slotMap, depth + 1);
+                    compileCondJumpMapped(e->rhs.get(), jumpIfTrue, patches, slotMap, depth + 1);
+                    return;
+                }
+                vector<int> skip;
+                compileCondJumpMapped(e->lhs.get(), !jumpIfTrue, skip, slotMap, depth + 1);
+                compileCondJumpMapped(e->rhs.get(), jumpIfTrue, patches, slotMap, depth + 1);
+                for (int idx : skip) patchC(idx, here());
+                return;
+            }
+            if (opc >= OPC_LT && opc <= OPC_NE) {
+                int branchOpc = jumpIfTrue ? opc : negateRel(opc);
+                int save = cTempTop;
+                if (e->rhs->kind == Expr::Kind::Number) {
+                    int lhs = compileExprMapped(e->lhs.get(), slotMap, depth + 1);
+                    cTempTop = save;
+                    patches.push_back(emit(riBranchOp(branchOpc), lhs,
+                                           wrap32(e->rhs->value), 0));
+                    return;
+                }
+                if (e->lhs->kind == Expr::Kind::Number) {
+                    int rhs = compileExprMapped(e->rhs.get(), slotMap, depth + 1);
+                    cTempTop = save;
+                    patches.push_back(emit(riBranchOp(swapRel(branchOpc)), rhs,
+                                           wrap32(e->lhs->value), 0));
+                    return;
+                }
+                int lhs = compileExprMapped(e->lhs.get(), slotMap, depth + 1);
+                int rhs = compileExprMapped(e->rhs.get(), slotMap, depth + 1);
+                cTempTop = save;
+                patches.push_back(emit(rrBranchOp(branchOpc), lhs, rhs, 0));
+                return;
+            }
+        }
+        int save = cTempTop;
+        int result = compileExprMapped(e, slotMap, depth + 1);
+        cTempTop = save;
+        patches.push_back(emit(jumpIfTrue ? VM_JNZ : VM_JZ, 0, result, 0));
+    }
+
+    bool branchInlineStmtShape(const Stmt *s, int &nodes, bool &alwaysReturns,
+                               unordered_set<int> &assigned) const {
+        alwaysReturns = false;
+        if (!s || s->fastDeadStore) return true;
+        if (++nodes > 96) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool guaranteed = false;
+                for (auto &child : s->stmts) {
+                    bool childReturns = false;
+                    if (!branchInlineStmtShape(child.get(), nodes, childReturns, assigned)) {
+                        return false;
+                    }
+                    guaranteed = guaranteed || childReturns;
+                }
+                alwaysReturns = guaranteed;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallS(s->expr.get());
+            case Stmt::Kind::DeclStmt:
+                return s->decl && s->decl->init && !exprHasCallS(s->decl->init.get());
+            case Stmt::Kind::Assign:
+                if (s->fastAssignGlobal || exprHasCallS(s->expr.get())) return false;
+                assigned.insert(s->fastAssignIndex);
+                return true;
+            case Stmt::Kind::If: {
+                if (exprHasCallS(s->expr.get())) return false;
+                bool thenReturns = false;
+                bool elseReturns = false;
+                if (!branchInlineStmtShape(s->thenStmt.get(), nodes, thenReturns, assigned) ||
+                    !branchInlineStmtShape(s->elseStmt.get(), nodes, elseReturns, assigned)) {
+                    return false;
+                }
+                alwaysReturns = thenReturns && s->elseStmt && elseReturns;
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr || exprHasCallS(s->expr.get())) return false;
+                alwaysReturns = true;
+                return true;
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
+    void compileInlineBranchStmt(const Stmt *s, const unordered_map<int, int> &slotMap,
+                                 int dst, vector<int> &returnPatches, int depth) {
+        if (!s || s->fastDeadStore) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    compileInlineBranchStmt(child.get(), slotMap, dst, returnPatches, depth);
+                }
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return;
+            case Stmt::Kind::DeclStmt: {
+                auto target = slotMap.find(s->decl->fastSlot);
+                if (target == slotMap.end()) throw InlineFail();
+                compileExprIntoMapped(s->decl->init.get(), target->second, slotMap, depth + 1);
+                return;
+            }
+            case Stmt::Kind::Assign: {
+                auto target = slotMap.find(s->fastAssignIndex);
+                if (s->fastAssignGlobal || target == slotMap.end()) throw InlineFail();
+                compileExprIntoMapped(s->expr.get(), target->second, slotMap, depth + 1);
+                return;
+            }
+            case Stmt::Kind::If: {
+                vector<int> elsePatches;
+                compileCondJumpMapped(s->expr.get(), false, elsePatches, slotMap,
+                                      depth + 1);
+                compileInlineBranchStmt(s->thenStmt.get(), slotMap, dst, returnPatches,
+                                        depth + 1);
+                if (s->elseStmt) {
+                    int endPatch = emit(VM_JMP, 0, 0, 0);
+                    for (int patch : elsePatches) patchC(patch, here());
+                    compileInlineBranchStmt(s->elseStmt.get(), slotMap, dst, returnPatches,
+                                            depth + 1);
+                    patchC(endPatch, here());
+                } else {
+                    for (int patch : elsePatches) patchC(patch, here());
+                }
+                return;
+            }
+            case Stmt::Kind::Return:
+                compileExprIntoMapped(s->expr.get(), dst, slotMap, depth + 1);
+                returnPatches.push_back(emit(VM_JMP, 0, 0, 0));
+                return;
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                throw InlineFail();
+        }
+        throw InlineFail();
+    }
+
+    bool tryCompileBranchInlineCall(const Expr *e, Function *function, int dst,
+                                    const unordered_map<int, int> *outerMap, int depth) {
+        if (!function || function->returnsVoid || function->fastLocalCount < 0 ||
+            function->fastLocalCount > 32) return false;
+        int nodes = 0;
+        bool alwaysReturns = false;
+        unordered_set<int> assigned;
+        if (!branchInlineStmtShape(function->body.get(), nodes, alwaysReturns, assigned) ||
+            !alwaysReturns) return false;
+
+        int save = cTempTop;
+        int maxSave = cMaxTemp;
+        size_t codeSave = cf ? cf->code.size() : 0;
+        try {
+            unordered_map<int, int> slotMap;
+            for (size_t i = 0; i < e->args.size(); ++i) {
+                const Expr *arg = e->args[i].get();
+                int sourceSlot = -1;
+                if (!assigned.count(static_cast<int>(i)) && arg->kind == Expr::Kind::Var &&
+                    !arg->fastGlobal) {
+                    if (outerMap) {
+                        auto source = outerMap->find(arg->fastIndex);
+                        if (source != outerMap->end()) sourceSlot = source->second;
+                    } else {
+                        sourceSlot = arg->fastIndex;
+                    }
+                }
+                if (sourceSlot >= 0 && sourceSlot != dst) {
+                    slotMap[static_cast<int>(i)] = sourceSlot;
+                } else {
+                    int target = allocTemp();
+                    if (outerMap) {
+                        compileExprIntoMapped(arg, target, *outerMap, depth + 1);
+                    } else {
+                        compileExprInto(arg, target);
+                    }
+                    slotMap[static_cast<int>(i)] = target;
+                }
+            }
+            for (int slot = static_cast<int>(e->args.size());
+                 slot < function->fastLocalCount; ++slot) {
+                slotMap[slot] = allocTemp();
+            }
+            vector<int> returnPatches;
+            compileInlineBranchStmt(function->body.get(), slotMap, dst, returnPatches,
+                                    depth + 1);
+            if (returnPatches.empty()) throw InlineFail();
+            for (int patch : returnPatches) patchC(patch, here());
+            cTempTop = save;
+            return true;
+        } catch (const InlineFail &) {
+            if (cf) cf->code.resize(codeSave);
+            cTempTop = save;
+            cMaxTemp = maxSave;
+            return false;
+        }
+    }
+
     bool tryCompileInlineCall(const Expr *e, int dst, const unordered_map<int, int> *outerMap, int depth) {
         if (!e || e->kind != Expr::Kind::Call || depth > 4) return false;
         auto found = funcs.find(e->name);
         if (found == funcs.end() || e->args.size() != found->second->params.size()) return false;
         const Expr *ret = nullptr;
         vector<pair<int, const Expr *>> aliases;
-        if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) return false;
+        if (!simpleReturnFunctionExprWithLocalDecls(found->second, ret, aliases)) {
+            return tryCompileBranchInlineCall(e, found->second, dst, outerMap, depth);
+        }
 
         int save = cTempTop;
+        int maxSave = cMaxTemp;
         size_t codeSave = cf ? cf->code.size() : 0;
         try {
             unordered_map<int, int> slotMap;
@@ -2809,6 +3025,7 @@ private:
         } catch (const InlineFail &) {
             if (cf) cf->code.resize(codeSave);
             cTempTop = save;
+            cMaxTemp = maxSave;
             return false;
         }
     }
@@ -3229,21 +3446,38 @@ private:
         int32_t magic;
         int shift;
         bool addDividend;
-        bool logicalShift;
     };
 
     static optional<JitMagicDiv> jitMagicForDivisor(int divisor) {
-        switch (divisor) {
-            case 3: return JitMagicDiv{3, 1431655766, 32, false, true};
-            case 5: return JitMagicDiv{5, 1717986919, 33, false, false};
-            case 7: return JitMagicDiv{7, static_cast<int32_t>(2454267027u), 2, true, true};
-            case 10: return JitMagicDiv{10, 1717986919, 34, false, false};
-            case 11: return JitMagicDiv{11, 780903145, 33, false, false};
-            case 13: return JitMagicDiv{13, 1321528399, 34, false, false};
-            case 31: return JitMagicDiv{31, static_cast<int32_t>(2216757315u), 4, true, true};
-            case 100: return JitMagicDiv{100, 1374389535, 37, false, false};
-            default: return nullopt;
-        }
+        if (divisor <= 1) return nullopt;
+        const int64_t two31 = 1ll << 31;
+        const int64_t d = divisor;
+        const int64_t anc = two31 - 1 - (two31 - 1) % d;
+        int p = 31;
+        int64_t q1 = two31 / anc;
+        int64_t r1 = two31 - q1 * anc;
+        int64_t q2 = two31 / d;
+        int64_t r2 = two31 - q2 * d;
+        int64_t delta = 0;
+        do {
+            ++p;
+            q1 <<= 1;
+            r1 <<= 1;
+            if (r1 >= anc) {
+                ++q1;
+                r1 -= anc;
+            }
+            q2 <<= 1;
+            r2 <<= 1;
+            if (r2 >= d) {
+                ++q2;
+                r2 -= d;
+            }
+            delta = d - r2;
+        } while (q1 < delta || (q1 == delta && r1 == 0));
+
+        int32_t magic = wrap32(q2 + 1);
+        return JitMagicDiv{divisor, magic, p - 32, magic < 0};
     }
 
     static bool isPow2Positive(int32_t x) {
@@ -3268,7 +3502,12 @@ private:
         jb(0x89); jb(0xC1);                     // mov ecx, eax (orig)
         jb(0x89); jb(0xC2);                     // mov edx, eax
         jb(0xC1); jb(0xFA); jb(31);             // sar edx, 31
-        jb(0x83); jb(0xE2); jb(static_cast<uint8_t>(divisor - 1)); // and edx, divisor-1
+        int32_t mask = divisor - 1;
+        if (mask <= 127) {
+            jb(0x83); jb(0xE2); jb(static_cast<uint8_t>(mask));    // and edx, imm8
+        } else {
+            jb(0x81); jb(0xE2); j32(mask);                         // and edx, imm32
+        }
         jb(0x01); jb(0xD0);                     // add eax, edx
         jb(0xC1); jb(0xF8); jb(static_cast<uint8_t>(shift));       // sar eax, shift
         if (!isMod) {
@@ -3293,14 +3532,15 @@ private:
         jb(0x89); jb(0xC2);                     // mov edx, eax (orig)
         jb(0x48); jb(0x98);                     // cdqe
         jb(0x48); jb(0x69); jb(0xC0); j32(spec->magic); // imul rax, rax, magic
-        if (spec->logicalShift) {
-            jb(0x48); jb(0xC1); jb(0xE8); jb(32);       // shr rax, 32
-            if (spec->addDividend) {
-                jb(0x01); jb(0xD0);                     // add eax, edx
+        if (spec->addDividend) {
+            jb(0x48); jb(0xC1); jb(0xF8); jb(32);       // sar rax, 32
+            jb(0x01); jb(0xD0);                         // add eax, edx
+            if (spec->shift > 0) {
                 jb(0xC1); jb(0xF8); jb(static_cast<uint8_t>(spec->shift)); // sar eax, shift
             }
         } else {
-            jb(0x48); jb(0xC1); jb(0xF8); jb(static_cast<uint8_t>(spec->shift)); // sar rax, shift
+            jb(0x48); jb(0xC1); jb(0xF8);
+            jb(static_cast<uint8_t>(32 + spec->shift)); // sar rax, 32 + shift
         }
         jb(0x89); jb(0xD1);                     // mov ecx, edx
         jb(0xC1); jb(0xF9); jb(31);             // sar ecx, 31
@@ -3347,7 +3587,7 @@ private:
         for (int i = 0; i < lim; ++i) jSyncPregFromMem(i);
     }
 
-    void jEmitInsn(int curFunc, const Insn &in) {
+    void jEmitInsn(int curFunc, int pc, const Insn &in) {
         int cf2 = vmFuncs[curFunc].frameSize;
         int a = in.a;
         int b = in.b;
@@ -3391,7 +3631,7 @@ private:
             case VM_SNEZ: jLoadEax(b); jb(0x85); jb(0xC0); jSetccMovzx(OPC_NE, a); return;
             case VM_SEQZ: jLoadEax(b); jb(0x85); jb(0xC0); jSetccMovzx(OPC_EQ, a); return;
             case VM_JMP:
-                jEmitBudgetCheck();
+                if (c <= pc) jEmitBudgetCheck();
                 jb(0xE9); { size_t h = jhole32(); jitBranchFix.push_back({h, curFunc, static_cast<int>(c)}); }
                 return;
             case VM_JZ:
@@ -3590,7 +3830,7 @@ private:
                 jitInsnAddr[f].resize(code.size());
                 for (size_t i = 0; i < code.size(); ++i) {
                     jitInsnAddr[f][i] = jitCode.size();
-                    jEmitInsn(static_cast<int>(f), code[i]);
+                    jEmitInsn(static_cast<int>(f), static_cast<int>(i), code[i]);
                 }
             }
             for (const auto &fx : jitBranchFix) {
