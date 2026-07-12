@@ -1769,7 +1769,14 @@ private:
 
     unordered_map<string, int> funcIndex;
     vector<VmFunc> vmFuncs;
-    vector<const Stmt *> foldStmts;
+    struct FoldSite {
+        const Stmt *stmt = nullptr;
+        unordered_map<int, int> slotMap;
+    };
+
+    vector<FoldSite> foldStmts;
+    const unordered_map<int, int> *mappedFoldSlots = nullptr;
+    const int32_t *mappedFoldFrame = nullptr;
     int initFuncIdx = -1;
     int mainFuncIdx = -1;
 
@@ -2885,8 +2892,8 @@ private:
     // Loop helpers are expanded into the caller's bytecode frame. Keep this
     // eligibility check deliberately conservative: the helper must be a
     // non-void, call-free fragment with an explicit return on every reachable
-    // path. In particular, loop instructions are handled by the inline
-    // emitter below and must never enter foldStmts/VM_FOLD metadata.
+    // path. Loop instructions are emitted with mapped VM_FOLD metadata so
+    // summaries can address their private caller-frame homes.
     bool loopInlineStmtShape(const Stmt *s, int &nodes, bool &alwaysReturns,
                              bool &hasLoop) const {
         alwaysReturns = false;
@@ -3002,6 +3009,8 @@ private:
                 return;
             }
             case Stmt::Kind::While: {
+                int foldIdx = emit(VM_FOLD, 0, static_cast<int>(foldStmts.size()), 0);
+                foldStmts.push_back(FoldSite{s, slotMap});
                 int condStart = here();
                 vector<int> exitPatches;
                 compileCondJumpMapped(s->expr.get(), false, exitPatches, slotMap,
@@ -3012,6 +3021,7 @@ private:
                                       breakPatches, continueTargets, depth + 1);
                 emit(VM_JMP, 0, 0, condStart);
                 int end = here();
+                patchC(foldIdx, end);
                 for (int patch : exitPatches) patchC(patch, end);
                 for (int patch : breakPatches.back()) patchC(patch, end);
                 breakPatches.pop_back();
@@ -3052,6 +3062,7 @@ private:
         int save = cTempTop;
         int maxSave = cMaxTemp;
         size_t codeSave = cf ? cf->code.size() : 0;
+        size_t foldSave = foldStmts.size();
         try {
             unordered_map<int, int> slotMap;
             // Give every helper slot a private caller-frame home. This avoids
@@ -3081,6 +3092,7 @@ private:
             return true;
         } catch (const InlineFail &) {
             if (cf) cf->code.resize(codeSave);
+            foldStmts.resize(foldSave);
             cTempTop = save;
             cMaxTemp = maxSave;
             return false;
@@ -3153,6 +3165,7 @@ private:
         int save = cTempTop;
         int maxSave = cMaxTemp;
         size_t codeSave = cf ? cf->code.size() : 0;
+        size_t foldSave = foldStmts.size();
         try {
             unordered_map<int, int> slotMap;
             for (size_t i = 0; i < e->args.size(); ++i) {
@@ -3192,6 +3205,7 @@ private:
             return true;
         } catch (const InlineFail &) {
             if (cf) cf->code.resize(codeSave);
+            foldStmts.resize(foldSave);
             cTempTop = save;
             cMaxTemp = maxSave;
             return false;
@@ -3214,6 +3228,7 @@ private:
         int save = cTempTop;
         int maxSave = cMaxTemp;
         size_t codeSave = cf ? cf->code.size() : 0;
+        size_t foldSave = foldStmts.size();
         try {
             unordered_map<int, int> slotMap;
             for (size_t i = 0; i < e->args.size(); ++i) {
@@ -3232,6 +3247,7 @@ private:
             return true;
         } catch (const InlineFail &) {
             if (cf) cf->code.resize(codeSave);
+            foldStmts.resize(foldSave);
             cTempTop = save;
             cMaxTemp = maxSave;
             return false;
@@ -3289,7 +3305,7 @@ private:
             case Stmt::Kind::While: {
                 if (s->fastDeadStore) return;
                 int foldIdx = emit(VM_FOLD, 0, static_cast<int>(foldStmts.size()), 0);
-                foldStmts.push_back(s);
+                foldStmts.push_back(FoldSite{s, {}});
                 int condStart = here();
                 vector<int> exitPatches;
                 compileCondJump(s->expr.get(), false, exitPatches);
@@ -3477,7 +3493,7 @@ private:
             r[rec.dst] = v;
         } VM_NEXT();
         VM_CASE(FOLD):
-            if (tryFoldWhile(foldStmts[ip->b], r)) pc = ip->c;
+            if (runFoldSite(ip->b, r)) pc = ip->c;
             VM_NEXT();
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
@@ -3990,8 +4006,8 @@ private:
     static int32_t jitFoldTramp(FastEvaluator *self, int32_t id, int32_t *frame) {
         try {
             if (id < 0 || static_cast<size_t>(id) >= self->foldStmts.size()) return 0;
-            const Stmt *stmt = self->foldStmts[static_cast<size_t>(id)];
-            bool folded = self->tryFoldWhile(stmt, frame, true);
+            const Stmt *stmt = self->foldStmts[static_cast<size_t>(id)].stmt;
+            bool folded = self->runFoldSite(id, frame, true);
             uint32_t delay = 0;
             if (stmt && stmt->fastLoopId >= 0 &&
                 stmt->fastLoopId < static_cast<int>(self->loopStats.size())) {
@@ -4086,11 +4102,51 @@ private:
 
     // ---- slot helpers ----
 
+    class MappedFoldScope {
+    public:
+        MappedFoldScope(FastEvaluator &owner, const FoldSite &site, int32_t *frame)
+            : owner(owner), previousSlots(owner.mappedFoldSlots),
+              previousFrame(owner.mappedFoldFrame) {
+            owner.mappedFoldSlots = site.slotMap.empty() ? nullptr : &site.slotMap;
+            owner.mappedFoldFrame = owner.mappedFoldSlots ? frame : nullptr;
+        }
+
+        ~MappedFoldScope() {
+            owner.mappedFoldSlots = previousSlots;
+            owner.mappedFoldFrame = previousFrame;
+        }
+
+        MappedFoldScope(const MappedFoldScope &) = delete;
+        MappedFoldScope &operator=(const MappedFoldScope &) = delete;
+
+    private:
+        FastEvaluator &owner;
+        const unordered_map<int, int> *previousSlots;
+        const int32_t *previousFrame;
+    };
+
+    bool runFoldSite(int id, int32_t *frame, bool callerThrottles = false) {
+        if (id < 0 || static_cast<size_t>(id) >= foldStmts.size()) return false;
+        const FoldSite &site = foldStmts[static_cast<size_t>(id)];
+        if (!site.stmt) return false;
+        MappedFoldScope scope(*this, site, frame);
+        return tryFoldWhile(site.stmt, frame, callerThrottles);
+    }
+
+    int mappedSlotKey(int key, const int32_t *frame) const {
+        if ((key & kGlobalBit) || !mappedFoldSlots || frame != mappedFoldFrame) return key;
+        auto found = mappedFoldSlots->find(key);
+        if (found == mappedFoldSlots->end()) throw TooHard();
+        return found->second;
+    }
+
     int32_t readSlot(int key, const int32_t *frame) const {
+        key = mappedSlotKey(key, frame);
         return (key & kGlobalBit) ? globals[key & ~kGlobalBit] : frame[key];
     }
 
     void writeSlot(int key, int32_t value, int32_t *frame) {
+        key = mappedSlotKey(key, frame);
         if (key & kGlobalBit) globals[key & ~kGlobalBit] = value;
         else frame[key] = value;
     }
@@ -9510,7 +9566,7 @@ private:
                 }
                 if (r == FoldOk && loop) {
                     bool notWorth = false;
-                    uint64_t maxNativeIterations = loop == &fresh ? 0 : 8;
+                    uint64_t maxNativeIterations = (loop == &fresh && !mappedFoldSlots) ? 0 : 8;
                     if (applyAffineLoop(s, *loop, frame, notWorth, maxNativeIterations)) {
                         st.everFolded = true;
                         return true;
