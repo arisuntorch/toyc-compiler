@@ -10014,7 +10014,29 @@ private:
         return false;
     }
 
+    bool collectUniqueDceNames(const Stmt *s, unordered_set<string> &names) const {
+        if (!s) return true;
+        if (s->kind == Stmt::Kind::DeclStmt && s->decl &&
+            !names.insert(s->decl->name).second) {
+            return false;
+        }
+        for (auto &child : s->stmts) {
+            if (!collectUniqueDceNames(child.get(), names)) return false;
+        }
+        return collectUniqueDceNames(s->thenStmt.get(), names) &&
+               collectUniqueDceNames(s->elseStmt.get(), names) &&
+               collectUniqueDceNames(s->body.get(), names);
+    }
+
     void dceFunction(Function &f) {
+        unordered_set<string> names;
+        for (const string &param : f.params) {
+            if (!names.insert(param).second) return;
+        }
+        // This DCE tracks liveness by source name. If a function contains
+        // shadowed or reused local names, a declaration in an inner/disjoint
+        // scope could otherwise kill the live bit for a different binding.
+        if (!collectUniqueDceNames(f.body.get(), names)) return;
         dceUsed.clear();
         unordered_set<string> live;
         dceStmt(f.body, live, DceCtx{}, true);
