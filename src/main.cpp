@@ -11388,9 +11388,11 @@ private:
                                    unordered_map<long long, long long> &w) const {
         if (!s) return;
         if (s->expr) hoistScanExpr(s->expr.get(), mult, w);
+        if (s->decl && s->decl->init) hoistScanExpr(s->decl->init.get(), mult, w);
         for (auto &child : s->stmts) hoistScanBranchInlineStmt(child.get(), mult, w);
         hoistScanBranchInlineStmt(s->thenStmt.get(), mult, w);
         hoistScanBranchInlineStmt(s->elseStmt.get(), mult, w);
+        hoistScanBranchInlineStmt(s->body.get(), mult, w);
     }
 
     void hoistScanExpr(const Expr *e, long long mult, unordered_map<long long, long long> &w) const {
@@ -11402,6 +11404,11 @@ private:
                 bool pureArgs = true;
                 for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
                 if (pureArgs) hoistScanBranchInlineStmt(branch->second->body.get(), mult, w);
+            } else if (auto loop = loopInlineableFuncs.find(e->name);
+                       loop != loopInlineableFuncs.end()) {
+                bool pureArgs = true;
+                for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
+                if (pureArgs) hoistScanBranchInlineStmt(loop->second->body.get(), mult, w);
             }
             return;
         }
@@ -12916,21 +12923,16 @@ private:
             if (hasCall(arg.get())) return false;
         }
 
-        // Evaluate every argument exactly once before any helper slot becomes
-        // visible. A temporary stack home keeps later argument evaluation from
-        // clobbering earlier values through a1-a7 scratch allocation.
-        for (auto &arg : e->args) {
-            genExprNoCall(arg.get(), "a0", {"t0", "t1", "t2", "t3", "t4", "t5"});
-            pushA0();
-        }
+        // The caller still contains a syntactic call, so its long-lived values
+        // never occupy a1-a7. Evaluate call-free arguments directly into the
+        // helper homes; expression code only uses its destination and t0-t5,
+        // leaving earlier arguments intact.
         for (size_t i = 0; i < e->args.size(); ++i) {
-            int offset = 16 * (static_cast<int>(e->args.size()) - 1 - static_cast<int>(i)) + 12;
-            loadMem("t0", "sp", offset);
             string reg = loopInlineSlotReg(static_cast<int>(i));
             if (reg.empty()) return false;
-            emit("mv " + reg + ", t0");
+            genExprNoCall(e->args[i].get(), reg,
+                          {"t0", "t1", "t2", "t3", "t4", "t5"});
         }
-        adjustSp(16 * static_cast<int>(e->args.size()));
 
         auto callerScopes = std::move(scopes);
         scopes.clear();
