@@ -10733,6 +10733,7 @@ private:
     unordered_map<string, Symbol> globals;
     unordered_map<string, FuncInfo> funcs;
     unordered_map<string, Function *> inlineableFuncs;
+    unordered_map<string, Function *> branchInlineableFuncs;
     unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
@@ -10742,6 +10743,7 @@ private:
     string functionBodyLabel;
     vector<string> currentParams;
     vector<string> savedVarRegs;
+    vector<string> inlineArgRegs;
     int varRegCap = 0;
     unordered_map<long long, string> constRegMap;
     vector<pair<long long, string>> hoistedConsts;
@@ -10806,17 +10808,82 @@ private:
         adjustSp(16);
     }
 
+    bool branchInlineStmtShape(const Stmt *s, const unordered_set<string> &params,
+                               int &nodes, bool &alwaysReturns) const {
+        alwaysReturns = false;
+        if (!s || ++nodes > 64) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool guaranteed = false;
+                for (auto &child : s->stmts) {
+                    if (guaranteed) break;
+                    bool childReturns = false;
+                    if (!branchInlineStmtShape(child.get(), params, nodes, childReturns)) {
+                        return false;
+                    }
+                    guaranteed = childReturns;
+                }
+                alwaysReturns = guaranteed;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::If: {
+                if (!s->expr || exprHasCall(s->expr.get()) ||
+                    !exprUsesOnlyVars(s->expr.get(), params)) {
+                    return false;
+                }
+                bool thenReturns = false;
+                bool elseReturns = false;
+                if (!branchInlineStmtShape(s->thenStmt.get(), params, nodes, thenReturns)) {
+                    return false;
+                }
+                if (s->elseStmt &&
+                    !branchInlineStmtShape(s->elseStmt.get(), params, nodes, elseReturns)) {
+                    return false;
+                }
+                alwaysReturns = thenReturns && s->elseStmt && elseReturns;
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr || exprHasCall(s->expr.get()) ||
+                    !exprUsesOnlyVars(s->expr.get(), params)) {
+                    return false;
+                }
+                alwaysReturns = true;
+                return true;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
     void collectFunctions() {
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
-                funcs[item.func->name] = FuncInfo{item.func->returnsVoid, static_cast<int>(item.func->params.size())};
-                const Stmt *body = item.func->body.get();
-                if (!item.func->returnsVoid && body && body->kind == Stmt::Kind::Block &&
+                Function *function = item.func.get();
+                funcs[function->name] = FuncInfo{function->returnsVoid,
+                                                 static_cast<int>(function->params.size())};
+                const Stmt *body = function->body.get();
+                if (!function->returnsVoid && body && body->kind == Stmt::Kind::Block &&
                     body->stmts.size() == 1 && body->stmts[0]->kind == Stmt::Kind::Return &&
                     body->stmts[0]->expr && !exprHasCall(body->stmts[0]->expr.get())) {
-                    unordered_set<string> params(item.func->params.begin(), item.func->params.end());
+                    unordered_set<string> params(function->params.begin(), function->params.end());
                     if (exprUsesOnlyVars(body->stmts[0]->expr.get(), params)) {
-                        inlineableFuncs[item.func->name] = item.func.get();
+                        inlineableFuncs[function->name] = function;
+                    }
+                }
+                if (!function->returnsVoid) {
+                    unordered_set<string> params(function->params.begin(), function->params.end());
+                    int nodes = 0;
+                    bool alwaysReturns = false;
+                    if (branchInlineStmtShape(body, params, nodes, alwaysReturns) && alwaysReturns) {
+                        branchInlineableFuncs[function->name] = function;
                     }
                 }
             }
@@ -11007,6 +11074,38 @@ private:
         return false;
     }
 
+    int maxBranchInlineArgs(const Expr *e) const {
+        if (!e) return 0;
+        int result = 0;
+        if (e->kind == Expr::Kind::Call && branchInlineableFuncs.count(e->name) &&
+            !inlineableFuncs.count(e->name)) {
+            bool pureArgs = true;
+            for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
+            if (pureArgs) {
+                for (auto &arg : e->args) {
+                    if (arg->kind != Expr::Kind::Number && arg->kind != Expr::Kind::Var) {
+                        ++result;
+                    }
+                }
+            }
+        }
+        result = max(result, maxBranchInlineArgs(e->lhs.get()));
+        result = max(result, maxBranchInlineArgs(e->rhs.get()));
+        for (auto &arg : e->args) result = max(result, maxBranchInlineArgs(arg.get()));
+        return result;
+    }
+
+    int maxBranchInlineArgs(const Stmt *s) const {
+        if (!s) return 0;
+        int result = maxBranchInlineArgs(s->expr.get());
+        if (s->decl) result = max(result, maxBranchInlineArgs(s->decl->init.get()));
+        for (auto &child : s->stmts) result = max(result, maxBranchInlineArgs(child.get()));
+        result = max(result, maxBranchInlineArgs(s->thenStmt.get()));
+        result = max(result, maxBranchInlineArgs(s->elseStmt.get()));
+        result = max(result, maxBranchInlineArgs(s->body.get()));
+        return result;
+    }
+
     bool stmtAlwaysJumps(const Stmt *s) const {
         if (!s) return false;
         switch (s->kind) {
@@ -11089,8 +11188,27 @@ private:
         w[v] += weight * (fits12(v) ? 1 : 2);
     }
 
+    void hoistScanBranchInlineStmt(const Stmt *s, long long mult,
+                                   unordered_map<long long, long long> &w) const {
+        if (!s) return;
+        if (s->expr) hoistScanExpr(s->expr.get(), mult, w);
+        for (auto &child : s->stmts) hoistScanBranchInlineStmt(child.get(), mult, w);
+        hoistScanBranchInlineStmt(s->thenStmt.get(), mult, w);
+        hoistScanBranchInlineStmt(s->elseStmt.get(), mult, w);
+    }
+
     void hoistScanExpr(const Expr *e, long long mult, unordered_map<long long, long long> &w) const {
         if (!e) return;
+        if (e->kind == Expr::Kind::Call) {
+            for (auto &arg : e->args) hoistScanExpr(arg.get(), mult, w);
+            auto branch = branchInlineableFuncs.find(e->name);
+            if (branch != branchInlineableFuncs.end() && !inlineableFuncs.count(e->name)) {
+                bool pureArgs = true;
+                for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
+                if (pureArgs) hoistScanBranchInlineStmt(branch->second->body.get(), mult, w);
+            }
+            return;
+        }
         if (e->kind == Expr::Kind::Number) {
             hoistNoteConst(e->value, mult, w);
             return;
@@ -11163,16 +11281,22 @@ private:
         int slots = countSlots(f);
         static const vector<string> allVarRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
         varRegCap = min<int>(static_cast<int>(allVarRegs.size()), slots);
-        auto hoistVals = collectHoistConsts(f, min(4, static_cast<int>(allVarRegs.size()) - varRegCap));
+        int inlineArgCount = min(maxBranchInlineArgs(f.body.get()),
+                                 static_cast<int>(allVarRegs.size()) - varRegCap);
+        inlineArgRegs.assign(allVarRegs.begin() + varRegCap,
+                             allVarRegs.begin() + varRegCap + inlineArgCount);
+        auto hoistVals = collectHoistConsts(
+            f, min(4, static_cast<int>(allVarRegs.size()) - varRegCap - inlineArgCount));
         constRegMap.clear();
         hoistedConsts.clear();
         for (size_t i = 0; i < hoistVals.size(); ++i) {
-            const string &reg = allVarRegs[varRegCap + static_cast<int>(i)];
+            const string &reg = allVarRegs[varRegCap + inlineArgCount + static_cast<int>(i)];
             constRegMap[hoistVals[i]] = reg;
             hoistedConsts.push_back({hoistVals[i], reg});
         }
         savedVarRegs.assign(allVarRegs.begin(),
-                            allVarRegs.begin() + varRegCap + static_cast<int>(hoistVals.size()));
+                            allVarRegs.begin() + varRegCap + inlineArgCount +
+                                static_cast<int>(hoistVals.size()));
         frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
         nextSlot = 0;
         nextVarReg = 0;
@@ -11878,6 +12002,29 @@ private:
         return scratch;
     }
 
+    bool genPow2ModZeroBranch(const Expr *e, const string &label, bool jumpIfTrue) {
+        if (!e || e->kind != Expr::Kind::Binary ||
+            (e->op != "==" && e->op != "!=")) {
+            return false;
+        }
+        const Expr *mod = nullptr;
+        if (auto rhs = tryConst(e->rhs.get()); rhs && *rhs == 0) mod = e->lhs.get();
+        else if (auto lhs = tryConst(e->lhs.get()); lhs && *lhs == 0) mod = e->rhs.get();
+        if (!mod || mod->kind != Expr::Kind::Binary || mod->op != "%" ||
+            hasCall(mod->lhs.get())) {
+            return false;
+        }
+        auto divisor = tryConst(mod->rhs.get());
+        if (!divisor || !isPowerOfTwo(*divisor) || *divisor > 2048) return false;
+
+        string value = condOperandReg(mod->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
+        emit("andi a0, " + value + ", " + to_string(*divisor - 1));
+        bool expressionTrueWhenZero = e->op == "==";
+        bool jumpOnZero = jumpIfTrue == expressionTrueWhenZero;
+        emit(string(jumpOnZero ? "beqz a0, " : "bnez a0, ") + label);
+        return true;
+    }
+
     void genCondFalse(const Expr *e, const string &falseLabel) {
         if (auto v = tryConst(e)) {
             if (!*v) emit("j " + falseLabel);
@@ -11899,6 +12046,7 @@ private:
             emitLabel(trueLabel);
             return;
         }
+        if (genPow2ModZeroBranch(e, falseLabel, false)) return;
         static const unordered_set<string> relops = {"<", ">", "<=", ">=", "==", "!="};
         if (e->kind == Expr::Kind::Binary && relops.count(e->op) && !hasCall(e)) {
             string l = condOperandReg(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
@@ -11936,6 +12084,7 @@ private:
             genCondTrue(e->rhs.get(), trueLabel);
             return;
         }
+        if (genPow2ModZeroBranch(e, trueLabel, true)) return;
         static const unordered_set<string> relops = {"<", ">", "<=", ">=", "==", "!="};
         if (e->kind == Expr::Kind::Binary && relops.count(e->op) && !hasCall(e)) {
             string l = condOperandReg(e->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
@@ -12203,20 +12352,122 @@ private:
         adjustSp(extraBytes + 16 * n);
     }
 
+    void genInlineBranchStmt(const Stmt *s,
+                             const unordered_map<string, const Expr *> &subst,
+                             const string &dst, const string &returnLabel) {
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    genInlineBranchStmt(child.get(), subst, dst, returnLabel);
+                    if (stmtAlwaysJumps(child.get())) break;
+                }
+                return;
+            case Stmt::Kind::Empty:
+                return;
+            case Stmt::Kind::If: {
+                auto condition = cloneExprSubstGeneric(s->expr.get(), subst);
+                string elseLabel = newLabel("inline_else");
+                genCondFalse(condition.get(), elseLabel);
+                genInlineBranchStmt(s->thenStmt.get(), subst, dst, returnLabel);
+                if (s->elseStmt) {
+                    string endLabel = newLabel("inline_endif");
+                    emit("j " + endLabel);
+                    emitLabel(elseLabel);
+                    genInlineBranchStmt(s->elseStmt.get(), subst, dst, returnLabel);
+                    emitLabel(endLabel);
+                } else {
+                    emitLabel(elseLabel);
+                }
+                return;
+            }
+            case Stmt::Kind::Return: {
+                auto value = cloneExprSubstGeneric(s->expr.get(), subst);
+                genExprNoCall(value.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
+                emit("j " + returnLabel);
+                return;
+            }
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+        }
+    }
+
     bool tryGenInlineCall(const Expr *e, const string &dst) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
-        if (found == inlineableFuncs.end()) return false;
-        Function *f = found->second;
+        if (found != inlineableFuncs.end()) {
+            Function *f = found->second;
+            if (e->args.size() != f->params.size()) return false;
+            for (auto &arg : e->args) {
+                if (hasCall(arg.get())) return false;
+            }
+            unordered_map<string, const Expr *> subst;
+            for (size_t i = 0; i < f->params.size(); ++i) {
+                subst[f->params[i]] = e->args[i].get();
+            }
+            const Expr *ret = f->body->stmts[0]->expr.get();
+            auto expanded = cloneExprSubstGeneric(ret, subst);
+            genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
+            return true;
+        }
+
+        // Branch inlining uses the normal condition generator, whose scratch
+        // convention owns a0/t0. Calls nested in a larger expression already
+        // route through a0, then move the completed result to their requested
+        // destination.
+        if (dst != "a0") return false;
+        auto branch = branchInlineableFuncs.find(e->name);
+        if (branch == branchInlineableFuncs.end()) return false;
+        Function *f = branch->second;
         if (e->args.size() != f->params.size()) return false;
         for (auto &arg : e->args) {
             if (hasCall(arg.get())) return false;
         }
         unordered_map<string, const Expr *> subst;
-        for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
-        const Expr *ret = f->body->stmts[0]->expr.get();
-        auto expanded = cloneExprSubstGeneric(ret, subst);
-        genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
+        size_t neededRegs = 0;
+        for (auto &arg : e->args) {
+            if (tryConst(arg.get())) continue;
+            if (arg->kind == Expr::Kind::Var && lookup(arg->name)) continue;
+            ++neededRegs;
+        }
+        bool materializeArgs = neededRegs <= inlineArgRegs.size();
+        if (materializeArgs) {
+            vector<Symbol> paramSymbols;
+            paramSymbols.reserve(e->args.size());
+            size_t nextInlineReg = 0;
+            for (auto &arg : e->args) {
+                if (auto value = tryConst(arg.get())) {
+                    paramSymbols.push_back(Symbol{true, *value, false, "", 0, ""});
+                    continue;
+                }
+                if (arg->kind == Expr::Kind::Var) {
+                    auto symbol = lookup(arg->name);
+                    if (symbol) {
+                        paramSymbols.push_back(*symbol);
+                        continue;
+                    }
+                }
+                const string &reg = inlineArgRegs[nextInlineReg++];
+                genExprNoCall(arg.get(), reg, {"t0", "t1", "t2", "t3", "t4", "t5"});
+                paramSymbols.push_back(Symbol{false, 0, false, "", 0, reg});
+            }
+            enterScope();
+            for (size_t i = 0; i < f->params.size(); ++i) {
+                scopes.back()[f->params[i]] = paramSymbols[i];
+            }
+        } else {
+            for (size_t i = 0; i < f->params.size(); ++i) {
+                subst[f->params[i]] = e->args[i].get();
+            }
+        }
+        string endLabel = newLabel("inline_return");
+        genInlineBranchStmt(f->body.get(), subst, dst, endLabel);
+        emitLabel(endLabel);
+        if (materializeArgs) leaveScope();
         return true;
     }
 
