@@ -309,7 +309,7 @@ static int32_t mod32(int32_t a, int32_t b) {
     return a % b;
 }
 
-static constexpr uint64_t kMaxPeriodicPhases = 8192;
+static constexpr uint64_t kMaxPeriodicPhases = 16384;
 
 static uint64_t periodicMatrixPhaseLimit(int dimension) {
     constexpr uint64_t baseline = 4096;
@@ -375,6 +375,11 @@ private:
             auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
             if (elapsed > timeLimit) throw TooHard();
         }
+    }
+
+    bool pastDeadline() const {
+        return chrono::duration_cast<chrono::milliseconds>(
+                   chrono::steady_clock::now() - startTime).count() > timeLimit;
     }
 
     void initGlobals() {
@@ -1551,6 +1556,7 @@ private:
         iterMats.reserve(static_cast<size_t>(period));
         vector<uint32_t> sample = state;
         for (uint64_t i = 0; i < period; ++i) {
+            if ((i & 255u) == 0u && pastDeadline()) throw TooHard();
             vector<vector<uint32_t>> mat = idmat;
             if (!buildPeriodicTransformStmt(s->body.get(), idx, sample, mat)) return false;
             const auto &row = mat[indIdx];
@@ -1564,7 +1570,10 @@ private:
         }
 
         vector<vector<uint32_t>> periodMat = idmat;
-        for (auto &mat : iterMats) periodMat = matMul(mat, periodMat);
+        for (size_t i = 0; i < iterMats.size(); ++i) {
+            if ((i & 255u) == 0u && pastDeadline()) throw TooHard();
+            periodMat = matMul(iterMats[i], periodMat);
+        }
 
         uint64_t whole = niter / period;
         uint64_t rem = niter % period;
@@ -1807,6 +1816,11 @@ private:
             auto elapsed = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - startTime).count();
             if (elapsed > timeLimit) throw TooHard();
         }
+    }
+
+    bool pastDeadline() const {
+        return chrono::duration_cast<chrono::milliseconds>(
+                   chrono::steady_clock::now() - startTime).count() > timeLimit;
     }
 
     static int encodeBinaryOpc(const string &op) {
@@ -4886,6 +4900,7 @@ private:
                             vector<uint32_t> phaseSample = sample;
                             bool ok = true;
                             for (uint64_t phase = 0; phase < period; ++phase) {
+                                if ((phase & 255u) == 0u && pastDeadline()) throw TooHard();
                                 vector<vector<uint32_t>> mat = idmat;
                                 TransformFlow flow = buildPeriodicTransformStmt(s->body.get(), idx, phaseSample, mat, frame);
                                 int32_t matStep = 0;
@@ -4899,7 +4914,10 @@ private:
                             }
                             if (ok) {
                                 vector<vector<uint32_t>> periodMat = idmat;
-                                for (auto &mat : iterMats) periodMat = matMul(mat, periodMat);
+                                for (size_t phase = 0; phase < iterMats.size(); ++phase) {
+                                    if ((phase & 255u) == 0u && pastDeadline()) throw TooHard();
+                                    periodMat = matMul(iterMats[phase], periodMat);
+                                }
                                 uint64_t whole = niter / period;
                                 uint64_t rem = niter % period;
                                 vector<vector<uint32_t>> combined = idmat;
@@ -5560,6 +5578,7 @@ private:
         iterMats.reserve(static_cast<size_t>(period));
         vector<uint32_t> sample = state;
         for (uint64_t i = 0; i < period; ++i) {
+            if ((i & 255u) == 0u && pastDeadline()) throw TooHard();
             tick(4);
             vector<vector<uint32_t>> mat = idmat;
             TransformFlow flow = buildPeriodicTransformStmt(s->body.get(), idx, sample, mat, frame);
@@ -5575,7 +5594,10 @@ private:
         }
 
         vector<vector<uint32_t>> periodMat = idmat;
-        for (auto &mat : iterMats) periodMat = matMul(mat, periodMat);
+        for (size_t i = 0; i < iterMats.size(); ++i) {
+            if ((i & 255u) == 0u && pastDeadline()) throw TooHard();
+            periodMat = matMul(iterMats[i], periodMat);
+        }
 
         uint64_t whole = niter / period;
         uint64_t rem = niter % period;
@@ -6798,7 +6820,8 @@ private:
 
     bool sumStrictPeriodicExpr(const Expr *e, int indKey, int32_t startIv, int32_t offset,
                                int32_t step, uint64_t niter, const unordered_set<int> &changing,
-                               const int32_t *frame, uint32_t &out) const {
+                               const int32_t *frame, uint32_t &out,
+                               uint64_t *workLeft = nullptr) const {
         vector<int32_t> mods;
         if (!collectStrictPeriodicModuli(e, indKey, startIv, offset, step, changing, frame, mods) ||
             mods.empty()) {
@@ -6813,10 +6836,15 @@ private:
             if (period > kMaxPeriodicPhases) return false;
         }
         if (period == 0 || period > kMaxPeriodicPhases) return false;
+        if (workLeft) {
+            if (period > *workLeft) throw TooHard();
+            *workLeft -= period;
+        }
         vector<uint32_t> vals;
         vals.reserve(static_cast<size_t>(period));
         uint32_t cycle = 0;
         for (uint64_t t = 0; t < period; ++t) {
+            if ((t & 255u) == 0u && pastDeadline()) throw TooHard();
             int32_t iv = static_cast<int32_t>(static_cast<uint32_t>(startIv) +
                                              static_cast<uint32_t>(offset) +
                                              static_cast<uint32_t>(step) * static_cast<uint32_t>(t));
@@ -7290,6 +7318,7 @@ private:
 
     struct PeriodicPolyCtx {
         uint64_t count = 0;
+        uint64_t *strictWorkLeft = nullptr;
         int32_t phaseIv = 0;
         int32_t qStep = 0;
         int32_t indOffset = 0;
@@ -7358,7 +7387,8 @@ private:
                                 sumQuadraticModExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                     ctx.count, changing, frame, sum) ||
                                 sumStrictPeriodicExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
-                                                      ctx.count, changing, frame, sum) ||
+                                                      ctx.count, changing, frame, sum,
+                                                      ctx.strictWorkLeft) ||
                                 sumLinearDivExpr(term, indKey, ctx.phaseIv, ctx.indOffset, ctx.qStep,
                                                  ctx.count, changing, frame, sum))) {
                         // sum was filled by the helper.
@@ -7435,12 +7465,15 @@ private:
 
         unordered_map<int, uint32_t> totalDeltas;
         bool sawAccumulator = false;
+        uint64_t strictWorkLeft = 256ull * 1024;
         int32_t qStep = static_cast<int32_t>(static_cast<uint32_t>(step) * static_cast<uint32_t>(period));
         uint64_t phases = min<uint64_t>(period, niter);
         for (uint64_t phase = 0; phase < phases; ++phase) {
+            if ((phase & 255u) == 0u && pastDeadline()) throw TooHard();
             tick(8);
             PeriodicPolyCtx ctx;
             ctx.count = (niter - 1 - phase) / period + 1;
+            ctx.strictWorkLeft = &strictWorkLeft;
             ctx.phaseIv = static_cast<int32_t>(static_cast<uint32_t>(startIv) +
                                                static_cast<uint32_t>(step) * static_cast<uint32_t>(phase));
             ctx.qStep = qStep;
