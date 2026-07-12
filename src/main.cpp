@@ -10756,6 +10756,7 @@ private:
     unordered_map<string, FuncInfo> funcs;
     unordered_map<string, Function *> inlineableFuncs;
     unordered_map<string, Function *> branchInlineableFuncs;
+    unordered_map<string, Function *> leafInlineableFuncs;
     unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
@@ -10777,6 +10778,7 @@ private:
     int nextSlot = 0;
     int nextVarReg = 0;
     int localBaseOffset = -12;
+    int inlineScratchBaseOffset = 0;
     int frameSize = 0;
 
     static int alignTo(int x, int a) { return (x + a - 1) / a * a; }
@@ -10889,6 +10891,61 @@ private:
         return false;
     }
 
+    bool leafInlineStmtShape(const Stmt *s, int localCount, int &nodes,
+                             bool &alwaysReturns) const {
+        alwaysReturns = false;
+        if (!s) return true;
+        if (++nodes > 96) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool guaranteed = false;
+                for (auto &child : s->stmts) {
+                    if (guaranteed) break;
+                    bool childReturns = false;
+                    if (!leafInlineStmtShape(child.get(), localCount, nodes, childReturns)) {
+                        return false;
+                    }
+                    guaranteed = childReturns;
+                }
+                alwaysReturns = guaranteed;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCall(s->expr.get());
+            case Stmt::Kind::DeclStmt:
+                return s->decl && s->decl->init && s->decl->fastSlot >= 0 &&
+                       s->decl->fastSlot < localCount && !exprHasCall(s->decl->init.get());
+            case Stmt::Kind::Assign:
+                return !s->fastAssignGlobal && s->fastAssignIndex >= 0 &&
+                       s->fastAssignIndex < localCount && !exprHasCall(s->expr.get());
+            case Stmt::Kind::If: {
+                if (!s->expr || exprHasCall(s->expr.get())) return false;
+                bool thenReturns = false;
+                bool elseReturns = false;
+                if (!leafInlineStmtShape(s->thenStmt.get(), localCount, nodes, thenReturns)) {
+                    return false;
+                }
+                if (s->elseStmt &&
+                    !leafInlineStmtShape(s->elseStmt.get(), localCount, nodes, elseReturns)) {
+                    return false;
+                }
+                alwaysReturns = thenReturns && s->elseStmt && elseReturns;
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr || exprHasCall(s->expr.get())) return false;
+                alwaysReturns = true;
+                return true;
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
     void collectFunctions() {
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) {
@@ -10910,6 +10967,14 @@ private:
                     bool alwaysReturns = false;
                     if (branchInlineStmtShape(body, params, nodes, alwaysReturns) && alwaysReturns) {
                         branchInlineableFuncs[function->name] = function;
+                    }
+                    nodes = 0;
+                    alwaysReturns = false;
+                    if (function->fastLocalCount >= 0 && function->fastLocalCount <= 64 &&
+                        function->fastLocalCount >= static_cast<int>(function->params.size()) &&
+                        leafInlineStmtShape(body, function->fastLocalCount, nodes, alwaysReturns) &&
+                        alwaysReturns) {
+                        leafInlineableFuncs[function->name] = function;
                     }
                 }
             }
@@ -11100,9 +11165,43 @@ private:
         return false;
     }
 
+    bool callWillInline(const Expr *e) const {
+        if (!e || e->kind != Expr::Kind::Call) return false;
+        Function *target = nullptr;
+        if (auto found = inlineableFuncs.find(e->name); found != inlineableFuncs.end()) {
+            target = found->second;
+        } else if (auto found = branchInlineableFuncs.find(e->name);
+                   found != branchInlineableFuncs.end()) {
+            target = found->second;
+        } else if (auto found = leafInlineableFuncs.find(e->name);
+                   found != leafInlineableFuncs.end()) {
+            target = found->second;
+        }
+        if (!target || e->args.size() != target->params.size()) return false;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) return false;
+        }
+        return true;
+    }
+
+    bool exprContainsRuntimeCall(const Expr *e) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Call) return !callWillInline(e);
+        if (exprContainsRuntimeCall(e->lhs.get()) || exprContainsRuntimeCall(e->rhs.get())) {
+            return true;
+        }
+        for (auto &arg : e->args) {
+            if (exprContainsRuntimeCall(arg.get())) return true;
+        }
+        return false;
+    }
+
     bool stmtContainsCall(const Stmt *s) const {
         if (!s) return false;
-        if (hasCall(s->expr.get()) || (s->decl && hasCall(s->decl->init.get()))) return true;
+        if (exprContainsRuntimeCall(s->expr.get()) ||
+            (s->decl && exprContainsRuntimeCall(s->decl->init.get()))) {
+            return true;
+        }
         for (auto &child : s->stmts) {
             if (stmtContainsCall(child.get())) return true;
         }
@@ -11140,6 +11239,33 @@ private:
         result = max(result, maxBranchInlineArgs(s->thenStmt.get()));
         result = max(result, maxBranchInlineArgs(s->elseStmt.get()));
         result = max(result, maxBranchInlineArgs(s->body.get()));
+        return result;
+    }
+
+    int maxLeafInlineSlots(const Expr *e) const {
+        if (!e) return 0;
+        int result = 0;
+        if (e->kind == Expr::Kind::Call && callWillInline(e) &&
+            !inlineableFuncs.count(e->name) && !branchInlineableFuncs.count(e->name)) {
+            auto found = leafInlineableFuncs.find(e->name);
+            if (found != leafInlineableFuncs.end()) {
+                result = max(0, found->second->fastLocalCount);
+            }
+        }
+        result = max(result, maxLeafInlineSlots(e->lhs.get()));
+        result = max(result, maxLeafInlineSlots(e->rhs.get()));
+        for (auto &arg : e->args) result = max(result, maxLeafInlineSlots(arg.get()));
+        return result;
+    }
+
+    int maxLeafInlineSlots(const Stmt *s) const {
+        if (!s) return 0;
+        int result = maxLeafInlineSlots(s->expr.get());
+        if (s->decl) result = max(result, maxLeafInlineSlots(s->decl->init.get()));
+        for (auto &child : s->stmts) result = max(result, maxLeafInlineSlots(child.get()));
+        result = max(result, maxLeafInlineSlots(s->thenStmt.get()));
+        result = max(result, maxLeafInlineSlots(s->elseStmt.get()));
+        result = max(result, maxLeafInlineSlots(s->body.get()));
         return result;
     }
 
@@ -11194,6 +11320,10 @@ private:
         return off;
     }
 
+    int inlineSlotOffset(int slot) const {
+        return inlineScratchBaseOffset - slot * 4;
+    }
+
     string allocVarReg() {
         if (nextVarReg >= static_cast<int>(allocableVarRegs.size())) return "";
         return allocableVarRegs[nextVarReg++];
@@ -11235,9 +11365,11 @@ private:
                                    unordered_map<long long, long long> &w) const {
         if (!s) return;
         if (s->expr) hoistScanExpr(s->expr.get(), mult, w);
+        if (s->decl && s->decl->init) hoistScanExpr(s->decl->init.get(), mult, w);
         for (auto &child : s->stmts) hoistScanBranchInlineStmt(child.get(), mult, w);
         hoistScanBranchInlineStmt(s->thenStmt.get(), mult, w);
         hoistScanBranchInlineStmt(s->elseStmt.get(), mult, w);
+        hoistScanBranchInlineStmt(s->body.get(), mult, w);
     }
 
     void hoistScanExpr(const Expr *e, long long mult, unordered_map<long long, long long> &w) const {
@@ -11249,6 +11381,9 @@ private:
                 bool pureArgs = true;
                 for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
                 if (pureArgs) hoistScanBranchInlineStmt(branch->second->body.get(), mult, w);
+            } else if (auto leaf = leafInlineableFuncs.find(e->name);
+                       leaf != leafInlineableFuncs.end() && callWillInline(e)) {
+                hoistScanBranchInlineStmt(leaf->second->body.get(), mult, w);
             }
             return;
         }
@@ -11429,6 +11564,7 @@ private:
 
     void genFunction(Function &f) {
         int slots = countSlots(f);
+        int inlineScratchSlots = maxLeafInlineSlots(f.body.get());
         static const vector<string> allSavedRegs = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
         };
@@ -11499,10 +11635,12 @@ private:
         int savedRegCount = min(usedRegCount, static_cast<int>(allSavedRegs.size()));
         savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + savedRegCount);
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
-        frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
+        frameSize = alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 +
+                                (slots + inlineScratchSlots) * 4, 16);
         nextSlot = 0;
         nextVarReg = 0;
         localBaseOffset = -12 - static_cast<int>(savedVarRegs.size()) * 4;
+        inlineScratchBaseOffset = localBaseOffset - slots * 4;
         scopes.clear();
         breakLabels.clear();
         continueLabels.clear();
@@ -12618,6 +12756,93 @@ private:
         }
     }
 
+    void genInlineLeafStmt(const Stmt *s, const string &returnLabel) {
+        if (!s) return;
+        if (s->fastDeadStore && s->kind != Stmt::Kind::DeclStmt) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                enterScope();
+                for (auto &child : s->stmts) {
+                    genInlineLeafStmt(child.get(), returnLabel);
+                    if (stmtAlwaysJumps(child.get())) break;
+                }
+                leaveScope();
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return;
+            case Stmt::Kind::DeclStmt: {
+                const Decl &decl = *s->decl;
+                if (decl.isConst) {
+                    long long value = evalConst(decl.init.get());
+                    scopes.back()[decl.name] = Symbol{true, value, false, "", 0, ""};
+                    return;
+                }
+                int off = inlineSlotOffset(decl.fastSlot);
+                if (!s->fastDeadStore) genExpr(decl.init.get());
+                scopes.back()[decl.name] = Symbol{false, 0, false, "", off, ""};
+                if (!s->fastDeadStore) storeMem("a0", "s0", off);
+                return;
+            }
+            case Stmt::Kind::Assign:
+                genExpr(s->expr.get());
+                storeVar(s->name);
+                return;
+            case Stmt::Kind::If: {
+                string elseLabel = newLabel("leaf_inline_else");
+                genCondFalse(s->expr.get(), elseLabel);
+                genInlineLeafStmt(s->thenStmt.get(), returnLabel);
+                if (s->elseStmt) {
+                    string endLabel = newLabel("leaf_inline_endif");
+                    emit("j " + endLabel);
+                    emitLabel(elseLabel);
+                    genInlineLeafStmt(s->elseStmt.get(), returnLabel);
+                    emitLabel(endLabel);
+                } else {
+                    emitLabel(elseLabel);
+                }
+                return;
+            }
+            case Stmt::Kind::Return:
+                genExpr(s->expr.get());
+                emit("j " + returnLabel);
+                return;
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+        }
+    }
+
+    bool tryGenLeafInlineCall(const Expr *e, const string &dst) {
+        if (dst != "a0") return false;
+        auto found = leafInlineableFuncs.find(e->name);
+        if (found == leafInlineableFuncs.end()) return false;
+        Function *function = found->second;
+        if (e->args.size() != function->params.size()) return false;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) return false;
+        }
+
+        for (size_t i = 0; i < e->args.size(); ++i) {
+            genExpr(e->args[i].get());
+            storeMem("a0", "s0", inlineSlotOffset(static_cast<int>(i)));
+        }
+        auto callerScopes = std::move(scopes);
+        scopes.clear();
+        enterScope();
+        for (size_t i = 0; i < function->params.size(); ++i) {
+            scopes.back()[function->params[i]] =
+                Symbol{false, 0, false, "", inlineSlotOffset(static_cast<int>(i)), ""};
+        }
+        string endLabel = newLabel("leaf_inline_return");
+        genInlineLeafStmt(function->body.get(), endLabel);
+        emitLabel(endLabel);
+        leaveScope();
+        scopes = std::move(callerScopes);
+        return true;
+    }
+
     bool tryGenInlineCall(const Expr *e, const string &dst) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
@@ -12643,7 +12868,7 @@ private:
         // destination.
         if (dst != "a0") return false;
         auto branch = branchInlineableFuncs.find(e->name);
-        if (branch == branchInlineableFuncs.end()) return false;
+        if (branch == branchInlineableFuncs.end()) return tryGenLeafInlineCall(e, dst);
         Function *f = branch->second;
         if (e->args.size() != f->params.size()) return false;
         for (auto &arg : e->args) {
