@@ -10744,6 +10744,9 @@ private:
     vector<string> currentParams;
     vector<string> savedVarRegs;
     vector<string> inlineArgRegs;
+    unordered_map<int, string> slotRegMap;
+    vector<pair<int, uint64_t>> rankedSlotCandidates;
+    bool useSlotRegMap = false;
     int varRegCap = 0;
     unordered_map<long long, string> constRegMap;
     vector<pair<long long, string>> hoistedConsts;
@@ -11162,6 +11165,12 @@ private:
         return savedVarRegs[nextVarReg++];
     }
 
+    string allocVarRegForSlot(int slot) {
+        if (!useSlotRegMap) return allocVarReg();
+        auto found = slotRegMap.find(slot);
+        return found == slotRegMap.end() ? string() : found->second;
+    }
+
     string constReg(long long v) const {
         auto it = constRegMap.find(v);
         return it == constRegMap.end() ? string() : it->second;
@@ -11239,9 +11248,9 @@ private:
 
     void hoistScanStmt(const Stmt *s, int depth, unordered_map<long long, long long> &w) const {
         if (!s || s->fastDeadStore) return;
-        long long mult = depth > 0 ? (1LL << (3 * min(depth, 3))) : 0;
+        long long mult = depth > 0 ? (1LL << (3 * min(depth, 7))) : 0;
         if (s->kind == Stmt::Kind::While) {
-            long long inner = 1LL << (3 * min(depth + 1, 3));
+            long long inner = 1LL << (3 * min(depth + 1, 7));
             hoistScanExpr(s->expr.get(), inner, w);
             hoistScanStmt(s->body.get(), depth + 1, w);
             return;
@@ -11256,8 +11265,7 @@ private:
         hoistScanStmt(s->body.get(), depth, w);
     }
 
-    vector<long long> collectHoistConsts(const Function &f, int maxCount) const {
-        if (maxCount <= 0) return {};
+    vector<pair<long long, long long>> rankHoistConsts(const Function &f) const {
         unordered_map<long long, long long> w;
         hoistScanStmt(f.body.get(), 0, w);
         vector<pair<long long, long long>> ranked(w.begin(), w.end());
@@ -11265,28 +11273,178 @@ private:
             if (a.second != b.second) return a.second > b.second;
             return a.first < b.first;
         });
-        vector<long long> out;
-        for (auto &[v, weight] : ranked) {
-            if (weight < 8) break;  // only worth it inside a loop
-            out.push_back(v);
-            if (static_cast<int>(out.size()) >= maxCount) break;
-        }
-        return out;
+        return ranked;
     }
 
     void enterScope() { scopes.push_back({}); }
     void leaveScope() { scopes.pop_back(); }
 
+    static uint64_t slotUseWeight(int loopDepth) {
+        return uint64_t{1} << (3 * min(loopDepth, 7));
+    }
+
+    static void addSlotUse(vector<uint64_t> &weights, int slot, uint64_t amount) {
+        if (slot < 0 || slot >= static_cast<int>(weights.size())) return;
+        uint64_t &value = weights[static_cast<size_t>(slot)];
+        value = numeric_limits<uint64_t>::max() - value < amount
+            ? numeric_limits<uint64_t>::max()
+            : value + amount;
+    }
+
+    void collectSlotUses(const Expr *e, int loopDepth, vector<uint64_t> &weights) const {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var && !e->fastGlobal) {
+            addSlotUse(weights, e->fastIndex, slotUseWeight(loopDepth));
+        }
+        collectSlotUses(e->lhs.get(), loopDepth, weights);
+        collectSlotUses(e->rhs.get(), loopDepth, weights);
+        for (auto &arg : e->args) collectSlotUses(arg.get(), loopDepth, weights);
+    }
+
+    void collectSlotUses(const Stmt *s, int loopDepth, vector<uint64_t> &weights) const {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) collectSlotUses(child.get(), loopDepth, weights);
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                if (!s->fastDeadStore) collectSlotUses(s->expr.get(), loopDepth, weights);
+                return;
+            case Stmt::Kind::Assign:
+                if (s->fastDeadStore) return;
+                if (!s->fastAssignGlobal) {
+                    addSlotUse(weights, s->fastAssignIndex, slotUseWeight(loopDepth));
+                }
+                collectSlotUses(s->expr.get(), loopDepth, weights);
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (s->fastDeadStore) return;
+                if (s->decl && !s->decl->isConst) {
+                    addSlotUse(weights, s->decl->fastSlot, slotUseWeight(loopDepth));
+                }
+                if (s->decl) collectSlotUses(s->decl->init.get(), loopDepth, weights);
+                return;
+            case Stmt::Kind::If:
+                collectSlotUses(s->expr.get(), loopDepth, weights);
+                collectSlotUses(s->thenStmt.get(), loopDepth, weights);
+                collectSlotUses(s->elseStmt.get(), loopDepth, weights);
+                return;
+            case Stmt::Kind::While:
+                collectSlotUses(s->expr.get(), loopDepth + 1, weights);
+                collectSlotUses(s->body.get(), loopDepth + 1, weights);
+                return;
+        }
+    }
+
+    void collectAllocatableSlots(const Stmt *s, int fastLocalCount,
+                                 vector<int> &slots, bool &valid) const {
+        if (!s || !valid) return;
+        if (s->kind == Stmt::Kind::DeclStmt && s->decl && !s->decl->isConst) {
+            int slot = s->decl->fastSlot;
+            if (slot < 0 || slot >= fastLocalCount) {
+                valid = false;
+                return;
+            }
+            slots.push_back(slot);
+        }
+        for (auto &child : s->stmts) {
+            collectAllocatableSlots(child.get(), fastLocalCount, slots, valid);
+        }
+        collectAllocatableSlots(s->thenStmt.get(), fastLocalCount, slots, valid);
+        collectAllocatableSlots(s->elseStmt.get(), fastLocalCount, slots, valid);
+        collectAllocatableSlots(s->body.get(), fastLocalCount, slots, valid);
+    }
+
+    void buildSlotRegisterMap(const Function &f, int slots,
+                              const vector<string> &allVarRegs) {
+        slotRegMap.clear();
+        rankedSlotCandidates.clear();
+        useSlotRegMap = false;
+        if (f.fastLocalCount < static_cast<int>(f.params.size())) return;
+
+        vector<int> candidates;
+        for (int i = 0; i < static_cast<int>(f.params.size()); ++i) candidates.push_back(i);
+        bool valid = true;
+        collectAllocatableSlots(f.body.get(), f.fastLocalCount, candidates, valid);
+        if (!valid) return;
+        sort(candidates.begin(), candidates.end());
+        candidates.erase(unique(candidates.begin(), candidates.end()), candidates.end());
+        if (static_cast<int>(candidates.size()) != slots) return;
+
+        vector<uint64_t> weights(static_cast<size_t>(f.fastLocalCount), 0);
+        collectSlotUses(f.body.get(), 0, weights);
+        sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
+            if (weights[static_cast<size_t>(lhs)] != weights[static_cast<size_t>(rhs)]) {
+                return weights[static_cast<size_t>(lhs)] > weights[static_cast<size_t>(rhs)];
+            }
+            return lhs < rhs;
+        });
+        for (int slot : candidates) {
+            rankedSlotCandidates.push_back({slot, weights[static_cast<size_t>(slot)]});
+        }
+        for (int i = 0; i < varRegCap; ++i) {
+            slotRegMap[candidates[static_cast<size_t>(i)]] = allVarRegs[static_cast<size_t>(i)];
+        }
+        useSlotRegMap = true;
+    }
+
     void genFunction(Function &f) {
         int slots = countSlots(f);
         static const vector<string> allVarRegs = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
-        varRegCap = min<int>(static_cast<int>(allVarRegs.size()), slots);
-        int inlineArgCount = min(maxBranchInlineArgs(f.body.get()),
-                                 static_cast<int>(allVarRegs.size()) - varRegCap);
+        int registerCount = static_cast<int>(allVarRegs.size());
+        varRegCap = min(registerCount, slots);
+        buildSlotRegisterMap(f, slots, allVarRegs);
+        int desiredInlineArgs = maxBranchInlineArgs(f.body.get());
+        int inlineArgCount = min(desiredInlineArgs, max(0, registerCount - slots));
+        vector<long long> hoistVals;
+        auto rankedConsts = rankHoistConsts(f);
+        rankedConsts.erase(
+            remove_if(rankedConsts.begin(), rankedConsts.end(),
+                      [](const auto &entry) { return entry.second < 8; }),
+            rankedConsts.end());
+        if (rankedConsts.size() > 4) rankedConsts.resize(4);
+
+        if (useSlotRegMap) {
+            struct RegChoice {
+                uint64_t score;
+                bool isConst;
+                int slot;
+                long long value;
+            };
+            vector<RegChoice> choices;
+            for (auto &[slot, score] : rankedSlotCandidates) {
+                choices.push_back(RegChoice{score, false, slot, 0});
+            }
+            for (auto &[value, score] : rankedConsts) {
+                choices.push_back(RegChoice{static_cast<uint64_t>(score), true, -1, value});
+            }
+            sort(choices.begin(), choices.end(), [](const RegChoice &lhs, const RegChoice &rhs) {
+                if (lhs.score != rhs.score) return lhs.score > rhs.score;
+                if (lhs.isConst != rhs.isConst) return !lhs.isConst;
+                return lhs.isConst ? lhs.value < rhs.value : lhs.slot < rhs.slot;
+            });
+            int capacity = registerCount - inlineArgCount;
+            if (static_cast<int>(choices.size()) > capacity) choices.resize(capacity);
+            varRegCap = 0;
+            for (const RegChoice &choice : choices) {
+                if (choice.isConst) hoistVals.push_back(choice.value);
+                else ++varRegCap;
+            }
+            buildSlotRegisterMap(f, slots, allVarRegs);
+        } else {
+            varRegCap = min(registerCount, slots);
+            inlineArgCount = min(desiredInlineArgs, registerCount - varRegCap);
+            int hoistCount = min({4, registerCount - varRegCap - inlineArgCount,
+                                  static_cast<int>(rankedConsts.size())});
+            for (int i = 0; i < hoistCount; ++i) hoistVals.push_back(rankedConsts[i].first);
+        }
         inlineArgRegs.assign(allVarRegs.begin() + varRegCap,
                              allVarRegs.begin() + varRegCap + inlineArgCount);
-        auto hoistVals = collectHoistConsts(
-            f, min(4, static_cast<int>(allVarRegs.size()) - varRegCap - inlineArgCount));
         constRegMap.clear();
         hoistedConsts.clear();
         for (size_t i = 0; i < hoistVals.size(); ++i) {
@@ -11325,7 +11483,7 @@ private:
 
         enterScope();
         for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
-            string reg = allocVarReg();
+            string reg = allocVarRegForSlot(i);
             int off = reg.empty() ? allocSlot() : 0;
             scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off, reg};
             if (i < 8) {
@@ -11425,7 +11583,7 @@ private:
             scopes.back()[d.name] = Symbol{true, v, false, "", 0, ""};
             return;
         }
-        string reg = allocVarReg();
+        string reg = allocVarRegForSlot(d.fastSlot);
         int off = reg.empty() ? allocSlot() : 0;
         scopes.back()[d.name] = Symbol{false, 0, false, "", off, reg};
         if (skipInit) return;
