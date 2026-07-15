@@ -11633,7 +11633,7 @@ private:
             if ((e->op == "+" || e->op == "-") && fits12(e->op == "+" ? v : -v)) counted = true;  // addi
             else if (e->op == "*" && (v == 0 || v == 1 || isPowerOfTwo(v))) counted = true;       // slli
             else if ((e->op == "/" || e->op == "%") && v > 0) {
-                if (isPowerOfTwo(v) && v <= 2048) counted = true;  // shift sequence
+                if (isPowerOfTwo(v)) counted = true;  // shift/mask sequence
                 else if (auto spec = codegenMagicForDivisor(static_cast<int>(v))) {
                     hoistNoteConst(spec->magic, mult, w);
                     if (e->op == "%") hoistNoteConst(v, mult, w);
@@ -11809,6 +11809,12 @@ private:
         bool callFree = !stmtContainsRuntimeCall(f.body.get());
         frameFreeLeaf = false;
         vector<string> allVarRegs;
+        vector<pair<long long, long long>> rankedConsts = rankHoistConsts(f);
+        rankedConsts.erase(
+            remove_if(rankedConsts.begin(), rankedConsts.end(),
+                      [](const auto &entry) { return entry.second < 8; }),
+            rankedConsts.end());
+        if (rankedConsts.size() > 8) rankedConsts.resize(8);
 
         // A small leaf can keep every mutable slot in caller-saved registers.
         // Probe the normal slot metadata first; any uncertainty falls back to
@@ -11819,6 +11825,14 @@ private:
             varRegCap = slots;
             buildSlotRegisterMap(f, slots, allVarRegs);
             frameFreeLeaf = useSlotRegMap && varRegCap == slots;
+        }
+        // A prologue is paid once, while an unhoisted constant is paid on every
+        // iteration. Prefer the wider framed register set when a hot leaf loop
+        // cannot hold both all mutable slots and its loop constants in a1-a7.
+        if (frameFreeLeaf &&
+            static_cast<int>(rankedConsts.size()) >
+                static_cast<int>(leafRegs.size()) - varRegCap) {
+            frameFreeLeaf = false;
         }
         if (!frameFreeLeaf) {
             allVarRegs = allSavedRegs;
@@ -11834,17 +11848,12 @@ private:
             ? 0
             : min(desiredInlineArgs, max(0, registerCount - slots));
         vector<long long> hoistVals;
-        vector<pair<long long, long long>> rankedConsts;
-        if (!frameFreeLeaf) {
-            rankedConsts = rankHoistConsts(f);
-            rankedConsts.erase(
-                remove_if(rankedConsts.begin(), rankedConsts.end(),
-                          [](const auto &entry) { return entry.second < 8; }),
-                rankedConsts.end());
-            if (rankedConsts.size() > 4) rankedConsts.resize(4);
-        }
 
-        if (!frameFreeLeaf && useSlotRegMap) {
+        if (frameFreeLeaf) {
+            int hoistCount = min({4, registerCount - varRegCap,
+                                  static_cast<int>(rankedConsts.size())});
+            for (int i = 0; i < hoistCount; ++i) hoistVals.push_back(rankedConsts[i].first);
+        } else if (useSlotRegMap) {
             struct RegChoice {
                 uint64_t score;
                 bool isConst;
@@ -11871,7 +11880,7 @@ private:
                 else ++varRegCap;
             }
             buildSlotRegisterMap(f, slots, allVarRegs);
-        } else if (!frameFreeLeaf) {
+        } else {
             varRegCap = min(registerCount, slots);
             inlineArgCount = min(desiredInlineArgs, registerCount - varRegCap);
             int hoistCount = min({4, registerCount - varRegCap - inlineArgCount,
@@ -12370,6 +12379,22 @@ private:
             emit("li " + dst + ", 0");
             return;
         }
+        if (dst != src) {
+            string tmp = pickScratch({dst, src}, scratchPrefs);
+            emitQuotientConst(dst, src, divisor, tmp);
+            if (isPowerOfTwo(divisor)) {
+                emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(divisor)));
+            } else {
+                string dreg = constReg(divisor);
+                if (dreg.empty()) {
+                    emit("li " + tmp + ", " + to_string(divisor));
+                    dreg = tmp;
+                }
+                emit("mul " + dst + ", " + dst + ", " + dreg);
+            }
+            emit("sub " + dst + ", " + src + ", " + dst);
+            return;
+        }
         string orig = pickScratch({dst, src}, scratchPrefs);
         string tmp = pickScratch({dst, src, orig}, scratchPrefs);
         emit("mv " + orig + ", " + src);
@@ -12529,13 +12554,25 @@ private:
                 return;
             }
             if ((e->op == "/" || e->op == "%") && canStrengthReduceDivisor(*rhs)) {
-                genExprNoCall(e->lhs.get(), dst, regs);
+                string sourceReg;
+                if (e->lhs->kind == Expr::Kind::Var) {
+                    auto symbol = lookup(e->lhs->name);
+                    if (symbol && !symbol->isConst && !symbol->isGlobal &&
+                        !symbol->reg.empty() && symbol->reg != dst) {
+                        sourceReg = symbol->reg;
+                    }
+                }
+                if (sourceReg.empty()) {
+                    genExprNoCall(e->lhs.get(), dst, regs);
+                    sourceReg = dst;
+                }
                 bool nonNegative = e->lhs->rangeAnalyzed && e->lhs->rangeMin >= 0;
                 if (nonNegative && e->lhs->rangeMax < *rhs) {
                     if (e->op == "/") emit("li " + dst + ", 0");
+                    else if (sourceReg != dst) emit("mv " + dst + ", " + sourceReg);
                     return;
                 }
-                emitDivModConst(dst, dst, static_cast<int>(*rhs), e->op == "%",
+                emitDivModConst(dst, sourceReg, static_cast<int>(*rhs), e->op == "%",
                                 nonNegative, regs);
                 return;
             }
