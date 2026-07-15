@@ -11948,7 +11948,14 @@ private:
             }
             int shift = log2Int(divisor);
             emit("srai " + tmp + ", " + src + ", 31");
-            emit("andi " + tmp + ", " + tmp + ", " + to_string(divisor - 1));
+            if (fits12(divisor - 1)) {
+                emit("andi " + tmp + ", " + tmp + ", " + to_string(divisor - 1));
+            } else {
+                // The sign word is either zero or all ones. A logical shift
+                // materializes the large (2^shift - 1) bias without an
+                // out-of-range I-type immediate.
+                emit("srli " + tmp + ", " + tmp + ", " + to_string(32 - shift));
+            }
             emit("add " + dst + ", " + src + ", " + tmp);
             emit("srai " + dst + ", " + dst + ", " + to_string(shift));
             return;
