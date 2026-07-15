@@ -11935,9 +11935,11 @@ private:
             frameFreeLeaf = false;
         }
         if (!frameFreeLeaf) {
-            allVarRegs = allSavedRegs;
             if (callFree) {
-                allVarRegs.insert(allVarRegs.end(), leafRegs.begin(), leafRegs.end());
+                allVarRegs = leafRegs;
+                allVarRegs.insert(allVarRegs.end(), allSavedRegs.begin(), allSavedRegs.end());
+            } else {
+                allVarRegs = allSavedRegs;
             }
             varRegCap = min(static_cast<int>(allVarRegs.size()), slots);
             buildSlotRegisterMap(f, slots, allVarRegs);
@@ -12012,10 +12014,13 @@ private:
                 });
             }
         }
-        int savedRegCount = frameFreeLeaf
-            ? 0
-            : min(usedRegCount, static_cast<int>(allSavedRegs.size()));
-        savedVarRegs.assign(allSavedRegs.begin(), allSavedRegs.begin() + savedRegCount);
+        savedVarRegs.clear();
+        if (!frameFreeLeaf) {
+            for (int i = 0; i < usedRegCount; ++i) {
+                const string &reg = allVarRegs[static_cast<size_t>(i)];
+                if (!reg.empty() && reg[0] == 's') savedVarRegs.push_back(reg);
+            }
+        }
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
         frameSize = frameFreeLeaf
             ? 0
@@ -12058,23 +12063,27 @@ private:
                 moves.push_back({reg, "a" + to_string(i)});
             }
             emitParallelMoves(std::move(moves));
-        } else if (varRegCap > static_cast<int>(allSavedRegs.size())) {
-            vector<pair<string, int>> paramHomes;
-            paramHomes.reserve(f.params.size());
+        } else if (callFree && varRegCap > 0) {
+            vector<pair<string, string>> registerMoves;
+            vector<pair<string, int>> stackParamHomes;
             for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
                 string reg = allocVarRegForSlot(i);
-                int off = allocSlot();
+                int off = reg.empty() ? allocSlot() : 0;
                 scopes.back()[f.params[i]] = Symbol{false, 0, false, "", off, reg};
-                paramHomes.push_back({reg, off});
                 if (i < 8) {
-                    storeMem("a" + to_string(i), "s0", off);
+                    if (!reg.empty()) registerMoves.push_back({reg, "a" + to_string(i)});
+                    else storeMem("a" + to_string(i), "s0", off);
                 } else {
-                    loadMem("t0", "s0", (i - 8) * 4);
-                    storeMem("t0", "s0", off);
+                    if (!reg.empty()) stackParamHomes.push_back({reg, (i - 8) * 4});
+                    else {
+                        loadMem("t0", "s0", (i - 8) * 4);
+                        storeMem("t0", "s0", off);
+                    }
                 }
             }
-            for (auto &[reg, off] : paramHomes) {
-                if (!reg.empty()) loadMem(reg, "s0", off);
+            emitParallelMoves(std::move(registerMoves));
+            for (auto &[reg, sourceOffset] : stackParamHomes) {
+                loadMem(reg, "s0", sourceOffset);
             }
         } else {
             for (int i = 0; i < static_cast<int>(f.params.size()); ++i) {
