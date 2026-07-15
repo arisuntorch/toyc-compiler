@@ -215,6 +215,9 @@ struct Expr {
     bool fastGlobal = false;
     int fastIndex = -1;
     int opc = -1;
+    bool rangeAnalyzed = false;
+    int32_t rangeMin = numeric_limits<int32_t>::min();
+    int32_t rangeMax = numeric_limits<int32_t>::max();
     unique_ptr<Expr> lhs;
     unique_ptr<Expr> rhs;
     vector<unique_ptr<Expr>> args;
@@ -9355,6 +9358,336 @@ private:
     }
 };
 
+class RangeAnalyzer {
+public:
+    explicit RangeAnalyzer(Program &program) : prog(program) {}
+
+    void run() {
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func || item.func->fastLocalCount < 0) continue;
+            Env env(static_cast<size_t>(item.func->fastLocalCount), full());
+            analyzeStmt(item.func->body.get(), env);
+        }
+    }
+
+private:
+    struct Range {
+        int64_t lo;
+        int64_t hi;
+    };
+    using Env = vector<Range>;
+
+    Program &prog;
+    static constexpr int64_t kMin = numeric_limits<int32_t>::min();
+    static constexpr int64_t kMax = numeric_limits<int32_t>::max();
+
+    static Range full() { return {kMin, kMax}; }
+    static Range exact(int64_t value) { return {value, value}; }
+    static bool same(Range a, Range b) { return a.lo == b.lo && a.hi == b.hi; }
+    static Range join(Range a, Range b) {
+        return {min(a.lo, b.lo), max(a.hi, b.hi)};
+    }
+
+    static bool sameEnv(const Env &a, const Env &b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (!same(a[i], b[i])) return false;
+        }
+        return true;
+    }
+
+    static Env joinEnv(const Env &a, const Env &b) {
+        Env out = a;
+        for (size_t i = 0; i < out.size(); ++i) out[i] = join(a[i], b[i]);
+        return out;
+    }
+
+    static Env widenEnv(const Env &oldEnv, const Env &nextEnv) {
+        Env out = oldEnv;
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (nextEnv[i].lo < oldEnv[i].lo) out[i].lo = kMin;
+            if (nextEnv[i].hi > oldEnv[i].hi) out[i].hi = kMax;
+        }
+        return out;
+    }
+
+    static bool inInt32(Range r) {
+        return r.lo >= kMin && r.hi <= kMax && r.lo <= r.hi;
+    }
+
+    static optional<int64_t> exactValue(Range r) {
+        if (r.lo == r.hi) return r.lo;
+        return nullopt;
+    }
+
+    void noteRange(Expr *e, Range r) {
+        if (!e) return;
+        if (!inInt32(r)) r = full();
+        if (!e->rangeAnalyzed) {
+            e->rangeAnalyzed = true;
+            e->rangeMin = static_cast<int32_t>(r.lo);
+            e->rangeMax = static_cast<int32_t>(r.hi);
+            return;
+        }
+        e->rangeMin = min(e->rangeMin, static_cast<int32_t>(r.lo));
+        e->rangeMax = max(e->rangeMax, static_cast<int32_t>(r.hi));
+    }
+
+    Range analyzeExpr(Expr *e, const Env &env) {
+        if (!e) return full();
+        Range result = full();
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                result = exact(wrap32(e->value));
+                break;
+            case Expr::Kind::Var:
+                if (!e->fastGlobal && e->fastIndex >= 0 &&
+                    e->fastIndex < static_cast<int>(env.size())) {
+                    result = env[static_cast<size_t>(e->fastIndex)];
+                }
+                break;
+            case Expr::Kind::Call:
+                for (auto &arg : e->args) analyzeExpr(arg.get(), env);
+                break;
+            case Expr::Kind::Unary: {
+                Range value = analyzeExpr(e->lhs.get(), env);
+                if (e->op == "+") result = value;
+                else if (e->op == "!") result = {0, 1};
+                else if (e->op == "-" && value.lo > kMin) {
+                    result = {-value.hi, -value.lo};
+                }
+                break;
+            }
+            case Expr::Kind::Binary: {
+                Range lhs = analyzeExpr(e->lhs.get(), env);
+                Range rhs = analyzeExpr(e->rhs.get(), env);
+                if (e->op == "<" || e->op == ">" || e->op == "<=" ||
+                    e->op == ">=" || e->op == "==" || e->op == "!=" ||
+                    e->op == "&&" || e->op == "||") {
+                    result = {0, 1};
+                    break;
+                }
+                if (e->op == "+") result = {lhs.lo + rhs.lo, lhs.hi + rhs.hi};
+                else if (e->op == "-") result = {lhs.lo - rhs.hi, lhs.hi - rhs.lo};
+                else if (e->op == "*") {
+                    array<int64_t, 4> values = {
+                        lhs.lo * rhs.lo, lhs.lo * rhs.hi,
+                        lhs.hi * rhs.lo, lhs.hi * rhs.hi,
+                    };
+                    result = {*min_element(values.begin(), values.end()),
+                              *max_element(values.begin(), values.end())};
+                } else if (auto divisor = exactValue(rhs); divisor && *divisor != 0) {
+                    int64_t d = *divisor;
+                    if (e->op == "/") {
+                        int64_t q1 = lhs.lo / d;
+                        int64_t q2 = lhs.hi / d;
+                        result = {min(q1, q2), max(q1, q2)};
+                    } else if (e->op == "%") {
+                        int64_t magnitude = d < 0 ? -d : d;
+                        int64_t limit = magnitude - 1;
+                        if (lhs.lo >= 0) result = {0, min(lhs.hi, limit)};
+                        else if (lhs.hi <= 0) result = {max(lhs.lo, -limit), 0};
+                        else result = {max(lhs.lo, -limit), min(lhs.hi, limit)};
+                    }
+                }
+                if (!inInt32(result)) result = full();
+                break;
+            }
+        }
+        noteRange(e, result);
+        return result;
+    }
+
+    static string reversedRelation(const string &op) {
+        if (op == "<") return ">";
+        if (op == ">") return "<";
+        if (op == "<=") return ">=";
+        if (op == ">=") return "<=";
+        return op;
+    }
+
+    static string falseRelation(const string &op) {
+        if (op == "<") return ">=";
+        if (op == ">") return "<=";
+        if (op == "<=") return ">";
+        if (op == ">=") return "<";
+        if (op == "==") return "!=";
+        if (op == "!=") return "==";
+        return op;
+    }
+
+    bool refineSlot(Env &env, int slot, const string &op, int64_t value) const {
+        if (slot < 0 || slot >= static_cast<int>(env.size())) return true;
+        Range &r = env[static_cast<size_t>(slot)];
+        if (op == "<") r.hi = min(r.hi, value - 1);
+        else if (op == "<=") r.hi = min(r.hi, value);
+        else if (op == ">") r.lo = max(r.lo, value + 1);
+        else if (op == ">=") r.lo = max(r.lo, value);
+        else if (op == "==") {
+            r.lo = max(r.lo, value);
+            r.hi = min(r.hi, value);
+        }
+        // A != constraint is generally non-convex and cannot be represented by
+        // one interval, so it is intentionally left unchanged.
+        return r.lo <= r.hi;
+    }
+
+    bool constrain(Expr *condition, bool wantTrue, Env &env) const {
+        if (!condition) return true;
+        if (condition->rangeAnalyzed) {
+            if (wantTrue && condition->rangeMin == 0 && condition->rangeMax == 0) return false;
+            if (!wantTrue && (condition->rangeMin > 0 || condition->rangeMax < 0)) return false;
+        }
+        if (condition->kind == Expr::Kind::Unary && condition->op == "!") {
+            return constrain(condition->lhs.get(), !wantTrue, env);
+        }
+        if (condition->kind == Expr::Kind::Binary && condition->op == "&&" && wantTrue) {
+            return constrain(condition->lhs.get(), true, env) &&
+                   constrain(condition->rhs.get(), true, env);
+        }
+        if (condition->kind == Expr::Kind::Binary && condition->op == "||" && !wantTrue) {
+            return constrain(condition->lhs.get(), false, env) &&
+                   constrain(condition->rhs.get(), false, env);
+        }
+        if (condition->kind != Expr::Kind::Binary) return true;
+        static const unordered_set<string> relations = {"<", ">", "<=", ">=", "==", "!="};
+        if (!relations.count(condition->op)) return true;
+
+        Expr *var = condition->lhs.get();
+        Expr *constant = condition->rhs.get();
+        string op = condition->op;
+        if (!var || var->kind != Expr::Kind::Var || var->fastGlobal ||
+            !constant || !constant->rangeAnalyzed || constant->rangeMin != constant->rangeMax) {
+            var = condition->rhs.get();
+            constant = condition->lhs.get();
+            op = reversedRelation(op);
+        }
+        if (!var || var->kind != Expr::Kind::Var || var->fastGlobal ||
+            !constant || !constant->rangeAnalyzed || constant->rangeMin != constant->rangeMax) {
+            return true;
+        }
+        if (!wantTrue) op = falseRelation(op);
+        return refineSlot(env, var->fastIndex, op, constant->rangeMin);
+    }
+
+    bool hasAbruptLoopFlow(const Stmt *s) const {
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::Break || s->kind == Stmt::Kind::Continue ||
+            s->kind == Stmt::Kind::Return) {
+            return true;
+        }
+        for (auto &child : s->stmts) {
+            if (hasAbruptLoopFlow(child.get())) return true;
+        }
+        return hasAbruptLoopFlow(s->thenStmt.get()) ||
+               hasAbruptLoopFlow(s->elseStmt.get()) ||
+               hasAbruptLoopFlow(s->body.get());
+    }
+
+    void analyzeConservatively(Stmt *s, const Env &unknownEnv) {
+        if (!s) return;
+        if (s->expr) analyzeExpr(s->expr.get(), unknownEnv);
+        if (s->decl && s->decl->init) analyzeExpr(s->decl->init.get(), unknownEnv);
+        for (auto &child : s->stmts) analyzeConservatively(child.get(), unknownEnv);
+        analyzeConservatively(s->thenStmt.get(), unknownEnv);
+        analyzeConservatively(s->elseStmt.get(), unknownEnv);
+        analyzeConservatively(s->body.get(), unknownEnv);
+    }
+
+    void invalidateAssigned(const Stmt *s, Env &env) const {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign && !s->fastAssignGlobal &&
+            s->fastAssignIndex >= 0 && s->fastAssignIndex < static_cast<int>(env.size())) {
+            env[static_cast<size_t>(s->fastAssignIndex)] = full();
+        }
+        if (s->kind == Stmt::Kind::DeclStmt && s->decl && s->decl->fastSlot >= 0 &&
+            s->decl->fastSlot < static_cast<int>(env.size())) {
+            env[static_cast<size_t>(s->decl->fastSlot)] = full();
+        }
+        for (auto &child : s->stmts) invalidateAssigned(child.get(), env);
+        invalidateAssigned(s->thenStmt.get(), env);
+        invalidateAssigned(s->elseStmt.get(), env);
+        invalidateAssigned(s->body.get(), env);
+    }
+
+    void analyzeStmt(Stmt *s, Env &env) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) analyzeStmt(child.get(), env);
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                analyzeExpr(s->expr.get(), env);
+                return;
+            case Stmt::Kind::DeclStmt: {
+                Range value = analyzeExpr(s->decl->init.get(), env);
+                if (!s->fastDeadStore && s->decl->fastSlot >= 0 &&
+                    s->decl->fastSlot < static_cast<int>(env.size())) {
+                    env[static_cast<size_t>(s->decl->fastSlot)] = value;
+                }
+                return;
+            }
+            case Stmt::Kind::Assign: {
+                Range value = analyzeExpr(s->expr.get(), env);
+                if (!s->fastDeadStore && !s->fastAssignGlobal && s->fastAssignIndex >= 0 &&
+                    s->fastAssignIndex < static_cast<int>(env.size())) {
+                    env[static_cast<size_t>(s->fastAssignIndex)] = value;
+                }
+                return;
+            }
+            case Stmt::Kind::If: {
+                analyzeExpr(s->expr.get(), env);
+                Env thenEnv = env;
+                Env elseEnv = env;
+                bool thenReachable = constrain(s->expr.get(), true, thenEnv);
+                bool elseReachable = constrain(s->expr.get(), false, elseEnv);
+                if (thenReachable) analyzeStmt(s->thenStmt.get(), thenEnv);
+                if (elseReachable) analyzeStmt(s->elseStmt.get(), elseEnv);
+                if (thenReachable && elseReachable) env = joinEnv(thenEnv, elseEnv);
+                else if (thenReachable) env = std::move(thenEnv);
+                else if (elseReachable) env = std::move(elseEnv);
+                return;
+            }
+            case Stmt::Kind::While: {
+                if (hasAbruptLoopFlow(s->body.get())) {
+                    Env unknownEnv(env.size(), full());
+                    analyzeExpr(s->expr.get(), unknownEnv);
+                    analyzeConservatively(s->body.get(), unknownEnv);
+                    invalidateAssigned(s->body.get(), env);
+                    return;
+                }
+                Env entry = env;
+                Env head = entry;
+                bool bodyReachable = true;
+                for (int iteration = 0; iteration < 10; ++iteration) {
+                    analyzeExpr(s->expr.get(), head);
+                    Env bodyEnv = head;
+                    bodyReachable = constrain(s->expr.get(), true, bodyEnv);
+                    if (!bodyReachable) break;
+                    analyzeStmt(s->body.get(), bodyEnv);
+                    Env next = joinEnv(entry, bodyEnv);
+                    if (iteration >= 6) next = widenEnv(head, next);
+                    if (sameEnv(head, next)) {
+                        head = std::move(next);
+                        break;
+                    }
+                    head = std::move(next);
+                }
+                analyzeExpr(s->expr.get(), head);
+                Env exitEnv = head;
+                if (constrain(s->expr.get(), false, exitEnv)) env = std::move(exitEnv);
+                else env = std::move(head);
+                return;
+            }
+        }
+    }
+};
+
 static unique_ptr<Expr> makeNumberExpr(long long value) {
     auto e = make_unique<Expr>();
     e->kind = Expr::Kind::Number;
@@ -12007,7 +12340,20 @@ private:
     }
 
     void emitDivModConst(const string &dst, const string &src, int divisor, bool isMod,
+                         bool sourceNonNegative,
                          const vector<string> &scratchPrefs = {}) {
+        if (sourceNonNegative && isPowerOfTwo(divisor)) {
+            int shift = log2Int(divisor);
+            if (!isMod) {
+                emit("srli " + dst + ", " + src + ", " + to_string(shift));
+            } else if (fits12(divisor - 1)) {
+                emit("andi " + dst + ", " + src + ", " + to_string(divisor - 1));
+            } else {
+                emit("slli " + dst + ", " + src + ", " + to_string(32 - shift));
+                emit("srli " + dst + ", " + dst + ", " + to_string(32 - shift));
+            }
+            return;
+        }
         if (!isMod) {
             if (dst == src) {
                 string orig = pickScratch({dst, src}, scratchPrefs);
@@ -12184,7 +12530,13 @@ private:
             }
             if ((e->op == "/" || e->op == "%") && canStrengthReduceDivisor(*rhs)) {
                 genExprNoCall(e->lhs.get(), dst, regs);
-                emitDivModConst(dst, dst, static_cast<int>(*rhs), e->op == "%", regs);
+                bool nonNegative = e->lhs->rangeAnalyzed && e->lhs->rangeMin >= 0;
+                if (nonNegative && e->lhs->rangeMax < *rhs) {
+                    if (e->op == "/") emit("li " + dst + ", 0");
+                    return;
+                }
+                emitDivModConst(dst, dst, static_cast<int>(*rhs), e->op == "%",
+                                nonNegative, regs);
                 return;
             }
         }
@@ -12321,10 +12673,15 @@ private:
             return false;
         }
         auto divisor = tryConst(mod->rhs.get());
-        if (!divisor || !isPowerOfTwo(*divisor) || *divisor > 2048) return false;
+        if (!divisor || !isPowerOfTwo(*divisor) || *divisor > INT32_MAX) return false;
 
         string value = condOperandReg(mod->lhs.get(), "a0", {"t1", "t2", "t3", "t4", "t5"});
-        emit("andi a0, " + value + ", " + to_string(*divisor - 1));
+        int shift = log2Int(*divisor);
+        if (fits12(*divisor - 1)) {
+            emit("andi a0, " + value + ", " + to_string(*divisor - 1));
+        } else {
+            emit("slli a0, " + value + ", " + to_string(32 - shift));
+        }
         bool expressionTrueWhenZero = e->op == "==";
         bool jumpOnZero = jumpIfTrue == expressionTrueWhenZero;
         emit(string(jumpOnZero ? "beqz a0, " : "bnez a0, ") + label);
@@ -12509,7 +12866,9 @@ private:
                 }
                 if ((e->op == "/" || e->op == "%") && canStrengthReduceDivisor(*rhs)) {
                     genExpr(e->lhs.get());
-                    emitDivModConst("a0", "a0", static_cast<int>(*rhs), e->op == "%");
+                    bool nonNegative = e->lhs->rangeAnalyzed && e->lhs->rangeMin >= 0;
+                    emitDivModConst("a0", "a0", static_cast<int>(*rhs), e->op == "%",
+                                    nonNegative);
                     return;
                 }
             }
@@ -12829,6 +13188,9 @@ int main(int argc, char **argv) {
     // host-JIT entry points are deliberately disabled in this compilation path.
     FastEvaluator deadStoreAnalysis(program, 100);
     (void)deadStoreAnalysis;
+
+    RangeAnalyzer rangeAnalysis(program);
+    rangeAnalysis.run();
 
     CodeGen codegen(program);
     cout << codegen.generate();

@@ -47,6 +47,11 @@ SHAPE_TESTS = [
         "int main(){int x=opaque(-2147483647);"
         "return x/32768+x%32768+x/1073741824+x%1073741824;}",
     ),
+    (
+        "nonnegative_pow2_loop",
+        "int main(){int i=0;int x=1;int s=0;"
+        "while(i<1000){x=(x*x+3)%32768;s=s+x;i=i+1;}return s;}",
+    ),
 ]
 
 
