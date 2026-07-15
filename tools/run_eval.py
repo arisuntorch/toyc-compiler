@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 import time
@@ -113,19 +112,18 @@ def local_checks(shape_timeout: float) -> None:
         proc = run([str(exe), "-opt"], input_text=source, timeout=max(5, int(shape_timeout) + 2), quiet=True)
         elapsed = time.perf_counter() - started
         out = proc.stdout
-        is_const_return = (
+        is_codegen = (
             proc.returncode == 0
             and ".globl main" in out
-            and re.search(r"\bli\s+a0,\s*-?\d+", out) is not None
             and "\n    ret\n" in out
-            and len(out.splitlines()) <= 8
+            and len(out.splitlines()) > 8
         )
-        if not is_const_return:
-            print(f"[FAIL] shape {name}: did not produce compact constant return", file=sys.stderr)
+        if not is_codegen:
+            print(f"[FAIL] shape {name}: expected real RISC-V code generation", file=sys.stderr)
             print(out[:1000], file=sys.stderr)
             raise SystemExit(1)
         if elapsed > shape_timeout:
-            print(f"[WARN] shape {name}: constant return but slow locally: {elapsed:.3f}s", flush=True)
+            print(f"[WARN] shape {name}: code generation slow locally: {elapsed:.3f}s", flush=True)
         else:
             print(f"[OK] shape {name}: {elapsed:.3f}s", flush=True)
 

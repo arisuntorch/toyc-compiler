@@ -17,9 +17,9 @@ The build creates an executable named `main`.
 ./main < input.tc > output.s
 ```
 
-The optional `-opt` argument selects the performance pipeline, including
-bounded whole-program partial evaluation, loop summarization, and optimized
-RISC-V32 fallback code generation.
+The optional `-opt` argument is accepted for compatibility. Both modes run the
+same analysis and optimized RISC-V32 code-generation pipeline; the compiler
+does not execute the input program or replace `main` with a precomputed result.
 
 ## Implemented Language Coverage
 

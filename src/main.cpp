@@ -1,13 +1,7 @@
 #include <bits/stdc++.h>
 using namespace std;
 
-#if defined(__x86_64__) && defined(__linux__)
-#include <sys/mman.h>
-#include <csetjmp>
-#define TOYC_JIT 1
-#else
 #define TOYC_JIT 0
-#endif
 
 enum class Tok {
     End,
@@ -9361,16 +9355,6 @@ private:
     }
 };
 
-static string genConstReturnAsm(int32_t value) {
-    ostringstream out;
-    out << ".text\n";
-    out << ".globl main\n";
-    out << "main:\n";
-    out << "    li a0, " << static_cast<long long>(value) << "\n";
-    out << "    ret\n";
-    return out.str();
-}
-
 static unique_ptr<Expr> makeNumberExpr(long long value) {
     auto e = make_unique<Expr>();
     e->kind = Expr::Kind::Number;
@@ -12800,77 +12784,24 @@ private:
 int main(int argc, char **argv) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-    bool optMode = false;
-    for (int i = 1; i < argc; ++i) {
-        if (string(argv[i]) == "-opt") optMode = true;
-    }
+    (void)argc;
+    (void)argv;
 
     string input((istreambuf_iterator<char>(cin)), istreambuf_iterator<char>());
     Lexer lexer(input);
     auto tokens = lexer.lex();
     Parser parser(std::move(tokens));
     Program program = parser.parseProgram();
-    auto parseFreshProgram = [&input]() {
-        Lexer freshLexer(input);
-        auto freshTokens = freshLexer.lex();
-        Parser freshParser(std::move(freshTokens));
-        return freshParser.parseProgram();
-    };
-    auto compileStart = chrono::steady_clock::now();
-    auto elapsedMs = [&]() {
-        return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - compileStart).count();
-    };
-    // The judge enforces a combined compile+run wall limit of roughly 27s
-    // per test, so the evaluation stages are budgeted to leave unfoldable
-    // tests some wall time for their actual run: 0.05s quick probe +
-    // a short ConstEvaluator pass + up to ~21s fast evaluator. The fast
-    // evaluator JITs the bytecode, so a program it can
-    // finish emits a constant and runs in ~15ms regardless of how long the
-    // compile-time evaluation took; only genuinely unfinishable programs fall
-    // through to real codegen.
-    if (getenv("TOYC_NOFOLD")) {
-        SafeOptimizer optimizer(program);
-        optimizer.run();
-        FastEvaluator deadStoreAnalysis(program, 100);
-        (void)deadStoreAnalysis;
-        CodeGen codegen(program);
-        cout << codegen.generate();
-        return 0;
-    }
-    if (optMode) {
-        ConstEvaluator quickConstEval(program, 1000000LL, 50);
-        if (auto value = quickConstEval.runMain()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-        long long remaining = 15000 - elapsedMs();
-        if (remaining > 1000) {
-            Program evalProgram = parseFreshProgram();
-            FastEvaluator fastEval(evalProgram, static_cast<int>(min<long long>(remaining, 12000)));
-            if (auto value = fastEval.runMain()) {
-                cout << genConstReturnAsm(*value);
-                return 0;
-            }
-        }
-        SafeOptimizer earlyOptimizer(program);
-        earlyOptimizer.run();
-        FastEvaluator deadStoreAnalysis(program, 100);
-        (void)deadStoreAnalysis;
-    } else {
-        SafeOptimizer optimizer(program);
-        optimizer.run();
-        ConstEvaluator constEval(program, 300000000LL, 2500);
-        if (auto value = constEval.runMain()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-        Program evalProgram = parseFreshProgram();
-        FastEvaluator fastEval(evalProgram, 12000);
-        if (auto value = fastEval.runMain()) {
-            cout << genConstReturnAsm(*value);
-            return 0;
-        }
-    }
+
+    SafeOptimizer optimizer(program);
+    optimizer.run();
+
+    // This constructor performs slot resolution and static dead-store/liveness
+    // analysis used by CodeGen. It does not execute main(); the evaluator and
+    // host-JIT entry points are deliberately disabled in this compilation path.
+    FastEvaluator deadStoreAnalysis(program, 100);
+    (void)deadStoreAnalysis;
+
     CodeGen codegen(program);
     cout << codegen.generate();
     return 0;
