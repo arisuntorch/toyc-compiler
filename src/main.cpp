@@ -11117,15 +11117,36 @@ private:
         return false;
     }
 
-    bool stmtContainsCall(const Stmt *s) const {
-        if (!s) return false;
-        if (hasCall(s->expr.get()) || (s->decl && hasCall(s->decl->init.get()))) return true;
-        for (auto &child : s->stmts) {
-            if (stmtContainsCall(child.get())) return true;
+    bool hasRuntimeCall(const Expr *e) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Call) {
+            bool callFreeArgs = true;
+            for (auto &arg : e->args) callFreeArgs = callFreeArgs && !hasCall(arg.get());
+            if (!callFreeArgs ||
+                (!inlineableFuncs.count(e->name) && !branchInlineableFuncs.count(e->name))) {
+                return true;
+            }
+            return false;
         }
-        return stmtContainsCall(s->thenStmt.get()) ||
-               stmtContainsCall(s->elseStmt.get()) ||
-               stmtContainsCall(s->body.get());
+        if (hasRuntimeCall(e->lhs.get()) || hasRuntimeCall(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (hasRuntimeCall(arg.get())) return true;
+        }
+        return false;
+    }
+
+    bool stmtContainsRuntimeCall(const Stmt *s) const {
+        if (!s) return false;
+        if (hasRuntimeCall(s->expr.get()) ||
+            (s->decl && hasRuntimeCall(s->decl->init.get()))) {
+            return true;
+        }
+        for (auto &child : s->stmts) {
+            if (stmtContainsRuntimeCall(child.get())) return true;
+        }
+        return stmtContainsRuntimeCall(s->thenStmt.get()) ||
+               stmtContainsRuntimeCall(s->elseStmt.get()) ||
+               stmtContainsRuntimeCall(s->body.get());
     }
 
     int maxBranchInlineArgs(const Expr *e) const {
@@ -11452,7 +11473,7 @@ private:
         static const vector<string> leafRegs = {
             "a1", "a2", "a3", "a4", "a5", "a6", "a7"
         };
-        bool callFree = !stmtContainsCall(f.body.get());
+        bool callFree = !stmtContainsRuntimeCall(f.body.get());
         frameFreeLeaf = false;
         vector<string> allVarRegs;
 
