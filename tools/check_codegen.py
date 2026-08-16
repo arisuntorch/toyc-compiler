@@ -25,6 +25,11 @@ CASES = {
         "while (i < 1000000) { j = 0; while (j < 1000) { "
         "s = s + i + j; j = j + 1; } i = i + 1; } return s; }"
     ),
+    "periodic_loop": (
+        "int main() { int i = 0; int s = 0; while (i < 10000000) { "
+        "if ((i % 3 == 0) || (i % 5 == 1)) { s = s + i; } "
+        "else { s = s + 1; } i = i + 1; } return s; }"
+    ),
     "helper_loop": (
         "int twice(int x) { return x + x; } int main() { int i = 0; int s = 0; "
         "while (i < 1000000) { s = s + twice(i); i = i + 1; } return s; }"
@@ -79,6 +84,13 @@ def main() -> int:
         )
         return 1
 
+    if ".Lwhile_body" in generated["periodic_loop"]:
+        print(
+            "[FAIL] periodic_loop: proven residue phases were not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
     dead_loop = compile_source(
         "int main(){int i=0;int junk=1;while(i<1000000000){"
         "if(i%2==0){junk=junk+i;}else{junk=junk*3;}i=i+1;}return 42;}"
@@ -96,6 +108,18 @@ def main() -> int:
         ),
         "wrapping_induction": (
             "int main(){int i=2147483640;while(i<2147483647){i=i+100;}return i;}"
+        ),
+        "nonperiodic_branch": (
+            "int main(){int i=0;int s=0;while(i<100){"
+            "if(i<50){s=s+i;}else{s=s+1;}i=i+1;}return s;}"
+        ),
+        "changing_periodic_state": (
+            "int main(){int i=0;int s=1;while(i<100){"
+            "if(s%3==0){s=s+i;}else{s=s+1;}i=i+1;}return s;}"
+        ),
+        "oversized_period": (
+            "int main(){int i=0;int s=0;while(i<2000){"
+            "if(i%257==0){s=s+i;}else{s=s+1;}i=i+1;}return s;}"
         ),
     }
     for name, source in fallback_cases.items():

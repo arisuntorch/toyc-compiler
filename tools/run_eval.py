@@ -54,6 +54,8 @@ SHAPE_TESTS = [
     ),
 ]
 
+CLOSED_LOOP_SHAPES = {"affine_loop", "nested_rect_loop", "periodic_branch"}
+
 
 def run(cmd: list[str], *, input_text: str | None = None, env: dict[str, str] | None = None,
         timeout: int | None = None, quiet: bool = False) -> subprocess.CompletedProcess[str]:
@@ -131,6 +133,10 @@ def local_checks(shape_timeout: float) -> None:
         )
         if not is_codegen:
             print(f"[FAIL] shape {name}: expected real RISC-V code generation", file=sys.stderr)
+            print(out[:1000], file=sys.stderr)
+            raise SystemExit(1)
+        if name in CLOSED_LOOP_SHAPES and ".Lwhile_body" in out:
+            print(f"[FAIL] shape {name}: proven loop was not lowered", file=sys.stderr)
             print(out[:1000], file=sys.stderr)
             raise SystemExit(1)
         if elapsed > shape_timeout:

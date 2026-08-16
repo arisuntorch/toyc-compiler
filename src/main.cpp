@@ -2277,14 +2277,16 @@ private:
     }
 };
 
-// Closed-form optimization for straight-line affine counted loops.
+// Closed-form optimization for affine and bounded residue-periodic counted loops.
 //
 // For a loop whose body is a sequence of affine assignments, one iteration is
 // a matrix transformation over 32-bit wrapping integers.  If local constant
 // data flow proves the initial induction value, invariant bound, monotonic
 // step, and exact finite trip count, exponentiating that matrix gives the same
-// final state without executing the loop in the compiler.  The rewritten AST
-// keeps an entry-condition branch and computes the final values at runtime.
+// final state without executing the loop in the compiler.  Branches driven only
+// by a proven finite induction-variable residue period are composed one abstract
+// period at a time.  The rewritten AST keeps an entry-condition branch and
+// computes the final values at runtime.
 class AffineLoopOptimizer {
 public:
     explicit AffineLoopOptimizer(Program &program) : prog(program) {}
@@ -2735,8 +2737,9 @@ private:
         return false;
     }
 
-    static optional<int32_t> exactTransformExpr(const Expr *e, const Model &model,
-                                                const Matrix &current) {
+    static optional<int32_t> exactTransformExpr(
+        const Expr *e, const Model &model, const Matrix &current,
+        const vector<optional<int32_t>> *base = nullptr) {
         if (!e) return nullopt;
         switch (e->kind) {
             case Expr::Kind::Number:
@@ -2745,13 +2748,22 @@ private:
                 auto found = model.index.find(exprKey(e));
                 if (found == model.index.end()) return nullopt;
                 const Row &row = current[static_cast<size_t>(found->second)];
-                if (!constRow(row)) return nullopt;
-                return static_cast<int32_t>(row.back());
+                if (constRow(row)) return static_cast<int32_t>(row.back());
+                if (!base || base->size() != row.size()) return nullopt;
+                uint32_t value = 0;
+                for (size_t i = 0; i < row.size(); ++i) {
+                    if (row[i] == 0) continue;
+                    if (!(*base)[i]) return nullopt;
+                    value += static_cast<uint32_t>(
+                        static_cast<uint64_t>(row[i]) *
+                        static_cast<uint32_t>(*(*base)[i]));
+                }
+                return static_cast<int32_t>(value);
             }
             case Expr::Kind::Call:
                 return nullopt;
             case Expr::Kind::Unary: {
-                auto value = exactTransformExpr(e->lhs.get(), model, current);
+                auto value = exactTransformExpr(e->lhs.get(), model, current, base);
                 if (!value) return nullopt;
                 if (e->op == "+") return *value;
                 if (e->op == "-") return sub32(0, *value);
@@ -2760,21 +2772,21 @@ private:
             }
             case Expr::Kind::Binary: {
                 if (e->op == "&&") {
-                    auto lhs = exactTransformExpr(e->lhs.get(), model, current);
+                    auto lhs = exactTransformExpr(e->lhs.get(), model, current, base);
                     if (!lhs) return nullopt;
                     if (!truthy(*lhs)) return 0;
-                    auto rhs = exactTransformExpr(e->rhs.get(), model, current);
+                    auto rhs = exactTransformExpr(e->rhs.get(), model, current, base);
                     return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
                 }
                 if (e->op == "||") {
-                    auto lhs = exactTransformExpr(e->lhs.get(), model, current);
+                    auto lhs = exactTransformExpr(e->lhs.get(), model, current, base);
                     if (!lhs) return nullopt;
                     if (truthy(*lhs)) return 1;
-                    auto rhs = exactTransformExpr(e->rhs.get(), model, current);
+                    auto rhs = exactTransformExpr(e->rhs.get(), model, current, base);
                     return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
                 }
-                auto lhs = exactTransformExpr(e->lhs.get(), model, current);
-                auto rhs = exactTransformExpr(e->rhs.get(), model, current);
+                auto lhs = exactTransformExpr(e->lhs.get(), model, current, base);
+                auto rhs = exactTransformExpr(e->rhs.get(), model, current, base);
                 if (!lhs || !rhs) return nullopt;
                 if (e->op == "+") return add32(*lhs, *rhs);
                 if (e->op == "-") return sub32(*lhs, *rhs);
@@ -2793,12 +2805,14 @@ private:
         return nullopt;
     }
 
-    static bool applyBodyTransform(const Stmt *s, const Model &model, Matrix &transform) {
+    static bool applyBodyTransform(
+        const Stmt *s, const Model &model, Matrix &transform,
+        const vector<optional<int32_t>> *base = nullptr) {
         if (!s || s->fastDeadStore) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
-                    if (!applyBodyTransform(child.get(), model, transform)) return false;
+                    if (!applyBodyTransform(child.get(), model, transform, base)) return false;
                 }
                 return true;
             case Stmt::Kind::Empty:
@@ -2807,23 +2821,28 @@ private:
             case Stmt::Kind::Assign: {
                 int key = assignKey(s);
                 Row row;
-                if (key < 0 || !affineExpr(s->expr.get(), model, transform, row)) return false;
+                if (key < 0 ||
+                    !affineExpr(s->expr.get(), model, transform, row, base)) {
+                    return false;
+                }
                 transform[static_cast<size_t>(model.index.at(key))] = std::move(row);
                 return true;
             }
             case Stmt::Kind::DeclStmt: {
                 if (!s->decl || s->decl->fastSlot < 0) return false;
                 Row row;
-                if (!affineExpr(s->decl->init.get(), model, transform, row)) return false;
+                if (!affineExpr(s->decl->init.get(), model, transform, row, base)) {
+                    return false;
+                }
                 transform[static_cast<size_t>(model.index.at(s->decl->fastSlot))] = std::move(row);
                 return true;
             }
             case Stmt::Kind::If: {
-                auto condition = exactTransformExpr(s->expr.get(), model, transform);
+                auto condition = exactTransformExpr(s->expr.get(), model, transform, base);
                 if (!condition) return false;
                 return applyBodyTransform(truthy(*condition) ? s->thenStmt.get()
                                                             : s->elseStmt.get(),
-                                          model, transform);
+                                          model, transform, base);
             }
             case Stmt::Kind::While:
             case Stmt::Kind::Break:
@@ -2842,7 +2861,8 @@ private:
     }
 
     static bool affineExpr(const Expr *e, const Model &model,
-                           const Matrix &current, Row &out) {
+                           const Matrix &current, Row &out,
+                           const vector<optional<int32_t>> *base = nullptr) {
         const int dimension = static_cast<int>(current.size());
         out.assign(static_cast<size_t>(dimension), 0);
         if (!e) return false;
@@ -2860,7 +2880,7 @@ private:
                 return false;
             case Expr::Kind::Unary: {
                 Row value;
-                if (!affineExpr(e->lhs.get(), model, current, value)) return false;
+                if (!affineExpr(e->lhs.get(), model, current, value, base)) return false;
                 if (e->op == "+") {
                     out = std::move(value);
                     return true;
@@ -2869,15 +2889,21 @@ private:
                     for (int i = 0; i < dimension; ++i) out[static_cast<size_t>(i)] = 0u - value[static_cast<size_t>(i)];
                     return true;
                 }
+                if (base) {
+                    if (auto exact = exactTransformExpr(e, model, current, base)) {
+                        out.assign(static_cast<size_t>(dimension), 0);
+                        out.back() = static_cast<uint32_t>(*exact);
+                        return true;
+                    }
+                }
                 return false;
             }
             case Expr::Kind::Binary: {
                 Row lhs, rhs;
-                if (!affineExpr(e->lhs.get(), model, current, lhs) ||
-                    !affineExpr(e->rhs.get(), model, current, rhs)) {
-                    return false;
-                }
+                bool lhsAffine = affineExpr(e->lhs.get(), model, current, lhs, base);
+                bool rhsAffine = affineExpr(e->rhs.get(), model, current, rhs, base);
                 if (e->op == "+" || e->op == "-") {
+                    if (!lhsAffine || !rhsAffine) return false;
                     for (int i = 0; i < dimension; ++i) {
                         out[static_cast<size_t>(i)] = e->op == "+"
                             ? lhs[static_cast<size_t>(i)] + rhs[static_cast<size_t>(i)]
@@ -2886,6 +2912,7 @@ private:
                     return true;
                 }
                 if (e->op == "*") {
+                    if (!lhsAffine || !rhsAffine) return false;
                     if (constRow(lhs)) {
                         uint32_t factor = lhs.back();
                         for (int i = 0; i < dimension; ++i) {
@@ -2900,6 +2927,13 @@ private:
                             out[static_cast<size_t>(i)] = static_cast<uint32_t>(
                                 static_cast<uint64_t>(lhs[static_cast<size_t>(i)]) * factor);
                         }
+                        return true;
+                    }
+                }
+                if (base) {
+                    if (auto exact = exactTransformExpr(e, model, current, base)) {
+                        out.assign(static_cast<size_t>(dimension), 0);
+                        out.back() = static_cast<uint32_t>(*exact);
                         return true;
                     }
                 }
@@ -2936,6 +2970,271 @@ private:
             if (exponent != 0) base = multiply(base, base);
         }
         return result;
+    }
+
+    static Matrix identityMatrix(int dimension) {
+        Matrix result(static_cast<size_t>(dimension),
+                      Row(static_cast<size_t>(dimension), 0));
+        for (int i = 0; i < dimension; ++i) {
+            result[static_cast<size_t>(i)][static_cast<size_t>(i)] = 1;
+        }
+        return result;
+    }
+
+    bool hasExactInvariantValue(int key, const ExactEnv &env,
+                                const Model &model) const {
+        if (key < 0 || model.modified.count(key)) return false;
+        if (isGlobalKey(key)) return exactGlobals.count(globalIndex(key)) != 0;
+        return key < static_cast<int>(env.size()) && env[static_cast<size_t>(key)].has_value();
+    }
+
+    bool phaseExactExpr(const Expr *e, int inductionKey, const ExactEnv &env,
+                        const Model &model, const unordered_set<int> &phaseExactKeys,
+                        vector<int32_t> &moduli, bool &sawPeriodic) const {
+        if (!e) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprKey(e);
+                return phaseExactKeys.count(key) ||
+                       (key != inductionKey && hasExactInvariantValue(key, env, model));
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary:
+                return phaseExactExpr(e->lhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic);
+            case Expr::Kind::Binary:
+                if (e->op == "%" && exprKey(e->lhs.get()) == inductionKey) {
+                    unordered_set<int> divisorKeys;
+                    collectExprKeys(e->rhs.get(), divisorKeys);
+                    auto divisor = evalExact(e->rhs.get(), env);
+                    if (!divisor || *divisor <= 0 || divisorKeys.count(inductionKey)) {
+                        return false;
+                    }
+                    moduli.push_back(*divisor);
+                    sawPeriodic = true;
+                    return true;
+                }
+                return phaseExactExpr(e->lhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic) &&
+                       phaseExactExpr(e->rhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic);
+        }
+        return false;
+    }
+
+    bool periodicAffineExpr(const Expr *e, int inductionKey, const ExactEnv &env,
+                            const Model &model,
+                            const unordered_set<int> &phaseExactKeys,
+                            vector<int32_t> &moduli, bool &sawPeriodic) const {
+        if (!e) return false;
+        if (phaseExactExpr(e, inductionKey, env, model, phaseExactKeys,
+                           moduli, sawPeriodic)) {
+            return true;
+        }
+        if (e->kind == Expr::Kind::Number || e->kind == Expr::Kind::Var) return true;
+        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Unary) {
+            return (e->op == "+" || e->op == "-") &&
+                   periodicAffineExpr(e->lhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic);
+        }
+        if (e->op == "+" || e->op == "-") {
+            return periodicAffineExpr(e->lhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic) &&
+                   periodicAffineExpr(e->rhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic);
+        }
+        if (e->op == "*") {
+            bool lhsExact = phaseExactExpr(e->lhs.get(), inductionKey, env, model,
+                                           phaseExactKeys, moduli, sawPeriodic);
+            if (lhsExact && periodicAffineExpr(e->rhs.get(), inductionKey, env, model,
+                                               phaseExactKeys, moduli, sawPeriodic)) {
+                return true;
+            }
+            bool rhsExact = phaseExactExpr(e->rhs.get(), inductionKey, env, model,
+                                           phaseExactKeys, moduli, sawPeriodic);
+            return rhsExact &&
+                   periodicAffineExpr(e->lhs.get(), inductionKey, env, model,
+                                      phaseExactKeys, moduli, sawPeriodic);
+        }
+        return false;
+    }
+
+    bool collectPeriodicStructure(const Stmt *s, int inductionKey,
+                                  const ExactEnv &env, const Model &model,
+                                  unordered_set<int> &phaseExactKeys,
+                                  vector<int32_t> &moduli,
+                                  bool &sawPeriodic) const {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectPeriodicStructure(child.get(), inductionKey, env, model,
+                                                  phaseExactKeys, moduli, sawPeriodic)) {
+                        return false;
+                    }
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return true;
+            case Stmt::Kind::Assign: {
+                int key = assignKey(s);
+                if (key < 0 ||
+                    !periodicAffineExpr(s->expr.get(), inductionKey, env, model,
+                                        phaseExactKeys, moduli, sawPeriodic)) {
+                    return false;
+                }
+                if (phaseExactExpr(s->expr.get(), inductionKey, env, model,
+                                   phaseExactKeys, moduli, sawPeriodic)) {
+                    phaseExactKeys.insert(key);
+                } else {
+                    phaseExactKeys.erase(key);
+                }
+                return true;
+            }
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || s->decl->fastSlot < 0 ||
+                    !periodicAffineExpr(s->decl->init.get(), inductionKey, env, model,
+                                        phaseExactKeys, moduli, sawPeriodic)) {
+                    return false;
+                }
+                int key = s->decl->fastSlot;
+                if (phaseExactExpr(s->decl->init.get(), inductionKey, env, model,
+                                   phaseExactKeys, moduli, sawPeriodic)) {
+                    phaseExactKeys.insert(key);
+                } else {
+                    phaseExactKeys.erase(key);
+                }
+                return true;
+            }
+            case Stmt::Kind::If: {
+                if (!phaseExactExpr(s->expr.get(), inductionKey, env, model,
+                                    phaseExactKeys, moduli, sawPeriodic)) {
+                    return false;
+                }
+                auto thenExact = phaseExactKeys;
+                auto elseExact = phaseExactKeys;
+                if (!collectPeriodicStructure(s->thenStmt.get(), inductionKey, env, model,
+                                              thenExact, moduli, sawPeriodic) ||
+                    !collectPeriodicStructure(s->elseStmt.get(), inductionKey, env, model,
+                                              elseExact, moduli, sawPeriodic)) {
+                    return false;
+                }
+                for (auto it = thenExact.begin(); it != thenExact.end();) {
+                    if (!elseExact.count(*it)) it = thenExact.erase(it);
+                    else ++it;
+                }
+                phaseExactKeys = std::move(thenExact);
+                return true;
+            }
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    vector<optional<int32_t>> periodicBase(const Model &model,
+                                           const ExactEnv &env,
+                                           int inductionKey,
+                                           int32_t inductionValue) const {
+        vector<optional<int32_t>> base(model.keys.size() + 1);
+        for (size_t i = 0; i < model.keys.size(); ++i) {
+            int key = model.keys[i];
+            if (key == inductionKey) {
+                base[i] = inductionValue;
+            } else if (model.modified.count(key)) {
+                base[i] = nullopt;
+            } else if (isGlobalKey(key)) {
+                auto found = exactGlobals.find(globalIndex(key));
+                if (found != exactGlobals.end()) base[i] = found->second;
+            } else if (key >= 0 && key < static_cast<int>(env.size())) {
+                base[i] = env[static_cast<size_t>(key)];
+            }
+        }
+        base.back() = 1;
+        return base;
+    }
+
+    bool buildPeriodicClosed(const Stmt *loop, const ExactEnv &env,
+                             const Model &model, CountedLoop &counted,
+                             Matrix &closed) const {
+        static constexpr uint64_t kMaxPeriodicPhases = 256;
+
+        optional<int32_t> step;
+        if (!findUnconditionalStep(loop->body.get(), counted.inductionKey, env, step) ||
+            !step || *step <= 0 || counted.start < 0) {
+            return false;
+        }
+        counted.step = *step;
+        auto trip = tripCount(counted);
+        if (!trip) return false;
+        counted.trips = trip->first;
+        counted.finalValue = trip->second;
+
+        vector<int32_t> moduli;
+        bool sawPeriodic = false;
+        unordered_set<int> phaseExactKeys;
+        if (!collectPeriodicStructure(loop->body.get(), counted.inductionKey, env,
+                                      model, phaseExactKeys, moduli, sawPeriodic) ||
+            !sawPeriodic) {
+            return false;
+        }
+
+        uint64_t period = 1;
+        uint64_t unsignedStep = static_cast<uint64_t>(counted.step);
+        for (int32_t divisor : moduli) {
+            uint64_t modulus = static_cast<uint64_t>(divisor);
+            uint64_t phaseCount = modulus / std::gcd(modulus, unsignedStep % modulus);
+            uint64_t common = std::gcd(period, phaseCount);
+            uint64_t factor = phaseCount / common;
+            if (period > kMaxPeriodicPhases / factor) return false;
+            period *= factor;
+        }
+        if (period == 0 || period > kMaxPeriodicPhases ||
+            counted.trips < max<uint64_t>(8, period * 2)) {
+            return false;
+        }
+
+        const int states = static_cast<int>(model.keys.size());
+        const int dimension = states + 1;
+        const int inductionIndex = model.index.at(counted.inductionKey);
+        vector<Matrix> phases;
+        phases.reserve(static_cast<size_t>(period));
+        Matrix periodTransform = identityMatrix(dimension);
+
+        for (uint64_t phase = 0; phase < period; ++phase) {
+            int64_t phaseValue = static_cast<int64_t>(counted.start) +
+                                 static_cast<int64_t>(phase) * counted.step;
+            if (phaseValue < 0 || phaseValue > numeric_limits<int32_t>::max()) return false;
+            auto base = periodicBase(model, env, counted.inductionKey,
+                                     static_cast<int32_t>(phaseValue));
+            Matrix transform = identityMatrix(dimension);
+            if (!applyBodyTransform(loop->body.get(), model, transform, &base)) return false;
+
+            const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
+            for (int i = 0; i < states; ++i) {
+                uint32_t expected = i == inductionIndex ? 1u : 0u;
+                if (inductionRow[static_cast<size_t>(i)] != expected) return false;
+            }
+            if (static_cast<int32_t>(inductionRow.back()) != counted.step) return false;
+            periodTransform = multiply(transform, periodTransform);
+            phases.push_back(std::move(transform));
+        }
+
+        uint64_t wholePeriods = counted.trips / period;
+        uint64_t remainder = counted.trips % period;
+        closed = power(std::move(periodTransform), wholePeriods);
+        for (uint64_t phase = 0; phase < remainder; ++phase) {
+            closed = multiply(phases[static_cast<size_t>(phase)], closed);
+        }
+        return true;
     }
 
     static unique_ptr<Expr> varExpr(const string &name) {
@@ -2999,66 +3298,14 @@ private:
         return sum;
     }
 
-    bool trySummarize(unique_ptr<Stmt> &stmt, const ExactEnv &env,
-                      CountedLoop &counted, unordered_set<int> &modifiedLocals) {
-        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
-            exprHasCallLocal(stmt->expr.get())) {
-            return false;
-        }
-        if (!extractCondition(stmt->expr.get(), env, counted)) return false;
-
-        Model model;
-        addModelKey(model, counted.inductionKey, stmt->expr->lhs &&
-                    exprKey(stmt->expr->lhs.get()) == counted.inductionKey
-                        ? stmt->expr->lhs->name : stmt->expr->rhs->name);
-        if (!collectBody(stmt->body.get(), model) ||
-            model.keys.size() > 32 || !model.modified.count(counted.inductionKey)) {
-            return false;
-        }
-        for (int key : model.modified) {
-            if (isGlobalKey(key) && constGlobals.count(globalIndex(key))) return false;
-        }
-
-        unordered_set<int> boundKeys;
-        Model boundModel;
-        if (!collectExprVars(counted.boundExpr, boundModel)) return false;
-        for (int key : boundModel.keys) boundKeys.insert(key);
-        for (int key : model.modified) {
-            if (boundKeys.count(key)) return false;
-        }
-
-        const int states = static_cast<int>(model.keys.size());
-        const int dimension = states + 1;
-        Matrix transform(static_cast<size_t>(dimension), Row(static_cast<size_t>(dimension), 0));
-        for (int i = 0; i < dimension; ++i) {
-            transform[static_cast<size_t>(i)][static_cast<size_t>(i)] = 1;
-        }
-        if (!applyBodyTransform(stmt->body.get(), model, transform)) return false;
-
-        int inductionIndex = model.index.at(counted.inductionKey);
-        const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
-        for (int i = 0; i < states; ++i) {
-            uint32_t expected = i == inductionIndex ? 1u : 0u;
-            if (inductionRow[static_cast<size_t>(i)] != expected) return false;
-        }
-        counted.step = static_cast<int32_t>(inductionRow.back());
-        auto trip = tripCount(counted);
-        if (!trip) return false;
-        counted.trips = trip->first;
-        counted.finalValue = trip->second;
-        if (counted.trips == 0) {
-            auto empty = make_unique<Stmt>();
-            empty->kind = Stmt::Kind::Empty;
-            stmt = std::move(empty);
-            changed = true;
-            return true;
-        }
-        if (counted.trips < 8) return false;
-
-        Matrix closed = power(std::move(transform), counted.trips);
+    bool rewriteClosedLoop(unique_ptr<Stmt> &stmt, const Model &model,
+                           const Matrix &closed,
+                           unordered_set<int> &modifiedLocals) {
         vector<int> persistent;
         for (int key : model.keys) {
-            if (model.modified.count(key) && !model.transient.count(key)) persistent.push_back(key);
+            if (model.modified.count(key) && !model.transient.count(key)) {
+                persistent.push_back(key);
+            }
         }
         if (persistent.empty()) return false;
         for (int key : persistent) {
@@ -3092,6 +3339,66 @@ private:
         stmt = std::move(wrapper);
         changed = true;
         return true;
+    }
+
+    bool trySummarize(unique_ptr<Stmt> &stmt, const ExactEnv &env,
+                      CountedLoop &counted, unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            exprHasCallLocal(stmt->expr.get())) {
+            return false;
+        }
+        if (!extractCondition(stmt->expr.get(), env, counted)) return false;
+
+        Model model;
+        addModelKey(model, counted.inductionKey, stmt->expr->lhs &&
+                    exprKey(stmt->expr->lhs.get()) == counted.inductionKey
+                        ? stmt->expr->lhs->name : stmt->expr->rhs->name);
+        if (!collectBody(stmt->body.get(), model) ||
+            model.keys.size() > 32 || !model.modified.count(counted.inductionKey)) {
+            return false;
+        }
+        for (int key : model.modified) {
+            if (isGlobalKey(key) && constGlobals.count(globalIndex(key))) return false;
+        }
+
+        unordered_set<int> boundKeys;
+        Model boundModel;
+        if (!collectExprVars(counted.boundExpr, boundModel)) return false;
+        for (int key : boundModel.keys) boundKeys.insert(key);
+        for (int key : model.modified) {
+            if (boundKeys.count(key)) return false;
+        }
+
+        const int states = static_cast<int>(model.keys.size());
+        const int dimension = states + 1;
+        Matrix transform = identityMatrix(dimension);
+        Matrix closed;
+        if (applyBodyTransform(stmt->body.get(), model, transform)) {
+            int inductionIndex = model.index.at(counted.inductionKey);
+            const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
+            for (int i = 0; i < states; ++i) {
+                uint32_t expected = i == inductionIndex ? 1u : 0u;
+                if (inductionRow[static_cast<size_t>(i)] != expected) return false;
+            }
+            counted.step = static_cast<int32_t>(inductionRow.back());
+            auto trip = tripCount(counted);
+            if (!trip) return false;
+            counted.trips = trip->first;
+            counted.finalValue = trip->second;
+            if (counted.trips == 0) {
+                auto empty = make_unique<Stmt>();
+                empty->kind = Stmt::Kind::Empty;
+                stmt = std::move(empty);
+                changed = true;
+                return true;
+            }
+            if (counted.trips < 8) return false;
+            closed = power(std::move(transform), counted.trips);
+        } else if (!buildPeriodicClosed(stmt.get(), env, model, counted, closed)) {
+            return false;
+        }
+
+        return rewriteClosedLoop(stmt, model, closed, modifiedLocals);
     }
 
     static void collectAssignedLocals(const Stmt *s, unordered_set<int> &slots) {

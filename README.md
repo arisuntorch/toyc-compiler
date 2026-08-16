@@ -51,9 +51,10 @@ loops during compilation.
   loop identifiers, and conservative integer-range proofs.
 - Fixed-point closed-form lowering of affine counted loops after proving the
   exact finite trip count and symbolic state transition. Reanalysis after each
-  rewrite lets rectangular loop nests collapse from the inside out. The pass
-  exponentiates recurrence matrices; it does not execute ToyC statements or
-  function calls.
+  rewrite lets rectangular loop nests collapse from the inside out. Proven
+  positive-induction residue branches are combined over a bounded phase period.
+  The pass exponentiates recurrence matrices; it does not execute ToyC
+  statements or function calls.
 - Elimination of finite, call-free loops whose local writes are all dead after
   the loop and which have no global or control-flow side effects.
 - Register-based expression evaluation for call-free expressions, avoiding most
