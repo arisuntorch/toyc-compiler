@@ -8,3 +8,11 @@ tmp/educg_oj_debug*
 .env.local
 __pycache__/
 tools/__pycache__/
+
+# Local experiments and handoff bundles are not part of the submitted compiler.
+.claude/
+.mindfs/
+handoff_cloud_model/
+teaching_toyc_compiler/
+tmp/
+*.zip

@@ -11,6 +11,12 @@ make
 
 The build creates an executable named `main`.
 
+Run the smoke tests and the static-code-generation compliance check with:
+
+```sh
+make check
+```
+
 ## Use
 
 ```sh
@@ -20,6 +26,9 @@ The build creates an executable named `main`.
 The optional `-opt` argument is accepted for compatibility. Both modes run the
 same analysis and optimized RISC-V32 code-generation pipeline; the compiler
 does not execute the input program or replace `main` with a precomputed result.
+Constant folding is limited to expressions and values proven by static AST and
+data-flow analysis. The compiler never interprets function calls or iterates ToyC
+loops during compilation.
 
 ## Implemented Language Coverage
 
@@ -38,6 +47,8 @@ does not execute the input program or replace `main` with a precomputed result.
   copy propagation, common-subexpression elimination, loop-invariant code
   motion, conservative dead-code elimination, and constant control-flow
   simplification.
+- A separate static-analysis pass for lexical binding, local slots, liveness,
+  loop identifiers, and conservative integer-range proofs.
 - Register-based expression evaluation for call-free expressions, avoiding most
   temporary stack traffic in loop bodies.
 - Loop-depth-weighted allocation of hot variables and constants to `s1`-`s11`,

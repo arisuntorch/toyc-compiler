@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small authenticated HTTP API for running the EduCG evaluator.
+"""Small authenticated HTTP API for running EduCG evaluations.
 
 The API keeps EDUCG_SESSION on the server. Callers only need EVAL_API_TOKEN.
 It intentionally runs one OJ job at a time to avoid accidental submission spam.
