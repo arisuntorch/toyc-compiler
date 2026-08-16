@@ -2312,9 +2312,15 @@ private:
     using ExactEnv = vector<optional<int32_t>>;
     using Row = vector<uint32_t>;
     using Matrix = vector<Row>;
+    static constexpr int kPolynomialTerms = 6;
+
+    struct Polynomial {
+        array<uint32_t, kPolynomialTerms> coefficients{};
+    };
 
     struct CountedLoop {
         int inductionKey = -1;
+        string inductionName;
         string relation;
         const Expr *boundExpr = nullptr;
         int32_t start = 0;
@@ -2667,6 +2673,7 @@ private:
             return false;
         }
         loop.inductionKey = exprKey(induction);
+        loop.inductionName = induction->name;
         auto start = evalExact(induction, env);
         auto bound = evalExact(loop.boundExpr, env);
         if (!start || !bound) return false;
@@ -3992,6 +3999,476 @@ private:
         return true;
     }
 
+    // Model each additive loop delta as P(k) over the iteration index.  A
+    // fixed-size forward-difference table sums P(0)..P(n-1) without walking
+    // the ToyC loop; all coefficient arithmetic is in the RV32 wraparound ring.
+    static Polynomial polynomialConstant(uint32_t value) {
+        Polynomial out;
+        out.coefficients[0] = value;
+        return out;
+    }
+
+    static Polynomial polynomialAdd(Polynomial lhs, const Polynomial &rhs) {
+        for (int degree = 0; degree < kPolynomialTerms; ++degree) {
+            lhs.coefficients[static_cast<size_t>(degree)] +=
+                rhs.coefficients[static_cast<size_t>(degree)];
+        }
+        return lhs;
+    }
+
+    static Polynomial polynomialNegate(Polynomial value) {
+        for (uint32_t &coefficient : value.coefficients) {
+            coefficient = 0u - coefficient;
+        }
+        return value;
+    }
+
+    static bool polynomialMultiply(const Polynomial &lhs,
+                                   const Polynomial &rhs,
+                                   Polynomial &out) {
+        out = Polynomial{};
+        for (int lhsDegree = 0; lhsDegree < kPolynomialTerms; ++lhsDegree) {
+            uint32_t lhsValue = lhs.coefficients[static_cast<size_t>(lhsDegree)];
+            if (lhsValue == 0) continue;
+            for (int rhsDegree = 0; rhsDegree < kPolynomialTerms; ++rhsDegree) {
+                uint32_t rhsValue = rhs.coefficients[static_cast<size_t>(rhsDegree)];
+                if (rhsValue == 0) continue;
+                if (lhsDegree + rhsDegree >= kPolynomialTerms) return false;
+                size_t degree = static_cast<size_t>(lhsDegree + rhsDegree);
+                out.coefficients[degree] += static_cast<uint32_t>(
+                    static_cast<uint64_t>(lhsValue) * rhsValue);
+            }
+        }
+        return true;
+    }
+
+    static uint32_t multiplyMod32(uint64_t lhs, uint64_t rhs) {
+        return static_cast<uint32_t>(static_cast<uint32_t>(lhs) *
+                                     static_cast<uint64_t>(static_cast<uint32_t>(rhs)));
+    }
+
+    static uint32_t binomialMod32(uint64_t n, int choose) {
+        if (choose < 0 || n < static_cast<uint64_t>(choose)) return 0;
+        if (choose == 0) return 1;
+        vector<uint64_t> factors;
+        factors.reserve(static_cast<size_t>(choose));
+        for (int i = 0; i < choose; ++i) {
+            factors.push_back(n - static_cast<uint64_t>(i));
+        }
+        for (int divisor = 2; divisor <= choose; ++divisor) {
+            int remaining = divisor;
+            for (int prime = 2; prime <= remaining; ++prime) {
+                while (remaining % prime == 0) {
+                    auto factor = find_if(
+                        factors.begin(), factors.end(),
+                        [prime](uint64_t value) {
+                            return value % static_cast<uint64_t>(prime) == 0;
+                        });
+                    if (factor == factors.end()) return 0;
+                    *factor /= static_cast<uint64_t>(prime);
+                    remaining /= prime;
+                }
+            }
+        }
+        uint32_t out = 1;
+        for (uint64_t factor : factors) out = multiplyMod32(out, factor);
+        return out;
+    }
+
+    static uint32_t sumPolynomial(const Polynomial &polynomial,
+                                  uint64_t count) {
+        array<uint32_t, kPolynomialTerms> differences{};
+        for (int sample = 0; sample < kPolynomialTerms; ++sample) {
+            uint32_t value = 0;
+            for (int degree = kPolynomialTerms - 1; degree >= 0; --degree) {
+                value = multiplyMod32(value, static_cast<uint32_t>(sample));
+                value += polynomial.coefficients[static_cast<size_t>(degree)];
+            }
+            differences[static_cast<size_t>(sample)] = value;
+        }
+
+        uint32_t out = 0;
+        for (int order = 0; order < kPolynomialTerms; ++order) {
+            out += multiplyMod32(
+                differences[0], binomialMod32(count, order + 1));
+            for (int i = 0; i + order + 1 < kPolynomialTerms; ++i) {
+                differences[static_cast<size_t>(i)] =
+                    differences[static_cast<size_t>(i + 1)] -
+                    differences[static_cast<size_t>(i)];
+            }
+        }
+        return out;
+    }
+
+    optional<int32_t> polynomialInvariantValue(
+        const Expr *expr, const ExactEnv &env,
+        const unordered_set<int> &changing) const {
+        unordered_set<int> keys;
+        collectExprKeys(expr, keys);
+        for (int key : keys) {
+            if (changing.count(key)) return nullopt;
+        }
+        return evalExact(expr, env);
+    }
+
+    bool polynomialExpr(const Expr *expr, int inductionKey,
+                        int32_t inductionBase, int32_t step,
+                        const unordered_set<int> &changing,
+                        const unordered_map<int, Polynomial> &aliases,
+                        const ExactEnv &env, Polynomial &out) const {
+        if (!expr) return false;
+        if (auto invariant = polynomialInvariantValue(expr, env, changing)) {
+            out = polynomialConstant(static_cast<uint32_t>(*invariant));
+            return true;
+        }
+        switch (expr->kind) {
+            case Expr::Kind::Number:
+                out = polynomialConstant(static_cast<uint32_t>(wrap32(expr->value)));
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprKey(expr);
+                auto alias = aliases.find(key);
+                if (alias != aliases.end()) {
+                    out = alias->second;
+                    return true;
+                }
+                if (key != inductionKey) return false;
+                out = Polynomial{};
+                out.coefficients[0] = static_cast<uint32_t>(inductionBase);
+                out.coefficients[1] = static_cast<uint32_t>(step);
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                if (!polynomialExpr(expr->lhs.get(), inductionKey,
+                                    inductionBase, step, changing, aliases,
+                                    env, out)) {
+                    return false;
+                }
+                if (expr->op == "+") return true;
+                if (expr->op == "-") {
+                    out = polynomialNegate(out);
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                if (expr->op != "+" && expr->op != "-" && expr->op != "*") {
+                    return false;
+                }
+                Polynomial lhs;
+                Polynomial rhs;
+                if (!polynomialExpr(expr->lhs.get(), inductionKey,
+                                    inductionBase, step, changing, aliases,
+                                    env, lhs) ||
+                    !polynomialExpr(expr->rhs.get(), inductionKey,
+                                    inductionBase, step, changing, aliases,
+                                    env, rhs)) {
+                    return false;
+                }
+                if (expr->op == "+") {
+                    out = polynomialAdd(lhs, rhs);
+                    return true;
+                }
+                if (expr->op == "-") {
+                    out = polynomialAdd(lhs, polynomialNegate(rhs));
+                    return true;
+                }
+                return polynomialMultiply(lhs, rhs, out);
+            }
+        }
+        return false;
+    }
+
+    bool polynomialInductionDelta(
+        const Expr *expr, int inductionKey, const ExactEnv &env,
+        const unordered_set<int> &changing, int32_t &delta) const {
+        if (!expr) return false;
+        if (expr->kind == Expr::Kind::Var && exprKey(expr) == inductionKey) {
+            delta = 0;
+            return true;
+        }
+        if (expr->kind == Expr::Kind::Unary && expr->op == "+") {
+            return polynomialInductionDelta(expr->lhs.get(), inductionKey,
+                                            env, changing, delta);
+        }
+        if (expr->kind != Expr::Kind::Binary) return false;
+
+        int32_t nested = 0;
+        if ((expr->op == "+" || expr->op == "-") &&
+            polynomialInductionDelta(expr->lhs.get(), inductionKey, env,
+                                     changing, nested)) {
+            auto constant = polynomialInvariantValue(expr->rhs.get(), env, changing);
+            if (!constant) return false;
+            delta = expr->op == "+" ? add32(nested, *constant)
+                                      : sub32(nested, *constant);
+            return true;
+        }
+        if (expr->op == "+" &&
+            polynomialInductionDelta(expr->rhs.get(), inductionKey, env,
+                                     changing, nested)) {
+            auto constant = polynomialInvariantValue(expr->lhs.get(), env, changing);
+            if (!constant) return false;
+            delta = add32(*constant, nested);
+            return true;
+        }
+        return false;
+    }
+
+    static bool expressionContainsKey(const Expr *expr, int key) {
+        if (!expr) return false;
+        if (expr->kind == Expr::Kind::Var) return exprKey(expr) == key;
+        if (expressionContainsKey(expr->lhs.get(), key) ||
+            expressionContainsKey(expr->rhs.get(), key)) {
+            return true;
+        }
+        for (auto &arg : expr->args) {
+            if (expressionContainsKey(arg.get(), key)) return true;
+        }
+        return false;
+    }
+
+    static bool collectAccumulatorTerms(
+        const Expr *expr, int key, int sign, int &coefficient,
+        vector<pair<int, const Expr *>> &terms) {
+        if (!expr) return false;
+        if (expr->kind == Expr::Kind::Var && exprKey(expr) == key) {
+            coefficient += sign;
+            return coefficient >= -1 && coefficient <= 1;
+        }
+        if (expr->kind == Expr::Kind::Binary && expr->op == "+") {
+            return collectAccumulatorTerms(expr->lhs.get(), key, sign,
+                                           coefficient, terms) &&
+                   collectAccumulatorTerms(expr->rhs.get(), key, sign,
+                                           coefficient, terms);
+        }
+        if (expr->kind == Expr::Kind::Binary && expr->op == "-") {
+            return collectAccumulatorTerms(expr->lhs.get(), key, sign,
+                                           coefficient, terms) &&
+                   collectAccumulatorTerms(expr->rhs.get(), key, -sign,
+                                           coefficient, terms);
+        }
+        if (expressionContainsKey(expr, key)) return false;
+        terms.push_back({sign, expr});
+        return true;
+    }
+
+    static bool flattenPolynomialBody(const Stmt *stmt,
+                                      vector<const Stmt *> &flat) {
+        if (!stmt) return true;
+        if (stmt->kind == Stmt::Kind::Block) {
+            for (auto &child : stmt->stmts) {
+                if (!flattenPolynomialBody(child.get(), flat)) return false;
+            }
+            return true;
+        }
+        switch (stmt->kind) {
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                if (exprHasCallLocal(stmt->expr.get())) return false;
+                flat.push_back(stmt);
+                return true;
+            case Stmt::Kind::Assign:
+                if (stmt->fastDeadStore) return true;
+                if (assignKey(stmt) < 0 || !stmt->expr ||
+                    exprHasCallLocal(stmt->expr.get())) {
+                    return false;
+                }
+                flat.push_back(stmt);
+                return true;
+            case Stmt::Kind::DeclStmt:
+                if (stmt->fastDeadStore) return true;
+                if (!stmt->decl || stmt->decl->fastSlot < 0 ||
+                    !stmt->decl->init || exprHasCallLocal(stmt->decl->init.get())) {
+                    return false;
+                }
+                flat.push_back(stmt);
+                return true;
+            case Stmt::Kind::Block:
+            case Stmt::Kind::If:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool trySummarizePolynomial(unique_ptr<Stmt> &stmt, const ExactEnv &env,
+                                CountedLoop &counted,
+                                unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            exprHasCallLocal(stmt->expr.get()) ||
+            !extractCondition(stmt->expr.get(), env, counted)) {
+            return false;
+        }
+
+        vector<const Stmt *> flat;
+        if (!flattenPolynomialBody(stmt->body.get(), flat) || flat.empty()) {
+            return false;
+        }
+
+        unordered_set<int> changing;
+        unordered_set<int> transient;
+        unordered_map<int, string> names;
+        names[counted.inductionKey] = counted.inductionName;
+        for (const Stmt *item : flat) {
+            if (item->kind == Stmt::Kind::Assign) {
+                int key = assignKey(item);
+                changing.insert(key);
+                names[key] = item->name;
+                if (isGlobalKey(key) && constGlobals.count(globalIndex(key))) {
+                    return false;
+                }
+            } else if (item->kind == Stmt::Kind::DeclStmt) {
+                int key = item->decl->fastSlot;
+                changing.insert(key);
+                transient.insert(key);
+                names[key] = item->decl->name;
+            }
+        }
+        if (!changing.count(counted.inductionKey)) return false;
+
+        unordered_set<int> boundKeys;
+        collectExprKeys(counted.boundExpr, boundKeys);
+        for (int key : changing) {
+            if (boundKeys.count(key)) return false;
+        }
+
+        int32_t step = 0;
+        int inductionUpdates = 0;
+        for (const Stmt *item : flat) {
+            if (item->kind != Stmt::Kind::Assign ||
+                assignKey(item) != counted.inductionKey) {
+                continue;
+            }
+            int32_t delta = 0;
+            if (!polynomialInductionDelta(item->expr.get(), counted.inductionKey,
+                                          env, changing, delta)) {
+                return false;
+            }
+            step = add32(step, delta);
+            ++inductionUpdates;
+        }
+        if (inductionUpdates == 0 || step == 0) return false;
+        counted.step = step;
+        auto trip = tripCount(counted);
+        if (!trip) return false;
+        counted.trips = trip->first;
+        counted.finalValue = trip->second;
+        if (counted.trips == 0) {
+            auto empty = make_unique<Stmt>();
+            empty->kind = Stmt::Kind::Empty;
+            stmt = std::move(empty);
+            changed = true;
+            return true;
+        }
+        if (counted.trips < 8) return false;
+
+        unordered_map<int, Polynomial> aliases;
+        unordered_map<int, Polynomial> deltas;
+        int32_t inductionOffset = 0;
+        bool sawAccumulator = false;
+        for (const Stmt *item : flat) {
+            if (item->kind == Stmt::Kind::Empty ||
+                item->kind == Stmt::Kind::ExprStmt) {
+                continue;
+            }
+            int32_t inductionBase = add32(counted.start, inductionOffset);
+            if (item->kind == Stmt::Kind::DeclStmt) {
+                Polynomial value;
+                if (!polynomialExpr(item->decl->init.get(), counted.inductionKey,
+                                    inductionBase, step, changing, aliases,
+                                    env, value)) {
+                    return false;
+                }
+                aliases[item->decl->fastSlot] = value;
+                continue;
+            }
+
+            int key = assignKey(item);
+            if (key == counted.inductionKey) {
+                int32_t delta = 0;
+                if (!polynomialInductionDelta(item->expr.get(), counted.inductionKey,
+                                              env, changing, delta)) {
+                    return false;
+                }
+                inductionOffset = add32(inductionOffset, delta);
+                aliases.erase(key);
+                continue;
+            }
+            if (transient.count(key)) {
+                Polynomial value;
+                if (!polynomialExpr(item->expr.get(), counted.inductionKey,
+                                    inductionBase, step, changing, aliases,
+                                    env, value)) {
+                    return false;
+                }
+                aliases[key] = value;
+                continue;
+            }
+
+            int coefficient = 0;
+            vector<pair<int, const Expr *>> terms;
+            if (!collectAccumulatorTerms(item->expr.get(), key, 1,
+                                         coefficient, terms) ||
+                coefficient != 1) {
+                return false;
+            }
+            for (const auto &[sign, termExpr] : terms) {
+                Polynomial term;
+                if (!polynomialExpr(termExpr, counted.inductionKey,
+                                    inductionBase, step, changing, aliases,
+                                    env, term)) {
+                    return false;
+                }
+                if (sign < 0) term = polynomialNegate(term);
+                deltas[key] = polynomialAdd(deltas[key], term);
+            }
+            aliases.erase(key);
+            sawAccumulator = true;
+        }
+        if (!sawAccumulator || inductionOffset != step) return false;
+
+        auto wrapper = make_unique<Stmt>();
+        wrapper->kind = Stmt::Kind::Block;
+        auto guarded = make_unique<Stmt>();
+        guarded->kind = Stmt::Kind::If;
+        guarded->expr = std::move(stmt->expr);
+        guarded->thenStmt = make_unique<Stmt>();
+        guarded->thenStmt->kind = Stmt::Kind::Block;
+
+        vector<int> accumulatorKeys;
+        accumulatorKeys.reserve(deltas.size());
+        for (const auto &[key, unused] : deltas) {
+            (void)unused;
+            accumulatorKeys.push_back(key);
+        }
+        sort(accumulatorKeys.begin(), accumulatorKeys.end());
+        for (int key : accumulatorKeys) {
+            uint32_t delta = sumPolynomial(deltas.at(key), counted.trips);
+            if (delta != 0) {
+                guarded->thenStmt->stmts.push_back(assignStmt(
+                    names.at(key),
+                    binaryExpr("+", varExpr(names.at(key)),
+                               makeNumberExpr(static_cast<int32_t>(delta)))));
+            }
+        }
+        guarded->thenStmt->stmts.push_back(
+            assignStmt(counted.inductionName,
+                       makeNumberExpr(counted.finalValue)));
+        wrapper->stmts.push_back(std::move(guarded));
+        stmt = std::move(wrapper);
+        for (int key : changing) {
+            if (!isGlobalKey(key)) modifiedLocals.insert(key);
+        }
+        changed = true;
+        return true;
+    }
+
     bool trySummarize(unique_ptr<Stmt> &stmt, const ExactEnv &env,
                       CountedLoop &counted, unordered_set<int> &modifiedLocals) {
         if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
@@ -4123,7 +4600,13 @@ private:
                     }
                     return;
                 }
-                if (trySummarize(stmt, env, counted, modified)) {
+                bool summarized = trySummarize(stmt, env, counted, modified);
+                if (!summarized) {
+                    counted = CountedLoop{};
+                    modified.clear();
+                    summarized = trySummarizePolynomial(stmt, env, counted, modified);
+                }
+                if (summarized) {
                     for (int slot : modified) {
                         if (slot >= 0 && slot < static_cast<int>(env.size())) {
                             env[static_cast<size_t>(slot)] = nullopt;

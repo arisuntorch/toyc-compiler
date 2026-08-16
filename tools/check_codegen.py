@@ -30,6 +30,11 @@ CASES = {
         "if ((i % 3 == 0) || (i % 5 == 1)) { s = s + i; } "
         "else { s = s + 1; } i = i + 1; } return s; }"
     ),
+    "polynomial_loop": (
+        "int main() { int i = 0; int s = 1; int q = 3; "
+        "while (i < 1000000000) { int t = i * i + q * i + 7; "
+        "s = s + t; i = i + 1; } return s; }"
+    ),
     "helper_loop": (
         "int twice(int x) { return x + x; } int main() { int i = 0; int s = 0; "
         "while (i < 1000000) { s = s + twice(i); i = i + 1; } return s; }"
@@ -129,6 +134,13 @@ def main() -> int:
     if ".Lwhile_body" in generated["periodic_loop"]:
         print(
             "[FAIL] periodic_loop: proven residue phases were not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
+    if ".Lwhile_body" in generated["polynomial_loop"]:
+        print(
+            "[FAIL] polynomial_loop: proven polynomial sum was not lowered",
             file=sys.stderr,
         )
         return 1
