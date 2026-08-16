@@ -196,6 +196,19 @@ def main() -> int:
         print("[FAIL] dead_loop: finite unobservable loop was not removed", file=sys.stderr)
         return 1
 
+    dynamic_dead_loop = compile_source(
+        "int opaque(int x){int y=x;return y;}int main(){int i=opaque(0);"
+        "int n=opaque(1000000000);int junk=1;while(i<n){"
+        "junk=junk*1103515245+12345;i=i+1;}return 42;}"
+    )
+    if ".Lwhile_body" in function_assembly(dynamic_dead_loop, "main"):
+        print(
+            "[FAIL] dynamic_dead_loop: proven unit-step dead loop was not removed",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] dynamic_dead_loop: removed with runtime endpoints")
+
     fallback_cases = {
         "non_affine": (
             "int main(){int i=0;int x=2;while(i<100){x=x*x+1;i=i+1;}return x;}"
@@ -257,6 +270,11 @@ def main() -> int:
         "dynamic_nonlinear_state": (
             "int opaque(int x){int y=x;return y;}int main(){int n=opaque(10);"
             "int j=0;int s=2;while(j<n){s=s*s+j;j=j+1;}return s+j;}"
+        ),
+        "dynamic_dead_non_unit_step": (
+            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(9);"
+            "int j=0;int junk=2;while(j<n){junk=junk*junk+1;j=j+2;}"
+            "return 42;}"
         ),
     }
     for name, source in dynamic_fallbacks.items():

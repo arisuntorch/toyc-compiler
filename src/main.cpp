@@ -2753,8 +2753,8 @@ private:
         return "";
     }
 
-    bool extractCondition(const Expr *condition, const ExactEnv &env,
-                          CountedLoop &loop) const {
+    bool extractConditionShape(const Expr *condition,
+                               CountedLoop &loop) const {
         if (!condition || condition->kind != Expr::Kind::Binary) return false;
         static const unordered_set<string> relations = {"<", "<=", ">", ">="};
         if (!relations.count(condition->op)) return false;
@@ -2773,6 +2773,16 @@ private:
         }
         loop.inductionKey = exprKey(induction);
         loop.inductionName = induction->name;
+        return loop.inductionKey >= 0;
+    }
+
+    bool extractCondition(const Expr *condition, const ExactEnv &env,
+                          CountedLoop &loop) const {
+        if (!extractConditionShape(condition, loop)) return false;
+        const Expr *induction = condition->lhs.get();
+        if (exprKey(induction) != loop.inductionKey) {
+            induction = condition->rhs.get();
+        }
         auto start = evalExact(induction, env);
         auto bound = evalExact(loop.boundExpr, env);
         if (!start || !bound) return false;
@@ -2944,7 +2954,7 @@ private:
     bool tryDropDeadLoop(unique_ptr<Stmt> &stmt, const ExactEnv &env,
                          CountedLoop &counted, unordered_set<int> &modifiedLocals) {
         if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->fastLoopValuesDead ||
-            !extractCondition(stmt->expr.get(), env, counted)) {
+            !extractConditionShape(stmt->expr.get(), counted)) {
             return false;
         }
 
@@ -2961,10 +2971,28 @@ private:
             return false;
         }
         counted.step = *step;
-        auto trip = tripCount(counted);
-        if (!trip) return false;
-        counted.trips = trip->first;
-        counted.finalValue = trip->second;
+
+        const Expr *induction = stmt->expr->lhs.get();
+        if (exprKey(induction) != counted.inductionKey) {
+            induction = stmt->expr->rhs.get();
+        }
+        auto start = evalExact(induction, env);
+        auto bound = evalExact(counted.boundExpr, env);
+        if (start && bound) {
+            counted.start = *start;
+            counted.bound = *bound;
+            auto trip = tripCount(counted);
+            if (!trip) return false;
+            counted.trips = trip->first;
+            counted.finalValue = trip->second;
+        } else {
+            // Strict unit-step loops reach their int32 bound exactly, so no
+            // induction update can wrap before termination.  This proof does
+            // not require evaluating either runtime endpoint.
+            bool increasing = counted.relation == "<" && counted.step == 1;
+            bool decreasing = counted.relation == ">" && counted.step == -1;
+            if (!increasing && !decreasing) return false;
+        }
 
         for (int key : modified) {
             if (!isGlobalKey(key)) modifiedLocals.insert(key);
