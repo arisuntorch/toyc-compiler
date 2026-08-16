@@ -1420,10 +1420,16 @@ public:
         for (int programRound = 0; programRound < 3; ++programRound) {
             collectGlobalAssignments();
             globalConsts.clear();
+            globalInitialValues.clear();
+            knownGlobals.clear();
             env.clear();
             for (auto &item : prog.items) {
                 if (item.kind != TopItem::Kind::Decl) continue;
                 optExpr(item.decl->init);
+                if (auto value = foldConstExpr(item.decl->init.get())) {
+                    globalInitialValues[item.decl->name] = *value;
+                    knownGlobals[item.decl->name] = *value;
+                }
                 if (item.decl->isConst ||
                     !assignedGlobalNames.count(item.decl->name)) {
                     if (auto value = foldConstExpr(item.decl->init.get())) {
@@ -1434,6 +1440,8 @@ public:
             for (auto &item : prog.items) {
                 if (item.kind != TopItem::Kind::Func) continue;
                 env.clear();
+                knownGlobals = item.func->name == "main"
+                    ? globalInitialValues : globalConsts;
                 enter();
                 for (const string &param : item.func->params) {
                     env.back()[param] = LocalInfo{};
@@ -1443,6 +1451,7 @@ public:
                 cseFunction(*item.func);
                 dceFunction(*item.func);
             }
+            knownGlobals.clear();
         }
     }
 
@@ -1454,6 +1463,8 @@ private:
     unordered_set<string> globalNames;
     unordered_set<string> assignedGlobalNames;
     unordered_set<string> localPureFunctions;
+    unordered_map<string, int32_t> globalInitialValues;
+    unordered_map<string, int32_t> knownGlobals;
     struct LocalInfo {
         optional<int32_t> constVal;
         string copyOf;  // empty = not a copy of another local
@@ -1773,14 +1784,25 @@ private:
                     else if (!info->copyOf.empty()) e->name = info->copyOf;  // copy propagation
                     return;
                 }
+                auto known = knownGlobals.find(e->name);
+                if (known != knownGlobals.end()) {
+                    e = makeNumberExpr(known->second);
+                    return;
+                }
                 auto g = globalConsts.find(e->name);
                 if (g != globalConsts.end()) e = makeNumberExpr(g->second);
                 return;
             }
-            case Expr::Kind::Call:
+            case Expr::Kind::Call: {
+                string callee = e->name;
                 for (auto &arg : e->args) optExpr(arg);
                 inlinePureCall(e);
+                if (e && e->kind == Expr::Kind::Call &&
+                    !localPureFunctions.count(callee)) {
+                    knownGlobals.clear();
+                }
                 return;
+            }
             case Expr::Kind::Unary:
                 optExpr(e->lhs);
                 if (auto v = foldConstExpr(e.get())) e = makeNumberExpr(*v);
@@ -1791,6 +1813,19 @@ private:
                 simplifyBinary(e);
                 return;
         }
+    }
+
+    static unordered_map<string, int32_t> mergeKnownGlobals(
+        const unordered_map<string, int32_t> &lhs,
+        const unordered_map<string, int32_t> &rhs) {
+        unordered_map<string, int32_t> out;
+        for (const auto &[name, value] : lhs) {
+            auto found = rhs.find(name);
+            if (found != rhs.end() && found->second == value) {
+                out[name] = value;
+            }
+        }
+        return out;
     }
 
     // Structural equality of pure (call-free) expressions.
@@ -1969,6 +2004,12 @@ private:
                 if (isKnownLocal(s->name)) {
                     setLocalValue(s->name, foldConstExpr(s->expr.get()));
                     recordCopy(s->name, s->expr.get());
+                } else if (globalNames.count(s->name)) {
+                    if (auto value = foldConstExpr(s->expr.get())) {
+                        knownGlobals[s->name] = *value;
+                    } else {
+                        knownGlobals.erase(s->name);
+                    }
                 }
                 break;
             case Stmt::Kind::If: {
@@ -1986,22 +2027,35 @@ private:
                     break;
                 }
                 auto saved = env;
+                auto savedGlobals = knownGlobals;
                 optStmt(s->thenStmt);
                 auto thenAssigned = assignedInStmt(s->thenStmt.get());
+                auto thenGlobals = knownGlobals;
                 env = saved;
+                knownGlobals = savedGlobals;
                 optStmt(s->elseStmt);
                 auto elseAssigned = assignedInStmt(s->elseStmt.get());
+                auto elseGlobals = knownGlobals;
                 env = saved;
+                knownGlobals = mergeKnownGlobals(thenGlobals, elseGlobals);
                 for (const string &name : thenAssigned) eraseLocalValue(name);
                 for (const string &name : elseAssigned) eraseLocalValue(name);
                 break;
             }
             case Stmt::Kind::While: {
                 auto assigned = assignedInStmt(s->body.get());
-                for (const string &name : assigned) eraseLocalValue(name);
+                auto entryGlobals = knownGlobals;
+                for (const string &name : assigned) {
+                    eraseLocalValue(name);
+                    if (globalNames.count(name)) knownGlobals.erase(name);
+                }
+                if (exprHasCall(s->expr.get()) || stmtHasCall(s->body.get())) {
+                    knownGlobals.clear();
+                }
                 optExpr(s->expr);
                 if (auto v = foldConstExpr(s->expr.get()); v && !truthy(*v)) {
                     s = emptyStmt();
+                    knownGlobals = std::move(entryGlobals);
                     break;
                 }
                 if (hoistLoopInvariants(s)) {
@@ -2010,8 +2064,10 @@ private:
                     break;
                 }
                 auto saved = env;
+                auto loopGlobals = knownGlobals;
                 optStmt(s->body);
                 env = saved;
+                knownGlobals = std::move(loopGlobals);
                 for (const string &name : assigned) eraseLocalValue(name);
                 break;
             }

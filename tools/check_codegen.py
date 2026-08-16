@@ -377,6 +377,41 @@ def main() -> int:
         return 1
     print("[OK] immutable_global: propagated through reachable call graph")
 
+    assigned_global_constant = compile_source(
+        "int g=1;int main(){g=7;int i=0;int s=0;"
+        "while(i<100000000){s=s+g*i;i=i+1;}return s+g;}"
+    )
+    if ".Lwhile_body" in function_assembly(assigned_global_constant, "main"):
+        print(
+            "[FAIL] assigned_global_constant: forward global value was lost",
+            file=sys.stderr,
+        )
+        return 1
+
+    merged_global_constant = compile_source(
+        "int g=0;int h=0;int choose(){h=h+1;return h%2;}"
+        "int main(){if(choose()){g=7;}else{g=7;}int i=0;int s=0;"
+        "while(i<100000000){s=s+g*i;i=i+1;}return s+g+h;}"
+    )
+    if ".Lwhile_body" in function_assembly(merged_global_constant, "main"):
+        print(
+            "[FAIL] merged_global_constant: equal branch values were not merged",
+            file=sys.stderr,
+        )
+        return 1
+
+    divergent_global_value = compile_source(
+        "int g=0;int h=0;int choose(){h=h+1;return h%2;}"
+        "int main(){if(choose()){g=7;}else{g=8;}int i=0;int s=0;"
+        "while(i<100000000){s=s+g*i;i=i+1;}return s+g+h;}"
+    )
+    if ".Lwhile_body" not in function_assembly(divergent_global_value, "main"):
+        print(
+            "[FAIL] divergent_global_value: unequal branch values were merged",
+            file=sys.stderr,
+        )
+        return 1
+
     mutable_global = compile_source(
         "int g=7;void set(){g=99;}int main(){set();int i=0;int s=0;"
         "while(i<1000000000){s=s+g;i=i+1;}return s;}"
