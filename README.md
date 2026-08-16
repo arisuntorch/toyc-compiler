@@ -49,6 +49,11 @@ loops during compilation.
   simplification.
 - A separate static-analysis pass for lexical binding, local slots, liveness,
   loop identifiers, and conservative integer-range proofs.
+- Closed-form lowering of straight-line affine counted loops after proving the
+  exact finite trip count and symbolic state transition. The pass exponentiates
+  a recurrence matrix; it does not execute ToyC statements or function calls.
+- Elimination of finite, call-free loops whose local writes are all dead after
+  the loop and which have no global or control-flow side effects.
 - Register-based expression evaluation for call-free expressions, avoiding most
   temporary stack traffic in loop bodies.
 - Loop-depth-weighted allocation of hot variables and constants to `s1`-`s11`,
