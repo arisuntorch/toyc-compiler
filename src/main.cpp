@@ -335,6 +335,15 @@ public:
             unordered_set<int> live;
             analyzeStmt(item.func->body.get(), live, nullptr, nullptr, true);
         }
+        markDeadGlobalStores();
+        // Global dead-store marks can make an enclosing local loop wholly
+        // unobservable.  Recompute local liveness once with those stores
+        // ignored so the loop optimizer can remove or summarize it.
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func) continue;
+            unordered_set<int> live;
+            analyzeStmt(item.func->body.get(), live, nullptr, nullptr, true);
+        }
     }
 
 private:
@@ -485,7 +494,7 @@ private:
 
     static bool loopWritesAreUnobservable(const Stmt *stmt,
                                           const unordered_set<int> &liveAfter) {
-        if (!stmt) return true;
+        if (!stmt || stmt->fastDeadStore) return true;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : stmt->stmts) {
@@ -523,6 +532,12 @@ private:
                      const unordered_set<int> *breakLive,
                      const unordered_set<int> *continueLive, bool mark) const {
         if (!stmt) return;
+        if (stmt->fastDeadStore &&
+            (stmt->kind == Stmt::Kind::ExprStmt ||
+             stmt->kind == Stmt::Kind::Assign ||
+             stmt->kind == Stmt::Kind::DeclStmt)) {
+            return;
+        }
         switch (stmt->kind) {
             case Stmt::Kind::Block:
                 for (auto it = stmt->stmts.rbegin(); it != stmt->stmts.rend(); ++it) {
@@ -602,6 +617,144 @@ private:
                 live.erase(slot);
                 addReads(stmt->decl->init.get(), live);
                 return;
+            }
+        }
+    }
+
+    struct GlobalStoreDependency {
+        Stmt *stmt = nullptr;
+        int target = -1;
+        unordered_set<int> reads;
+    };
+
+    static void collectCalledNames(const Expr *expr,
+                                   unordered_set<string> &called) {
+        if (!expr) return;
+        if (expr->kind == Expr::Kind::Call) called.insert(expr->name);
+        collectCalledNames(expr->lhs.get(), called);
+        collectCalledNames(expr->rhs.get(), called);
+        for (auto &arg : expr->args) collectCalledNames(arg.get(), called);
+    }
+
+    static void collectCalledNames(const Stmt *stmt,
+                                   unordered_set<string> &called) {
+        if (!stmt || stmt->fastDeadStore) return;
+        collectCalledNames(stmt->expr.get(), called);
+        if (stmt->decl) collectCalledNames(stmt->decl->init.get(), called);
+        for (auto &child : stmt->stmts) {
+            collectCalledNames(child.get(), called);
+        }
+        collectCalledNames(stmt->thenStmt.get(), called);
+        collectCalledNames(stmt->elseStmt.get(), called);
+        collectCalledNames(stmt->body.get(), called);
+    }
+
+    static void collectGlobalReads(const Expr *expr,
+                                   unordered_set<int> &reads) {
+        if (!expr) return;
+        if (expr->kind == Expr::Kind::Var && expr->fastGlobal &&
+            expr->fastIndex >= 0) {
+            reads.insert(expr->fastIndex);
+            return;
+        }
+        collectGlobalReads(expr->lhs.get(), reads);
+        collectGlobalReads(expr->rhs.get(), reads);
+        for (auto &arg : expr->args) collectGlobalReads(arg.get(), reads);
+    }
+
+    static void collectGlobalStoreDependencies(
+        Stmt *stmt, unordered_set<int> &roots,
+        vector<GlobalStoreDependency> &stores) {
+        if (!stmt || stmt->fastDeadStore) return;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) {
+                    collectGlobalStoreDependencies(child.get(), roots, stores);
+                }
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                collectGlobalReads(stmt->expr.get(), roots);
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (stmt->decl) collectGlobalReads(stmt->decl->init.get(), roots);
+                return;
+            case Stmt::Kind::Assign: {
+                if (!stmt->fastAssignGlobal) {
+                    collectGlobalReads(stmt->expr.get(), roots);
+                    return;
+                }
+                unordered_set<int> reads;
+                collectGlobalReads(stmt->expr.get(), reads);
+                if (hasCall(stmt->expr.get())) {
+                    roots.insert(reads.begin(), reads.end());
+                    return;
+                }
+                stores.push_back(GlobalStoreDependency{
+                    stmt, stmt->fastAssignIndex, std::move(reads)});
+                return;
+            }
+            case Stmt::Kind::If:
+                collectGlobalReads(stmt->expr.get(), roots);
+                collectGlobalStoreDependencies(stmt->thenStmt.get(), roots,
+                                               stores);
+                collectGlobalStoreDependencies(stmt->elseStmt.get(), roots,
+                                               stores);
+                return;
+            case Stmt::Kind::While:
+                collectGlobalReads(stmt->expr.get(), roots);
+                collectGlobalStoreDependencies(stmt->body.get(), roots, stores);
+                return;
+        }
+    }
+
+    void markDeadGlobalStores() {
+        unordered_map<string, Function *> functions;
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Func) {
+                functions[item.func->name] = item.func.get();
+            }
+        }
+        unordered_set<string> reachable;
+        vector<string> pending;
+        if (functions.count("main")) {
+            reachable.insert("main");
+            pending.push_back("main");
+        }
+        for (size_t next = 0; next < pending.size(); ++next) {
+            Function *function = functions.at(pending[next]);
+            unordered_set<string> called;
+            collectCalledNames(function->body.get(), called);
+            for (const string &name : called) {
+                if (functions.count(name) && reachable.insert(name).second) {
+                    pending.push_back(name);
+                }
+            }
+        }
+
+        unordered_set<int> liveGlobals;
+        vector<GlobalStoreDependency> stores;
+        for (const string &name : reachable) {
+            collectGlobalStoreDependencies(functions.at(name)->body.get(),
+                                           liveGlobals, stores);
+        }
+        bool grew = true;
+        while (grew) {
+            grew = false;
+            for (const GlobalStoreDependency &store : stores) {
+                if (!liveGlobals.count(store.target)) continue;
+                size_t before = liveGlobals.size();
+                liveGlobals.insert(store.reads.begin(), store.reads.end());
+                grew = grew || liveGlobals.size() != before;
+            }
+        }
+        for (GlobalStoreDependency &store : stores) {
+            if (!liveGlobals.count(store.target)) {
+                store.stmt->fastDeadStore = true;
             }
         }
     }

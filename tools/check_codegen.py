@@ -330,6 +330,46 @@ def main() -> int:
         return 1
     print("[OK] mutable_global: retained reachable runtime state")
 
+    dead_global_loop = compile_source(
+        "int junk=2;int main(){int i=0;int s=0;while(i<1000000000){"
+        "junk=junk*junk+1;s=s+i;i=i+1;}return s;}"
+    )
+    dead_global_main = function_assembly(dead_global_loop, "main")
+    if ".Lwhile_body" in dead_global_main or ".Lglob_junk" in dead_global_main:
+        print(
+            "[FAIL] dead_global_loop: dead global dependency blocked loop summary",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] dead_global_loop: removed dead global recurrence")
+
+    live_global_dependency = compile_source(
+        "int source=3;int result=0;int main(){int i=0;while(i<20){"
+        "source=source*5+1;result=source+i;i=i+1;}return result;}"
+    )
+    live_dependency_main = function_assembly(live_global_dependency, "main")
+    if ".Lglob_source" not in live_dependency_main or \
+            ".Lglob_result" not in live_dependency_main:
+        print(
+            "[FAIL] live_global_dependency: observable dependency was deleted",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] live_global_dependency: retained transitive global state")
+
+    global_call_store = compile_source(
+        "int g=0;int side=0;int effect(){side=side+1;return side;}"
+        "int main(){g=effect();return side;}"
+    )
+    global_call_main = function_assembly(global_call_store, "main")
+    if "call effect" not in global_call_main or ".Lglob_g" not in global_call_main:
+        print(
+            "[FAIL] global_call_store: call-bearing global store was deleted",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] global_call_store: retained call side effects")
+
     loop_helper_fallbacks = {
         "non_affine_loop_helper": (
             "int helper(int n,int x){int j=0;while(j<n){x=x*x+1;j=j+1;}"
