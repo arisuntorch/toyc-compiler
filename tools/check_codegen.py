@@ -40,6 +40,11 @@ CASES = {
         "int main(){int i=-7;int s=3;while(1&&(i+5<1000000000)){"
         "s=s+i*3+1;i=i+4;}return s+i;}"
     ),
+    "runtime_unroll": (
+        "int opaque(int x){int y=x;return y;}int main(){int i=0;int x=1;"
+        "int s=0;int m=opaque(100);while(i<100000000){"
+        "x=x*1103515245+12345;s=s+x%m;i=i+1;}return s;}"
+    ),
     "helper_loop": (
         "int twice(int x) { return x + x; } int main() { int i = 0; int s = 0; "
         "while (i < 1000000) { s = s + twice(i); i = i + 1; } return s; }"
@@ -163,6 +168,15 @@ def main() -> int:
     if ".Lwhile_body" in generated["offset_condition_loop"]:
         print(
             "[FAIL] offset_condition_loop: affine condition offset was not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
+    runtime_unroll_main = function_assembly(generated["runtime_unroll"], "main")
+    if runtime_unroll_main.count("rem ") != 4 or \
+            ".Lwhile_body" not in runtime_unroll_main:
+        print(
+            "[FAIL] runtime_unroll: proven hot loop was not expanded four ways",
             file=sys.stderr,
         )
         return 1
@@ -294,6 +308,10 @@ def main() -> int:
         "dynamic_nonlinear_state": (
             "int opaque(int x){int y=x;return y;}int main(){int n=opaque(10);"
             "int j=0;int s=2;while(j<n){s=s*s+j;j=j+1;}return s+j;}"
+        ),
+        "changing_induction_step": (
+            "int main(){int i=0;int step=1;int x=0;while(i<1024){"
+            "step=step+1;x=x*3+step;i=i+step;}return x+i+step;}"
         ),
     }
     for name, source in dynamic_fallbacks.items():

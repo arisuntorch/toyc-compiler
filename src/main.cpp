@@ -249,6 +249,7 @@ struct Stmt {
     bool fastDeadStore = false;
     bool fastLoopValuesDead = false;
     int fastLoopId = -1;
+    int fastRuntimeUnroll = 1;
     unique_ptr<Expr> expr;
     unique_ptr<Stmt> thenStmt;
     unique_ptr<Stmt> elseStmt;
@@ -4502,6 +4503,129 @@ private:
         return stmt;
     }
 
+    static unique_ptr<Stmt> cloneStmtPlain(const Stmt *stmt) {
+        if (!stmt) return nullptr;
+        auto out = make_unique<Stmt>();
+        out->kind = stmt->kind;
+        out->name = stmt->name;
+        out->expr = cloneExprPlain(stmt->expr.get());
+        if (stmt->decl) {
+            out->decl = make_unique<Decl>();
+            out->decl->isConst = stmt->decl->isConst;
+            out->decl->name = stmt->decl->name;
+            out->decl->init = cloneExprPlain(stmt->decl->init.get());
+        }
+        for (auto &child : stmt->stmts) {
+            out->stmts.push_back(cloneStmtPlain(child.get()));
+        }
+        out->thenStmt = cloneStmtPlain(stmt->thenStmt.get());
+        out->elseStmt = cloneStmtPlain(stmt->elseStmt.get());
+        out->body = cloneStmtPlain(stmt->body.get());
+        return out;
+    }
+
+    static unique_ptr<Stmt> cloneUnrolledBody(
+        const Stmt *stmt, int inductionKey,
+        optional<int32_t> replacementStep) {
+        if (!stmt) return nullptr;
+        if (stmt->kind == Stmt::Kind::Assign &&
+            assignKey(stmt) == inductionKey) {
+            if (!replacementStep) {
+                auto empty = make_unique<Stmt>();
+                empty->kind = Stmt::Kind::Empty;
+                return empty;
+            }
+            return assignStmt(
+                stmt->name,
+                binaryExpr("+", varExpr(stmt->name),
+                           makeNumberExpr(*replacementStep)));
+        }
+        if (stmt->kind != Stmt::Kind::Block) return cloneStmtPlain(stmt);
+        auto out = make_unique<Stmt>();
+        out->kind = Stmt::Kind::Block;
+        for (auto &child : stmt->stmts) {
+            out->stmts.push_back(cloneUnrolledBody(
+                child.get(), inductionKey, replacementStep));
+        }
+        return out;
+    }
+
+    static bool runtimeUnrollShape(const Stmt *stmt, int &nodes) {
+        if (!stmt || stmt->fastDeadStore) return true;
+        if (++nodes > 24) return false;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) {
+                    if (!runtimeUnrollShape(child.get(), nodes)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+                return !exprHasCallLocal(stmt->expr.get());
+            case Stmt::Kind::DeclStmt:
+                return stmt->decl &&
+                    !exprHasCallLocal(stmt->decl->init.get());
+            case Stmt::Kind::If:
+                return !exprHasCallLocal(stmt->expr.get()) &&
+                    runtimeUnrollShape(stmt->thenStmt.get(), nodes) &&
+                    runtimeUnrollShape(stmt->elseStmt.get(), nodes);
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    static bool readsInductionOutsideStep(const Stmt *stmt,
+                                          int inductionKey) {
+        if (!stmt || stmt->fastDeadStore) return false;
+        if (stmt->kind == Stmt::Kind::Assign &&
+            assignKey(stmt) == inductionKey) {
+            return false;
+        }
+        unordered_set<int> reads;
+        collectExprKeys(stmt->expr.get(), reads);
+        if (stmt->decl) collectExprKeys(stmt->decl->init.get(), reads);
+        if (reads.count(inductionKey)) return true;
+        for (auto &child : stmt->stmts) {
+            if (readsInductionOutsideStep(child.get(), inductionKey)) return true;
+        }
+        return readsInductionOutsideStep(stmt->thenStmt.get(), inductionKey) ||
+               readsInductionOutsideStep(stmt->elseStmt.get(), inductionKey) ||
+               readsInductionOutsideStep(stmt->body.get(), inductionKey);
+    }
+
+    static bool inductionStepUsesChangingValue(
+        const Stmt *stmt, int inductionKey,
+        const unordered_set<int> &modified) {
+        if (!stmt || stmt->fastDeadStore) return false;
+        if (stmt->kind == Stmt::Kind::Assign &&
+            assignKey(stmt) == inductionKey) {
+            unordered_set<int> reads;
+            collectExprKeys(stmt->expr.get(), reads);
+            for (int key : reads) {
+                if (key != inductionKey && modified.count(key)) return true;
+            }
+            return false;
+        }
+        for (auto &child : stmt->stmts) {
+            if (inductionStepUsesChangingValue(
+                    child.get(), inductionKey, modified)) {
+                return true;
+            }
+        }
+        return inductionStepUsesChangingValue(
+                   stmt->thenStmt.get(), inductionKey, modified) ||
+               inductionStepUsesChangingValue(
+                   stmt->elseStmt.get(), inductionKey, modified) ||
+               inductionStepUsesChangingValue(
+                   stmt->body.get(), inductionKey, modified);
+    }
+
     static unique_ptr<Expr> finalExpr(const Row &row, const Model &model,
                                       const unordered_map<int, string> &temporaries) {
         unique_ptr<Expr> sum;
@@ -5239,6 +5363,70 @@ private:
         return true;
     }
 
+    bool tryRuntimeUnroll(unique_ptr<Stmt> &stmt, const ExactEnv &env,
+                          unordered_set<int> &modifiedLocals) {
+        static constexpr int kUnrollFactor = 4;
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            stmt->fastRuntimeUnroll != 1 || exprHasCallLocal(stmt->expr.get())) {
+            return false;
+        }
+
+        CountedLoop counted;
+        if (!extractCondition(stmt->expr.get(), env, counted)) return false;
+        unordered_set<int> modified;
+        collectModifiedKeys(stmt->body.get(), modified);
+        unordered_set<int> boundKeys;
+        collectExprKeys(counted.boundExpr, boundKeys);
+        for (int key : modified) {
+            if (boundKeys.count(key)) return false;
+        }
+
+        optional<int32_t> step;
+        if (!findUnconditionalStep(stmt->body.get(), counted.inductionKey,
+                                   env, step) ||
+            !step || inductionStepUsesChangingValue(
+                         stmt->body.get(), counted.inductionKey, modified)) {
+            return false;
+        }
+        counted.step = *step;
+        auto trip = tripCount(counted);
+        if (!trip || trip->first < 256 ||
+            trip->first % kUnrollFactor != 0) {
+            return false;
+        }
+
+        int nodes = 0;
+        if (!runtimeUnrollShape(stmt->body.get(), nodes)) return false;
+        bool combineStep =
+            !readsInductionOutsideStep(stmt->body.get(), counted.inductionKey);
+        int32_t combinedStep = static_cast<int32_t>(
+            static_cast<uint32_t>(counted.step) * kUnrollFactor);
+        if (combinedStep == 0) return false;
+
+        auto unrolled = make_unique<Stmt>();
+        unrolled->kind = Stmt::Kind::Block;
+        for (int copy = 0; copy < kUnrollFactor; ++copy) {
+            auto scopedCopy = make_unique<Stmt>();
+            scopedCopy->kind = Stmt::Kind::Block;
+            if (!combineStep) {
+                scopedCopy->stmts.push_back(cloneStmtPlain(stmt->body.get()));
+            } else {
+                optional<int32_t> replacement;
+                if (copy + 1 == kUnrollFactor) replacement = combinedStep;
+                scopedCopy->stmts.push_back(cloneUnrolledBody(
+                    stmt->body.get(), counted.inductionKey, replacement));
+            }
+            unrolled->stmts.push_back(std::move(scopedCopy));
+        }
+        stmt->body = std::move(unrolled);
+        stmt->fastRuntimeUnroll = kUnrollFactor;
+        for (int key : modified) {
+            if (!isGlobalKey(key)) modifiedLocals.insert(key);
+        }
+        changed = true;
+        return true;
+    }
+
     bool trySummarizePolynomial(unique_ptr<Stmt> &stmt, const ExactEnv &env,
                                 CountedLoop &counted,
                                 unordered_set<int> &modifiedLocals) {
@@ -5560,6 +5748,15 @@ private:
                 }
                 modified.clear();
                 if (trySummarizeDynamicUnitLoop(stmt, env, modified)) {
+                    for (int slot : modified) {
+                        if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                            env[static_cast<size_t>(slot)] = nullopt;
+                        }
+                    }
+                    return;
+                }
+                modified.clear();
+                if (tryRuntimeUnroll(stmt, env, modified)) {
                     for (int slot : modified) {
                         if (slot >= 0 && slot < static_cast<int>(env.size())) {
                             env[static_cast<size_t>(slot)] = nullopt;
