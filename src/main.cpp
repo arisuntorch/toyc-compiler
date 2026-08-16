@@ -1411,16 +1411,16 @@ public:
     explicit SafeOptimizer(Program &program) : prog(program) {}
 
     void run() {
-        collectInlineableFunctions();
         collectProgramNames();
-        collectFunctionGlobalWrites();
-        collectLocalPureFunctions();
         functionEntryGlobals.clear();
         functionEntrySeen.clear();
         // Recompute reachability and writes after each rewrite pass.  A first
         // pass can delete a constant-false call or global store, allowing the
         // next pass to prove additional globals immutable from main.
         for (int programRound = 0; programRound < 3; ++programRound) {
+            collectInlineableFunctions();
+            collectFunctionGlobalWrites();
+            collectLocalPureFunctions();
             collectGlobalAssignments();
             globalConsts.clear();
             globalInitialValues.clear();
@@ -1462,6 +1462,9 @@ public:
                 leave();
                 cseFunction(*item.func);
                 dceFunction(*item.func);
+                if (summarizeStraightLineFunction(*item.func)) {
+                    inlineableFuncs[item.func->name] = item.func.get();
+                }
                 recordFunctionEntries = false;
             }
             knownGlobals.clear();
@@ -1487,6 +1490,193 @@ private:
         string copyOf;  // empty = not a copy of another local
     };
     vector<unordered_map<string, LocalInfo>> env;
+
+    static int summaryBinding(
+        const vector<unordered_map<string, int>> &scopes,
+        const string &name) {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return found->second;
+        }
+        return -1;
+    }
+
+    static unique_ptr<Expr> cloneSummaryExpr(
+        const Expr *expr, int &nodes, bool &valid) {
+        if (!expr || !valid) return nullptr;
+        if (++nodes > 512) {
+            valid = false;
+            return nullptr;
+        }
+        auto out = make_unique<Expr>();
+        out->kind = expr->kind;
+        out->value = expr->value;
+        out->name = expr->name;
+        out->op = expr->op;
+        out->lhs = cloneSummaryExpr(expr->lhs.get(), nodes, valid);
+        out->rhs = cloneSummaryExpr(expr->rhs.get(), nodes, valid);
+        for (auto &arg : expr->args) {
+            out->args.push_back(cloneSummaryExpr(arg.get(), nodes, valid));
+        }
+        return valid ? std::move(out) : nullptr;
+    }
+
+    static unique_ptr<Expr> expandSummaryExpr(
+        const Expr *expr,
+        const vector<unordered_map<string, int>> &scopes,
+        const vector<unique_ptr<Expr>> &values,
+        vector<int> &uses,
+        int &nodes, bool &valid) {
+        if (!expr || !valid) return nullptr;
+        if (expr->kind == Expr::Kind::Call) {
+            valid = false;
+            return nullptr;
+        }
+        if (expr->kind == Expr::Kind::Var) {
+            int binding = summaryBinding(scopes, expr->name);
+            if (binding < 0 || binding >= static_cast<int>(values.size()) ||
+                !values[static_cast<size_t>(binding)]) {
+                valid = false;
+                return nullptr;
+            }
+            ++uses[static_cast<size_t>(binding)];
+            return cloneSummaryExpr(
+                values[static_cast<size_t>(binding)].get(), nodes, valid);
+        }
+        if (++nodes > 512) {
+            valid = false;
+            return nullptr;
+        }
+        auto out = make_unique<Expr>();
+        out->kind = expr->kind;
+        out->value = expr->value;
+        out->name = expr->name;
+        out->op = expr->op;
+        out->lhs = expandSummaryExpr(
+            expr->lhs.get(), scopes, values, uses, nodes, valid);
+        out->rhs = expandSummaryExpr(
+            expr->rhs.get(), scopes, values, uses, nodes, valid);
+        for (auto &arg : expr->args) {
+            out->args.push_back(expandSummaryExpr(
+                arg.get(), scopes, values, uses, nodes, valid));
+        }
+        return valid ? std::move(out) : nullptr;
+    }
+
+    static bool summarizeStraightLineStmt(
+        const Stmt *stmt,
+        vector<unordered_map<string, int>> &scopes,
+        vector<unique_ptr<Expr>> &values,
+        vector<int> &uses,
+        unique_ptr<Expr> &result, bool &returned,
+        int &nodes, bool &valid) {
+        if (!stmt || !valid || returned) return valid;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                scopes.push_back({});
+                for (auto &child : stmt->stmts) {
+                    if (!summarizeStraightLineStmt(
+                            child.get(), scopes, values, uses, result, returned,
+                            nodes, valid)) {
+                        break;
+                    }
+                    if (returned) break;
+                }
+                scopes.pop_back();
+                return valid;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt: {
+                auto unused = expandSummaryExpr(
+                    stmt->expr.get(), scopes, values, uses, nodes, valid);
+                return valid && static_cast<bool>(unused);
+            }
+            case Stmt::Kind::DeclStmt: {
+                if (!stmt->decl || !stmt->decl->init) return false;
+                auto value = expandSummaryExpr(
+                    stmt->decl->init.get(), scopes, values, uses, nodes, valid);
+                if (!valid || !value) return false;
+                int binding = static_cast<int>(values.size());
+                values.push_back(std::move(value));
+                uses.push_back(0);
+                scopes.back()[stmt->decl->name] = binding;
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                int binding = summaryBinding(scopes, stmt->name);
+                if (binding < 0 || binding >= static_cast<int>(values.size())) {
+                    return false;
+                }
+                auto value = expandSummaryExpr(
+                    stmt->expr.get(), scopes, values, uses, nodes, valid);
+                if (!valid || !value) return false;
+                values[static_cast<size_t>(binding)] = std::move(value);
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (!stmt->expr) return false;
+                result = expandSummaryExpr(
+                    stmt->expr.get(), scopes, values, uses, nodes, valid);
+                returned = valid && static_cast<bool>(result);
+                return returned;
+            case Stmt::Kind::If:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
+    bool summarizeStraightLineFunction(Function &function) {
+        if (function.returnsVoid || !function.body) return false;
+
+        vector<unordered_map<string, int>> scopes(1);
+        vector<unique_ptr<Expr>> values;
+        vector<int> uses;
+        values.reserve(function.params.size());
+        uses.reserve(function.params.size());
+        for (const string &param : function.params) {
+            int binding = static_cast<int>(values.size());
+            values.push_back(makeVarExpr(param));
+            uses.push_back(0);
+            scopes.back()[param] = binding;
+        }
+
+        unique_ptr<Expr> result;
+        bool returned = false;
+        bool valid = true;
+        int nodes = 0;
+        if (!summarizeStraightLineStmt(
+                function.body.get(), scopes, values, uses, result, returned,
+                nodes, valid) || !returned || !result) {
+            return false;
+        }
+        for (size_t i = function.params.size(); i < values.size(); ++i) {
+            if (uses[i] > 1 && values[i] &&
+                values[i]->kind != Expr::Kind::Number &&
+                values[i]->kind != Expr::Kind::Var) {
+                return false;
+            }
+        }
+
+        enter();
+        for (const string &param : function.params) {
+            env.back()[param] = LocalInfo{};
+        }
+        optExpr(result);
+        leave();
+        if (!result || exprHasCall(result.get())) return false;
+
+        auto body = make_unique<Stmt>();
+        body->kind = Stmt::Kind::Block;
+        auto ret = make_unique<Stmt>();
+        ret->kind = Stmt::Kind::Return;
+        ret->expr = std::move(result);
+        body->stmts.push_back(std::move(ret));
+        function.body = std::move(body);
+        return true;
+    }
 
     void collectInlineableFunctions() {
         inlineableFuncs.clear();

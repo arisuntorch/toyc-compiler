@@ -173,13 +173,30 @@ def main() -> int:
         return 1
 
     runtime_unroll_main = function_assembly(generated["runtime_unroll"], "main")
-    if runtime_unroll_main.count("rem ") != 4 or \
+    modulo_sequences = runtime_unroll_main.count("rem ") + \
+        runtime_unroll_main.count("mulh ")
+    if modulo_sequences != 4 or \
             ".Lwhile_body" not in runtime_unroll_main:
         print(
             "[FAIL] runtime_unroll: proven hot loop was not expanded four ways",
             file=sys.stderr,
         )
         return 1
+
+    straight_line_summary = compile_source(
+        "int helper(int x){int a=x+3;int b=a*5;int c=b-7;return c;}"
+        "int main(){int i=0;int s=0;while(i<100000000){"
+        "s=s+helper(i);i=i+1;}return s;}"
+    )
+    straight_line_main = function_assembly(straight_line_summary, "main")
+    if "call helper" in straight_line_main or \
+            ".Lwhile_body" in straight_line_main:
+        print(
+            "[FAIL] straight_line_summary: symbolic helper was not exposed to loop analysis",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] straight_line_summary: removed helper call and loop backedge")
 
     pure_call_cse = compile_source(
         "int helper(int x){int j=0;int s=x;while(j<8){"
@@ -263,9 +280,10 @@ def main() -> int:
         return 1
 
     dynamic_dead_loop = compile_source(
-        "int opaque(int x){int y=x;return y;}int main(){int i=opaque(0);"
+        "int side=0;int opaque(int x){side=side+1;return x;}"
+        "int main(){int i=opaque(0);"
         "int n=opaque(1000000000);int junk=1;while(i<n){"
-        "junk=junk*1103515245+12345;i=i+1;}return 42;}"
+        "junk=junk*1103515245+12345;i=i+1;}return 42+side;}"
     )
     if ".Lwhile_body" in function_assembly(dynamic_dead_loop, "main"):
         print(
@@ -276,9 +294,10 @@ def main() -> int:
     print("[OK] dynamic_dead_loop: removed with runtime endpoints")
 
     dynamic_dead_stride_loop = compile_source(
-        "int opaque(int x){int y=x;return y;}int main(){int n=opaque(9);"
+        "int side=0;int opaque(int x){side=side+1;return x;}"
+        "int main(){int n=opaque(9);"
         "int j=0;int junk=2;while(j<=n){junk=junk*junk+1;j=j+2;}"
-        "return 42;}"
+        "return 42+side;}"
     )
     if ".Lwhile_body" in function_assembly(dynamic_dead_stride_loop, "main"):
         print(
@@ -339,16 +358,19 @@ def main() -> int:
 
     dynamic_fallbacks = {
         "dynamic_changing_bound": (
-            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(-1);"
-            "int j=0;int s=0;while(j<n){s=s+j;n=n+1;j=j+1;}return s+j+n;}"
+            "int side=0;int opaque(int x){side=side+1;return x;}"
+            "int main(){int n=opaque(-1);int j=0;int s=0;while(j<n){"
+            "s=s+j;n=n+1;j=j+1;}return s+j+n+side;}"
         ),
         "dynamic_non_unit_step": (
-            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(20);"
-            "int j=0;int s=0;while(j<n){s=s+j;j=j+2;}return s+j;}"
+            "int side=0;int opaque(int x){side=side+1;return x;}"
+            "int main(){int n=opaque(20);int j=0;int s=0;while(j<n){"
+            "s=s+j;j=j+2;}return s+j+side;}"
         ),
         "dynamic_nonlinear_state": (
-            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(10);"
-            "int j=0;int s=2;while(j<n){s=s*s+j;j=j+1;}return s+j;}"
+            "int side=0;int opaque(int x){side=side+1;return x;}"
+            "int main(){int n=opaque(10);int j=0;int s=2;while(j<n){"
+            "s=s*s+j;j=j+1;}return s+j+side;}"
         ),
         "changing_induction_step": (
             "int main(){int i=0;int step=1;int x=0;while(i<1024){"
