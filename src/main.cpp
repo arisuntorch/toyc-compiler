@@ -2287,6 +2287,12 @@ private:
 // by a proven finite induction-variable residue period are composed one abstract
 // period at a time.  The rewritten AST keeps an entry-condition branch and
 // computes the final values at runtime.
+//
+// Loop helpers use the same proof machinery.  The bounded statement walk only
+// specializes non-loop control flow for one proven residue phase; every while
+// statement must be discharged by a counted-loop proof and matrix
+// exponentiation.  No ToyC loop is iterated and no ToyC function is invoked by
+// the compiler.
 class AffineLoopOptimizer {
 public:
     explicit AffineLoopOptimizer(Program &program) : prog(program) {}
@@ -2332,6 +2338,7 @@ private:
     unordered_map<int, int32_t> exactGlobals;
     unordered_set<int> constGlobals;
     unordered_map<string, const Function *> branchHelpers;
+    unordered_map<string, const Function *> exactLoopHelpers;
     unordered_set<string> usedNames;
     int freshId = 0;
     bool changed = false;
@@ -2410,6 +2417,105 @@ private:
         return false;
     }
 
+    static bool exactLoopHelperExprShape(const Expr *e, int localCount,
+                                         int &nodes) {
+        if (!e) return true;
+        if (++nodes > 256 || e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Var) {
+            return !e->fastGlobal && e->fastIndex >= 0 &&
+                   e->fastIndex < localCount;
+        }
+        if (!exactLoopHelperExprShape(e->lhs.get(), localCount, nodes) ||
+            !exactLoopHelperExprShape(e->rhs.get(), localCount, nodes)) {
+            return false;
+        }
+        for (auto &arg : e->args) {
+            if (!exactLoopHelperExprShape(arg.get(), localCount, nodes)) return false;
+        }
+        return true;
+    }
+
+    static bool exactLoopHelperStmtShape(const Stmt *s, int loopDepth,
+                                         int localCount, int &nodes,
+                                         bool &hasLoop, bool &alwaysReturns) {
+        alwaysReturns = false;
+        if (!s || ++nodes > 256) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool returned = false;
+                for (auto &child : s->stmts) {
+                    if (returned) break;
+                    bool childReturns = false;
+                    if (!exactLoopHelperStmtShape(child.get(), loopDepth,
+                                                  localCount, nodes, hasLoop,
+                                                  childReturns)) {
+                        return false;
+                    }
+                    returned = childReturns;
+                }
+                alwaysReturns = returned;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return exactLoopHelperExprShape(s->expr.get(), localCount, nodes);
+            case Stmt::Kind::DeclStmt:
+                return s->decl && s->decl->init && s->decl->fastSlot >= 0 &&
+                       s->decl->fastSlot < localCount &&
+                       exactLoopHelperExprShape(s->decl->init.get(), localCount,
+                                                nodes);
+            case Stmt::Kind::Assign:
+                return !s->fastAssignGlobal && s->fastAssignIndex >= 0 &&
+                       s->fastAssignIndex < localCount &&
+                       exactLoopHelperExprShape(s->expr.get(), localCount, nodes);
+            case Stmt::Kind::If: {
+                if (!exactLoopHelperExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                bool thenReturns = false;
+                bool elseReturns = false;
+                if (!exactLoopHelperStmtShape(s->thenStmt.get(), loopDepth,
+                                              localCount, nodes, hasLoop,
+                                              thenReturns)) {
+                    return false;
+                }
+                if (s->elseStmt &&
+                    !exactLoopHelperStmtShape(s->elseStmt.get(), loopDepth,
+                                              localCount, nodes, hasLoop,
+                                              elseReturns)) {
+                    return false;
+                }
+                alwaysReturns = thenReturns && s->elseStmt && elseReturns;
+                return true;
+            }
+            case Stmt::Kind::While: {
+                if (!exactLoopHelperExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                hasLoop = true;
+                bool bodyReturns = false;
+                if (!exactLoopHelperStmtShape(s->body.get(), loopDepth + 1,
+                                              localCount, nodes, hasLoop,
+                                              bodyReturns) || bodyReturns) {
+                    return false;
+                }
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (loopDepth != 0 || !s->expr ||
+                    !exactLoopHelperExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                alwaysReturns = true;
+                return true;
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
     void collectProgramInfo() {
         int global = 0;
         for (auto &item : prog.items) {
@@ -2434,6 +2540,19 @@ private:
                     if (branchHelperShape(item.func->body.get(), params, nodes,
                                           alwaysReturns) && alwaysReturns) {
                         branchHelpers[item.func->name] = item.func.get();
+                    }
+                }
+                if (!item.func->returnsVoid && item.func->fastLocalCount >=
+                        static_cast<int>(item.func->params.size()) &&
+                    item.func->fastLocalCount <= 32) {
+                    int nodes = 0;
+                    bool hasLoop = false;
+                    bool alwaysReturns = false;
+                    if (exactLoopHelperStmtShape(item.func->body.get(), 0,
+                                                 item.func->fastLocalCount,
+                                                 nodes, hasLoop, alwaysReturns) &&
+                        hasLoop && alwaysReturns) {
+                        exactLoopHelpers[item.func->name] = item.func.get();
                     }
                 }
             }
@@ -2771,10 +2890,23 @@ private:
         return found->second;
     }
 
+    const Function *exactLoopHelperCallShape(const Expr *e) const {
+        if (!e || e->kind != Expr::Kind::Call) return nullptr;
+        auto found = exactLoopHelpers.find(e->name);
+        if (found == exactLoopHelpers.end() ||
+            e->args.size() != found->second->params.size()) {
+            return nullptr;
+        }
+        for (auto &arg : e->args) {
+            if (exprHasCallLocal(arg.get())) return nullptr;
+        }
+        return found->second;
+    }
+
     bool collectExprVars(const Expr *e, Model &model) const {
         if (!e) return true;
         if (e->kind == Expr::Kind::Call) {
-            if (!branchHelperCall(e)) return false;
+            if (!branchHelperCall(e) && !exactLoopHelperCallShape(e)) return false;
             for (auto &arg : e->args) {
                 if (!collectExprVars(arg.get(), model)) return false;
             }
@@ -2877,18 +3009,172 @@ private:
         return HelperFlow::Fail;
     }
 
+    bool applyClosedToExactEnv(const Model &model, const Matrix &closed,
+                               ExactEnv &env) const {
+        ExactEnv next = env;
+        for (int key : model.modified) {
+            if (model.transient.count(key)) continue;
+            if (isGlobalKey(key) || key < 0 || key >= static_cast<int>(env.size())) {
+                return false;
+            }
+            const Row &row = closed[static_cast<size_t>(model.index.at(key))];
+            uint32_t value = row.back();
+            for (size_t i = 0; i < model.keys.size(); ++i) {
+                uint32_t coefficient = row[i];
+                if (coefficient == 0) continue;
+                int sourceKey = model.keys[i];
+                if (model.transient.count(sourceKey) || isGlobalKey(sourceKey) ||
+                    sourceKey < 0 || sourceKey >= static_cast<int>(env.size()) ||
+                    !env[static_cast<size_t>(sourceKey)]) {
+                    return false;
+                }
+                value += static_cast<uint32_t>(
+                    static_cast<uint64_t>(coefficient) *
+                    static_cast<uint32_t>(*env[static_cast<size_t>(sourceKey)]));
+            }
+            next[static_cast<size_t>(key)] = static_cast<int32_t>(value);
+        }
+        env = std::move(next);
+        return true;
+    }
+
+    bool summarizeExactHelperLoop(const Stmt *loop, ExactEnv &env) const {
+        CountedLoop counted;
+        if (!loop || loop->kind != Stmt::Kind::While || !loop->expr ||
+            !extractCondition(loop->expr.get(), env, counted)) {
+            return false;
+        }
+
+        Model model;
+        const Expr *induction = loop->expr->lhs.get();
+        if (exprKey(induction) != counted.inductionKey) induction = loop->expr->rhs.get();
+        if (!induction || induction->kind != Expr::Kind::Var) return false;
+        addModelKey(model, counted.inductionKey, induction->name);
+        if (!collectBody(loop->body.get(), model) || model.keys.size() > 32 ||
+            !model.modified.count(counted.inductionKey)) {
+            return false;
+        }
+
+        unordered_set<int> boundKeys;
+        Model boundModel;
+        if (!collectExprVars(counted.boundExpr, boundModel)) return false;
+        for (int key : boundModel.keys) boundKeys.insert(key);
+        for (int key : model.modified) {
+            if (isGlobalKey(key) || boundKeys.count(key)) return false;
+        }
+
+        const int states = static_cast<int>(model.keys.size());
+        Matrix transform = identityMatrix(states + 1);
+        Matrix closed;
+        if (applyBodyTransform(loop->body.get(), model, transform)) {
+            int inductionIndex = model.index.at(counted.inductionKey);
+            const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
+            for (int i = 0; i < states; ++i) {
+                uint32_t expected = i == inductionIndex ? 1u : 0u;
+                if (inductionRow[static_cast<size_t>(i)] != expected) return false;
+            }
+            counted.step = static_cast<int32_t>(inductionRow.back());
+            auto trip = tripCount(counted);
+            if (!trip) return false;
+            counted.trips = trip->first;
+            counted.finalValue = trip->second;
+            closed = power(std::move(transform), counted.trips);
+        } else if (!buildPeriodicClosed(loop, env, model, counted, closed, false)) {
+            return false;
+        }
+        return applyClosedToExactEnv(model, closed, env);
+    }
+
+    HelperFlow summarizeExactHelperStmt(const Stmt *s, ExactEnv &env,
+                                        optional<int32_t> &result) const {
+        if (!s) return HelperFlow::Fallthrough;
+        if (s->fastDeadStore && (s->kind == Stmt::Kind::ExprStmt ||
+                                 s->kind == Stmt::Kind::Assign ||
+                                 s->kind == Stmt::Kind::DeclStmt)) {
+            return HelperFlow::Fallthrough;
+        }
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    HelperFlow flow = summarizeExactHelperStmt(child.get(), env, result);
+                    if (flow != HelperFlow::Fallthrough) return flow;
+                }
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || s->decl->fastSlot < 0 ||
+                    s->decl->fastSlot >= static_cast<int>(env.size())) {
+                    return HelperFlow::Fail;
+                }
+                auto value = evalExact(s->decl->init.get(), env);
+                if (!value) return HelperFlow::Fail;
+                env[static_cast<size_t>(s->decl->fastSlot)] = *value;
+                return HelperFlow::Fallthrough;
+            }
+            case Stmt::Kind::Assign: {
+                if (s->fastAssignGlobal || s->fastAssignIndex < 0 ||
+                    s->fastAssignIndex >= static_cast<int>(env.size())) {
+                    return HelperFlow::Fail;
+                }
+                auto value = evalExact(s->expr.get(), env);
+                if (!value) return HelperFlow::Fail;
+                env[static_cast<size_t>(s->fastAssignIndex)] = *value;
+                return HelperFlow::Fallthrough;
+            }
+            case Stmt::Kind::If: {
+                auto condition = evalExact(s->expr.get(), env);
+                if (!condition) return HelperFlow::Fail;
+                const Stmt *branch = truthy(*condition) ? s->thenStmt.get()
+                                                        : s->elseStmt.get();
+                return branch ? summarizeExactHelperStmt(branch, env, result)
+                              : HelperFlow::Fallthrough;
+            }
+            case Stmt::Kind::While:
+                return summarizeExactHelperLoop(s, env)
+                    ? HelperFlow::Fallthrough : HelperFlow::Fail;
+            case Stmt::Kind::Return:
+                result = evalExact(s->expr.get(), env);
+                return result ? HelperFlow::Returned : HelperFlow::Fail;
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return HelperFlow::Fail;
+        }
+        return HelperFlow::Fail;
+    }
+
+    optional<int32_t> exactLoopHelperValue(
+        const Expr *call, const Model &model, const Matrix &current,
+        const vector<optional<int32_t>> *base) const {
+        const Function *function = exactLoopHelperCallShape(call);
+        if (!function) return nullopt;
+        ExactEnv env(static_cast<size_t>(function->fastLocalCount));
+        for (size_t i = 0; i < call->args.size(); ++i) {
+            auto value = exactTransformExpr(call->args[i].get(), model, current, base);
+            if (!value) return nullopt;
+            env[i] = *value;
+        }
+        optional<int32_t> result;
+        return summarizeExactHelperStmt(function->body.get(), env, result) ==
+                       HelperFlow::Returned
+            ? result : nullopt;
+    }
+
     optional<int32_t> exactHelperCall(
         const Expr *call, const Model &model, const Matrix &current,
         const vector<optional<int32_t>> *base) const {
-        const Function *function = branchHelperCall(call);
-        if (!function) return nullopt;
-        vector<const Expr *> args;
-        args.reserve(call->args.size());
-        for (auto &arg : call->args) args.push_back(arg.get());
-        optional<int32_t> result;
-        return exactHelperStmt(function->body.get(), args, model, current,
-                               base, result) == HelperFlow::Returned
-            ? result : nullopt;
+        if (const Function *function = branchHelperCall(call)) {
+            vector<const Expr *> args;
+            args.reserve(call->args.size());
+            for (auto &arg : call->args) args.push_back(arg.get());
+            optional<int32_t> result;
+            if (exactHelperStmt(function->body.get(), args, model, current,
+                                base, result) == HelperFlow::Returned) {
+                return result;
+            }
+        }
+        return exactLoopHelperValue(call, model, current, base);
     }
 
     optional<int32_t> exactTransformExpr(
@@ -3063,13 +3349,20 @@ private:
     bool affineHelperCall(const Expr *call, const Model &model,
                           const Matrix &current, Row &out,
                           const vector<optional<int32_t>> *base) const {
-        const Function *function = branchHelperCall(call);
-        if (!function) return false;
-        vector<const Expr *> args;
-        args.reserve(call->args.size());
-        for (auto &arg : call->args) args.push_back(arg.get());
-        return affineHelperStmt(function->body.get(), args, model, current,
-                                base, out) == HelperFlow::Returned;
+        if (const Function *function = branchHelperCall(call)) {
+            vector<const Expr *> args;
+            args.reserve(call->args.size());
+            for (auto &arg : call->args) args.push_back(arg.get());
+            if (affineHelperStmt(function->body.get(), args, model, current,
+                                 base, out) == HelperFlow::Returned) {
+                return true;
+            }
+        }
+        auto exact = exactLoopHelperValue(call, model, current, base);
+        if (!exact) return false;
+        out.assign(current.size(), 0);
+        out.back() = static_cast<uint32_t>(*exact);
+        return true;
     }
 
     bool affineExpr(const Expr *e, const Model &model,
@@ -3299,9 +3592,20 @@ private:
                        (key != inductionKey && hasExactInvariantValue(key, env, model));
             }
             case Expr::Kind::Call:
-                return !params && periodicHelperCall(
-                    e, inductionKey, env, model, phaseExactKeys,
-                    moduli, sawPeriodic, true);
+                if (params) return false;
+                if (periodicHelperCall(e, inductionKey, env, model,
+                                       phaseExactKeys, moduli,
+                                       sawPeriodic, true)) {
+                    return true;
+                }
+                if (!exactLoopHelperCallShape(e)) return false;
+                for (auto &arg : e->args) {
+                    if (!phaseExactExpr(arg.get(), inductionKey, env, model,
+                                        phaseExactKeys, moduli, sawPeriodic)) {
+                        return false;
+                    }
+                }
+                return true;
             case Expr::Kind::Unary:
                 return phaseExactExpr(e->lhs.get(), inductionKey, env, model,
                                       phaseExactKeys, moduli, sawPeriodic, params);
@@ -3487,12 +3791,13 @@ private:
 
     bool buildPeriodicClosed(const Stmt *loop, const ExactEnv &env,
                              const Model &model, CountedLoop &counted,
-                             Matrix &closed) const {
-        static constexpr uint64_t kMaxPeriodicPhases = 256;
+                             Matrix &closed,
+                             bool requireProfitability = true) const {
+        static constexpr uint64_t kMaxPeriodicPhases = 4096;
 
         optional<int32_t> step;
         if (!findUnconditionalStep(loop->body.get(), counted.inductionKey, env, step) ||
-            !step || *step <= 0 || counted.start < 0) {
+            !step || *step == 0 || counted.start < 0) {
             return false;
         }
         counted.step = *step;
@@ -3500,6 +3805,16 @@ private:
         if (!trip) return false;
         counted.trips = trip->first;
         counted.finalValue = trip->second;
+        if (counted.trips == 0) {
+            closed = identityMatrix(static_cast<int>(model.keys.size()) + 1);
+            return true;
+        }
+        int64_t lastPhaseValue = static_cast<int64_t>(counted.start) +
+            static_cast<int64_t>(counted.trips - 1) * counted.step;
+        if (lastPhaseValue < 0 ||
+            lastPhaseValue > numeric_limits<int32_t>::max()) {
+            return false;
+        }
 
         vector<int32_t> moduli;
         bool sawPeriodic = false;
@@ -3511,17 +3826,21 @@ private:
         }
 
         uint64_t period = 1;
-        uint64_t unsignedStep = static_cast<uint64_t>(counted.step);
+        uint64_t stepMagnitude = counted.step < 0
+            ? static_cast<uint64_t>(-static_cast<int64_t>(counted.step))
+            : static_cast<uint64_t>(counted.step);
         for (int32_t divisor : moduli) {
             uint64_t modulus = static_cast<uint64_t>(divisor);
-            uint64_t phaseCount = modulus / std::gcd(modulus, unsignedStep % modulus);
+            uint64_t phaseCount = modulus /
+                std::gcd(modulus, stepMagnitude % modulus);
             uint64_t common = std::gcd(period, phaseCount);
             uint64_t factor = phaseCount / common;
             if (period > kMaxPeriodicPhases / factor) return false;
             period *= factor;
         }
         if (period == 0 || period > kMaxPeriodicPhases ||
-            counted.trips < max<uint64_t>(8, period * 2)) {
+            (requireProfitability &&
+             counted.trips < max<uint64_t>(8, period * 2))) {
             return false;
         }
 
@@ -3529,10 +3848,11 @@ private:
         const int dimension = states + 1;
         const int inductionIndex = model.index.at(counted.inductionKey);
         vector<Matrix> phases;
-        phases.reserve(static_cast<size_t>(period));
+        uint64_t phasesToBuild = min(period, counted.trips);
+        phases.reserve(static_cast<size_t>(phasesToBuild));
         Matrix periodTransform = identityMatrix(dimension);
 
-        for (uint64_t phase = 0; phase < period; ++phase) {
+        for (uint64_t phase = 0; phase < phasesToBuild; ++phase) {
             int64_t phaseValue = static_cast<int64_t>(counted.start) +
                                  static_cast<int64_t>(phase) * counted.step;
             if (phaseValue < 0 || phaseValue > numeric_limits<int32_t>::max()) return false;
@@ -3549,6 +3869,14 @@ private:
             if (static_cast<int32_t>(inductionRow.back()) != counted.step) return false;
             periodTransform = multiply(transform, periodTransform);
             phases.push_back(std::move(transform));
+        }
+
+        if (counted.trips < period) {
+            closed = identityMatrix(dimension);
+            for (const Matrix &phase : phases) {
+                closed = multiply(phase, closed);
+            }
+            return true;
         }
 
         uint64_t wholePeriods = counted.trips / period;
@@ -3864,6 +4192,8 @@ private:
     unordered_map<string, FuncInfo> funcs;
     unordered_map<string, Function *> inlineableFuncs;
     unordered_map<string, Function *> branchInlineableFuncs;
+    unordered_map<string, Function *> loopInlineableFuncs;
+    unordered_map<string, vector<int>> loopInlineRegisterSlots;
     unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
@@ -3894,6 +4224,9 @@ private:
     int nextVarReg = 0;
     int localBaseOffset = -12;
     int frameSize = 0;
+    int loopInlineScratchBaseOffset = 0;
+    int loopInlineScratchSlots = 0;
+    vector<string> loopInlineHomeRegs;
     bool frameFreeLeaf = false;
 
     static int alignTo(int x, int a) { return (x + a - 1) / a * a; }
@@ -3983,6 +4316,123 @@ private:
         adjustSp(16);
     }
 
+    enum InlineFlow : unsigned {
+        InlineFallthrough = 1u,
+        InlineReturn = 2u,
+        InlineBreak = 4u,
+        InlineContinue = 8u,
+    };
+
+    bool loopInlineExprShape(const Expr *e, int localCount, int &nodes) const {
+        if (!e) return true;
+        if (++nodes > 256 || e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Var) {
+            return !e->fastGlobal && e->fastIndex >= 0 &&
+                   e->fastIndex < localCount;
+        }
+        if (!loopInlineExprShape(e->lhs.get(), localCount, nodes) ||
+            !loopInlineExprShape(e->rhs.get(), localCount, nodes)) {
+            return false;
+        }
+        for (auto &arg : e->args) {
+            if (!loopInlineExprShape(arg.get(), localCount, nodes)) return false;
+        }
+        return true;
+    }
+
+    bool loopInlineStmtShape(const Stmt *s, int loopDepth, int localCount,
+                             const unordered_set<int> &mutableSlots, int &nodes,
+                             bool &hasLoop, unsigned &flow) const {
+        if (!s) {
+            flow = InlineFallthrough;
+            return true;
+        }
+        if (++nodes > 256) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                unsigned aggregate = InlineFallthrough;
+                for (auto &child : s->stmts) {
+                    unsigned childFlow = 0;
+                    if (!loopInlineStmtShape(child.get(), loopDepth, localCount,
+                                             mutableSlots, nodes, hasLoop, childFlow)) {
+                        return false;
+                    }
+                    if (aggregate & InlineFallthrough) {
+                        aggregate = (aggregate & ~InlineFallthrough) | childFlow;
+                    }
+                }
+                flow = aggregate;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::ExprStmt:
+                if (!loopInlineExprShape(s->expr.get(), localCount, nodes)) return false;
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::DeclStmt:
+                if (!s->decl || !s->decl->init || s->decl->fastSlot < 0 ||
+                    s->decl->fastSlot >= localCount ||
+                    !loopInlineExprShape(s->decl->init.get(), localCount, nodes)) {
+                    return false;
+                }
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::Assign:
+                if (s->fastAssignGlobal || s->fastAssignIndex < 0 ||
+                    s->fastAssignIndex >= localCount ||
+                    !mutableSlots.count(s->fastAssignIndex) ||
+                    !loopInlineExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                flow = InlineFallthrough;
+                return true;
+            case Stmt::Kind::If: {
+                if (!loopInlineExprShape(s->expr.get(), localCount, nodes)) return false;
+                unsigned thenFlow = 0;
+                unsigned elseFlow = InlineFallthrough;
+                if (!loopInlineStmtShape(s->thenStmt.get(), loopDepth, localCount,
+                                         mutableSlots, nodes, hasLoop, thenFlow)) {
+                    return false;
+                }
+                if (s->elseStmt &&
+                    !loopInlineStmtShape(s->elseStmt.get(), loopDepth, localCount,
+                                         mutableSlots, nodes, hasLoop, elseFlow)) {
+                    return false;
+                }
+                flow = thenFlow | elseFlow;
+                return true;
+            }
+            case Stmt::Kind::While: {
+                if (!loopInlineExprShape(s->expr.get(), localCount, nodes)) return false;
+                hasLoop = true;
+                unsigned bodyFlow = 0;
+                if (!loopInlineStmtShape(s->body.get(), loopDepth + 1, localCount,
+                                         mutableSlots, nodes, hasLoop, bodyFlow)) {
+                    return false;
+                }
+                flow = InlineFallthrough | (bodyFlow & InlineReturn);
+                return true;
+            }
+            case Stmt::Kind::Break:
+                if (loopDepth <= 0) return false;
+                flow = InlineBreak;
+                return true;
+            case Stmt::Kind::Continue:
+                if (loopDepth <= 0) return false;
+                flow = InlineContinue;
+                return true;
+            case Stmt::Kind::Return:
+                if (!s->expr || !loopInlineExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                flow = InlineReturn;
+                return true;
+        }
+        return false;
+    }
+
     bool branchInlineStmtShape(const Stmt *s, const unordered_set<string> &params,
                                int &nodes, bool &alwaysReturns) const {
         alwaysReturns = false;
@@ -4059,6 +4509,48 @@ private:
                     bool alwaysReturns = false;
                     if (branchInlineStmtShape(body, params, nodes, alwaysReturns) && alwaysReturns) {
                         branchInlineableFuncs[function->name] = function;
+                    }
+                    nodes = 0;
+                    bool hasLoop = false;
+                    unsigned flow = 0;
+                    unordered_set<int> mutableSlots;
+                    for (int slot = 0; slot < static_cast<int>(function->params.size());
+                         ++slot) {
+                        mutableSlots.insert(slot);
+                    }
+                    std::function<void(const Stmt *)> collectMutableSlots =
+                        [&](const Stmt *stmt) {
+                            if (!stmt) return;
+                            if (stmt->kind == Stmt::Kind::DeclStmt && stmt->decl &&
+                                !stmt->decl->isConst) {
+                                mutableSlots.insert(stmt->decl->fastSlot);
+                            }
+                            for (auto &child : stmt->stmts) {
+                                collectMutableSlots(child.get());
+                            }
+                            collectMutableSlots(stmt->thenStmt.get());
+                            collectMutableSlots(stmt->elseStmt.get());
+                            collectMutableSlots(stmt->body.get());
+                        };
+                    collectMutableSlots(body);
+                    if (function->fastLocalCount >=
+                            static_cast<int>(function->params.size()) &&
+                        function->fastLocalCount <= 32 &&
+                        loopInlineStmtShape(body, 0, function->fastLocalCount,
+                                            mutableSlots, nodes, hasLoop, flow) &&
+                        hasLoop && flow == InlineReturn) {
+                        loopInlineableFuncs[function->name] = function;
+                        vector<uint64_t> weights(
+                            static_cast<size_t>(function->fastLocalCount), 0);
+                        collectSlotUses(body, 0, weights);
+                        vector<int> ranked(mutableSlots.begin(), mutableSlots.end());
+                        sort(ranked.begin(), ranked.end(), [&](int lhs, int rhs) {
+                            uint64_t lhsWeight = weights[static_cast<size_t>(lhs)];
+                            uint64_t rhsWeight = weights[static_cast<size_t>(rhs)];
+                            if (lhsWeight != rhsWeight) return lhsWeight > rhsWeight;
+                            return lhs < rhs;
+                        });
+                        loopInlineRegisterSlots[function->name] = std::move(ranked);
                     }
                 }
             }
@@ -4321,6 +4813,41 @@ private:
         return result;
     }
 
+    int maxLoopInlineScratch(const Expr *e) const {
+        if (!e) return 0;
+        int result = 0;
+        if (e->kind == Expr::Kind::Call) {
+            auto found = loopInlineableFuncs.find(e->name);
+            if (found != loopInlineableFuncs.end() &&
+                e->args.size() == found->second->params.size()) {
+                bool eligibleArgs = true;
+                for (auto &arg : e->args) {
+                    eligibleArgs = eligibleArgs && !hasCall(arg.get());
+                }
+                if (eligibleArgs) result = found->second->fastLocalCount;
+            }
+        }
+        result = max(result, maxLoopInlineScratch(e->lhs.get()));
+        result = max(result, maxLoopInlineScratch(e->rhs.get()));
+        for (auto &arg : e->args) {
+            result = max(result, maxLoopInlineScratch(arg.get()));
+        }
+        return result;
+    }
+
+    int maxLoopInlineScratch(const Stmt *s) const {
+        if (!s) return 0;
+        int result = maxLoopInlineScratch(s->expr.get());
+        if (s->decl) result = max(result, maxLoopInlineScratch(s->decl->init.get()));
+        for (auto &child : s->stmts) {
+            result = max(result, maxLoopInlineScratch(child.get()));
+        }
+        result = max(result, maxLoopInlineScratch(s->thenStmt.get()));
+        result = max(result, maxLoopInlineScratch(s->elseStmt.get()));
+        result = max(result, maxLoopInlineScratch(s->body.get()));
+        return result;
+    }
+
     bool stmtAlwaysJumps(const Stmt *s) const {
         if (!s) return false;
         switch (s->kind) {
@@ -4418,6 +4945,27 @@ private:
         hoistScanBranchInlineStmt(s->elseStmt.get(), mult, w);
     }
 
+    void hoistScanLoopInlineStmt(const Stmt *s, int loopDepth,
+                                 long long outerMult,
+                                 unordered_map<long long, long long> &w) const {
+        if (!s || s->fastDeadStore) return;
+        long long mult = outerMult * (1LL << (3 * min(loopDepth, 7)));
+        if (s->kind == Stmt::Kind::While) {
+            long long inner = outerMult * (1LL << (3 * min(loopDepth + 1, 7)));
+            hoistScanExpr(s->expr.get(), inner, w);
+            hoistScanLoopInlineStmt(s->body.get(), loopDepth + 1, outerMult, w);
+            return;
+        }
+        if (s->expr) hoistScanExpr(s->expr.get(), mult, w);
+        if (s->decl && s->decl->init) hoistScanExpr(s->decl->init.get(), mult, w);
+        for (auto &child : s->stmts) {
+            hoistScanLoopInlineStmt(child.get(), loopDepth, outerMult, w);
+        }
+        hoistScanLoopInlineStmt(s->thenStmt.get(), loopDepth, outerMult, w);
+        hoistScanLoopInlineStmt(s->elseStmt.get(), loopDepth, outerMult, w);
+        hoistScanLoopInlineStmt(s->body.get(), loopDepth, outerMult, w);
+    }
+
     void hoistScanExpr(const Expr *e, long long mult, unordered_map<long long, long long> &w) const {
         if (!e) return;
         if (e->kind == Expr::Kind::Call) {
@@ -4427,6 +4975,15 @@ private:
                 bool pureArgs = true;
                 for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
                 if (pureArgs) hoistScanBranchInlineStmt(branch->second->body.get(), mult, w);
+            }
+            auto loop = loopInlineableFuncs.find(e->name);
+            if (loop != loopInlineableFuncs.end()) {
+                bool pureArgs = true;
+                for (auto &arg : e->args) pureArgs = pureArgs && !exprHasCall(arg.get());
+                if (pureArgs) {
+                    hoistScanLoopInlineStmt(loop->second->body.get(), 0,
+                                            max(1LL, mult), w);
+                }
             }
             return;
         }
@@ -4691,6 +5248,7 @@ private:
         cachedGlobals.clear();
         cachedGlobalRegs.clear();
         int slots = countSlots(f);
+        loopInlineScratchSlots = maxLoopInlineScratch(f.body.get());
         static const vector<string> allSavedRegs = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
         };
@@ -4805,20 +5363,43 @@ private:
                 });
             }
         }
+        loopInlineHomeRegs.clear();
+        if (!frameFreeLeaf && loopInlineScratchSlots > 0) {
+            unordered_set<string> usedRegs;
+            for (int i = 0; i < usedRegCount; ++i) {
+                usedRegs.insert(allVarRegs[static_cast<size_t>(i)]);
+            }
+            for (const string &reg : allSavedRegs) {
+                if (!usedRegs.count(reg)) loopInlineHomeRegs.push_back(reg);
+            }
+            for (const string &reg : leafRegs) {
+                if (!usedRegs.count(reg)) loopInlineHomeRegs.push_back(reg);
+            }
+        }
         savedVarRegs.clear();
         if (!frameFreeLeaf) {
             for (int i = 0; i < usedRegCount; ++i) {
                 const string &reg = allVarRegs[static_cast<size_t>(i)];
                 if (!reg.empty() && reg[0] == 's') savedVarRegs.push_back(reg);
             }
+            for (const string &reg : loopInlineHomeRegs) {
+                if (!reg.empty() && reg[0] == 's' &&
+                    find(savedVarRegs.begin(), savedVarRegs.end(), reg) ==
+                        savedVarRegs.end()) {
+                    savedVarRegs.push_back(reg);
+                }
+            }
         }
         allocableVarRegs.assign(allVarRegs.begin(), allVarRegs.begin() + varRegCap);
         frameSize = frameFreeLeaf
             ? 0
-            : alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 + slots * 4, 16);
+            : alignTo(8 + static_cast<int>(savedVarRegs.size()) * 4 +
+                          (slots + loopInlineScratchSlots) * 4,
+                      16);
         nextSlot = 0;
         nextVarReg = 0;
         localBaseOffset = -12 - static_cast<int>(savedVarRegs.size()) * 4;
+        loopInlineScratchBaseOffset = localBaseOffset - slots * 4;
         scopes.clear();
         breakLabels.clear();
         continueLabels.clear();
@@ -6022,6 +6603,157 @@ private:
         }
     }
 
+    unordered_map<int, Symbol> loopInlineSlotHomes(const Function &function) const {
+        unordered_map<int, Symbol> homes;
+        auto ranked = loopInlineRegisterSlots.find(function.name);
+        if (ranked == loopInlineRegisterSlots.end()) return homes;
+        for (int slot = 0; slot < function.fastLocalCount; ++slot) {
+            homes[slot] = Symbol{false, 0, false, "",
+                                 loopInlineScratchBaseOffset - slot * 4, ""};
+        }
+        for (size_t rank = 0; rank < ranked->second.size(); ++rank) {
+            if (rank >= loopInlineHomeRegs.size()) break;
+            int slot = ranked->second[rank];
+            auto found = homes.find(slot);
+            if (found != homes.end()) found->second.reg = loopInlineHomeRegs[rank];
+        }
+        return homes;
+    }
+
+    void genInlineLoopStmt(const Stmt *s, const string &endLabel,
+                           const unordered_map<int, Symbol> &slotHomes) {
+        if (!s) return;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                enterScope();
+                for (auto &child : s->stmts) {
+                    genInlineLoopStmt(child.get(), endLabel, slotHomes);
+                    if (stmtAlwaysJumps(child.get())) break;
+                }
+                leaveScope();
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return;
+            case Stmt::Kind::DeclStmt: {
+                const Decl &decl = *s->decl;
+                if (decl.isConst) {
+                    long long value = foldConst(decl.init.get());
+                    scopes.back()[decl.name] = Symbol{true, value, false, "", 0, ""};
+                    return;
+                }
+                auto home = slotHomes.find(decl.fastSlot);
+                if (home == slotHomes.end() || home->second.isConst ||
+                    home->second.isGlobal) {
+                    throw logic_error("invalid loop-inline local slot");
+                }
+                scopes.back()[decl.name] = home->second;
+                genExprNoCall(decl.init.get(), "a0",
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                storeVarFrom(decl.name, "a0");
+                return;
+            }
+            case Stmt::Kind::Assign: {
+                auto symbol = lookup(s->name);
+                if (!symbol || symbol->isConst || symbol->isGlobal) {
+                    throw logic_error("invalid loop-inline assignment");
+                }
+                genExprNoCall(s->expr.get(), "a0",
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                storeVarFrom(s->name, "a0");
+                return;
+            }
+            case Stmt::Kind::If: {
+                string elseLabel = newLabel("loop_inline_else");
+                string afterLabel = newLabel("loop_inline_endif");
+                genCondFalse(s->expr.get(), elseLabel);
+                genInlineLoopStmt(s->thenStmt.get(), endLabel, slotHomes);
+                if (s->elseStmt) {
+                    emit("j " + afterLabel);
+                    emitLabel(elseLabel);
+                    genInlineLoopStmt(s->elseStmt.get(), endLabel, slotHomes);
+                    emitLabel(afterLabel);
+                } else {
+                    emitLabel(elseLabel);
+                }
+                return;
+            }
+            case Stmt::Kind::While: {
+                auto constCond = tryConst(s->expr.get());
+                if (constCond && !*constCond) return;
+                string bodyLabel = newLabel("loop_inline_while_body");
+                string condLabel = newLabel("loop_inline_while_cond");
+                string afterLabel = newLabel("loop_inline_while_end");
+                if (!constCond) genCondFalse(s->expr.get(), afterLabel);
+                emitLabel(bodyLabel);
+                breakLabels.push_back(afterLabel);
+                continueLabels.push_back(condLabel);
+                genInlineLoopStmt(s->body.get(), endLabel, slotHomes);
+                continueLabels.pop_back();
+                breakLabels.pop_back();
+                emitLabel(condLabel);
+                if (constCond) emit("j " + bodyLabel);
+                else genCondTrue(s->expr.get(), bodyLabel);
+                emitLabel(afterLabel);
+                return;
+            }
+            case Stmt::Kind::Break:
+                if (breakLabels.empty()) throw logic_error("invalid loop-inline break");
+                emit("j " + breakLabels.back());
+                return;
+            case Stmt::Kind::Continue:
+                if (continueLabels.empty()) throw logic_error("invalid loop-inline continue");
+                emit("j " + continueLabels.back());
+                return;
+            case Stmt::Kind::Return:
+                genExprNoCall(s->expr.get(), "a0",
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                emit("j " + endLabel);
+                return;
+        }
+        throw logic_error("invalid loop-inline statement");
+    }
+
+    bool tryGenLoopInlineCall(const Expr *e, const string &dst) {
+        if (dst != "a0") return false;
+        auto found = loopInlineableFuncs.find(e->name);
+        if (found == loopInlineableFuncs.end()) return false;
+        Function *function = found->second;
+        if (e->args.size() != function->params.size()) return false;
+        for (auto &arg : e->args) {
+            if (hasCall(arg.get())) return false;
+        }
+
+        unordered_map<int, Symbol> slotHomes = loopInlineSlotHomes(*function);
+        if (static_cast<int>(slotHomes.size()) != function->fastLocalCount) {
+            return false;
+        }
+        for (size_t i = 0; i < e->args.size(); ++i) {
+            const Symbol &home = slotHomes[static_cast<int>(i)];
+            if (!home.reg.empty()) {
+                genExprNoCall(e->args[i].get(), home.reg,
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+            } else {
+                genExprNoCall(e->args[i].get(), "a0",
+                              {"t0", "t1", "t2", "t3", "t4", "t5"});
+                storeMem("a0", "s0", home.offset);
+            }
+        }
+
+        auto callerScopes = std::move(scopes);
+        scopes.clear();
+        enterScope();
+        for (size_t i = 0; i < function->params.size(); ++i) {
+            scopes.back()[function->params[i]] = slotHomes[static_cast<int>(i)];
+        }
+        string endLabel = newLabel("loop_inline_return");
+        genInlineLoopStmt(function->body.get(), endLabel, slotHomes);
+        emitLabel(endLabel);
+        leaveScope();
+        scopes = std::move(callerScopes);
+        return true;
+    }
+
     bool tryGenInlineCall(const Expr *e, const string &dst) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
@@ -6047,7 +6779,7 @@ private:
         // destination.
         if (dst != "a0") return false;
         auto branch = branchInlineableFuncs.find(e->name);
-        if (branch == branchInlineableFuncs.end()) return false;
+        if (branch == branchInlineableFuncs.end()) return tryGenLoopInlineCall(e, dst);
         Function *f = branch->second;
         if (e->args.size() != f->params.size()) return false;
         for (auto &arg : e->args) {
