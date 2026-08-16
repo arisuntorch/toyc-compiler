@@ -247,6 +247,7 @@ struct Stmt {
     bool fastAssignGlobal = false;
     int fastAssignIndex = -1;
     bool fastDeadStore = false;
+    bool fastLoopValuesDead = false;
     int fastLoopId = -1;
     unique_ptr<Expr> expr;
     unique_ptr<Stmt> thenStmt;
@@ -421,6 +422,7 @@ private:
         // The analysis may be rerun after an AST rewrite.  Do not retain a
         // dead-store decision made for the pre-rewrite control-flow graph.
         stmt->fastDeadStore = false;
+        stmt->fastLoopValuesDead = false;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
                 scopes.push_back({});
@@ -481,6 +483,38 @@ private:
         for (auto &arg : expr->args) addReads(arg.get(), live);
     }
 
+    static bool loopWritesAreUnobservable(const Stmt *stmt,
+                                          const unordered_set<int> &liveAfter) {
+        if (!stmt) return true;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) {
+                    if (!loopWritesAreUnobservable(child.get(), liveAfter)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !hasCall(stmt->expr.get());
+            case Stmt::Kind::Assign:
+                return !stmt->fastAssignGlobal && !hasCall(stmt->expr.get()) &&
+                       !liveAfter.count(stmt->fastAssignIndex);
+            case Stmt::Kind::DeclStmt:
+                return stmt->decl && !hasCall(stmt->decl->init.get()) &&
+                       !liveAfter.count(stmt->decl->fastSlot);
+            case Stmt::Kind::If:
+                return !hasCall(stmt->expr.get()) &&
+                       loopWritesAreUnobservable(stmt->thenStmt.get(), liveAfter) &&
+                       loopWritesAreUnobservable(stmt->elseStmt.get(), liveAfter);
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
     // Backward data-flow analysis.  A local store can be removed only when its
     // value is not live and its right-hand side cannot call another function.
     // Loops are solved to a fixpoint; break and continue use their real target
@@ -523,6 +557,10 @@ private:
             }
             case Stmt::Kind::While: {
                 const unordered_set<int> after = live;
+                if (mark) {
+                    stmt->fastLoopValuesDead = !hasCall(stmt->expr.get()) &&
+                        loopWritesAreUnobservable(stmt->body.get(), after);
+                }
                 unordered_set<int> head = after;
                 addReads(stmt->expr.get(), head);
                 for (int iteration = 0; iteration < 32; ++iteration) {
@@ -2493,6 +2531,143 @@ private:
         return false;
     }
 
+    static void collectExprKeys(const Expr *e, unordered_set<int> &keys) {
+        if (!e) return;
+        if (e->kind == Expr::Kind::Var) {
+            int key = exprKey(e);
+            if (key >= 0) keys.insert(key);
+            return;
+        }
+        collectExprKeys(e->lhs.get(), keys);
+        collectExprKeys(e->rhs.get(), keys);
+        for (auto &arg : e->args) collectExprKeys(arg.get(), keys);
+    }
+
+    static void collectModifiedKeys(const Stmt *s, unordered_set<int> &keys) {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign) {
+            int key = assignKey(s);
+            if (key >= 0) keys.insert(key);
+        } else if (s->kind == Stmt::Kind::DeclStmt && s->decl && s->decl->fastSlot >= 0) {
+            keys.insert(s->decl->fastSlot);
+        }
+        for (auto &child : s->stmts) collectModifiedKeys(child.get(), keys);
+        collectModifiedKeys(s->thenStmt.get(), keys);
+        collectModifiedKeys(s->elseStmt.get(), keys);
+        collectModifiedKeys(s->body.get(), keys);
+    }
+
+    static bool stmtWritesKey(const Stmt *s, int key) {
+        if (!s) return false;
+        if (s->kind == Stmt::Kind::Assign && assignKey(s) == key) return true;
+        if (s->kind == Stmt::Kind::DeclStmt && s->decl && s->decl->fastSlot == key) return true;
+        for (auto &child : s->stmts) {
+            if (stmtWritesKey(child.get(), key)) return true;
+        }
+        return stmtWritesKey(s->thenStmt.get(), key) ||
+               stmtWritesKey(s->elseStmt.get(), key) ||
+               stmtWritesKey(s->body.get(), key);
+    }
+
+    bool inductionDelta(const Expr *e, int inductionKey, const ExactEnv &env,
+                        int32_t &delta) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var && exprKey(e) == inductionKey) {
+            delta = 0;
+            return true;
+        }
+        if (e->kind == Expr::Kind::Unary && e->op == "+") {
+            return inductionDelta(e->lhs.get(), inductionKey, env, delta);
+        }
+        if (e->kind != Expr::Kind::Binary) return false;
+
+        int32_t nested = 0;
+        if ((e->op == "+" || e->op == "-") &&
+            inductionDelta(e->lhs.get(), inductionKey, env, nested)) {
+            auto constant = evalExact(e->rhs.get(), env);
+            if (!constant) return false;
+            delta = e->op == "+" ? add32(nested, *constant)
+                                   : sub32(nested, *constant);
+            return true;
+        }
+        if (e->op == "+" && inductionDelta(e->rhs.get(), inductionKey, env, nested)) {
+            auto constant = evalExact(e->lhs.get(), env);
+            if (!constant) return false;
+            delta = add32(*constant, nested);
+            return true;
+        }
+        return false;
+    }
+
+    bool findUnconditionalStep(const Stmt *s, int inductionKey, const ExactEnv &env,
+                               optional<int32_t> &step) const {
+        if (!s) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!findUnconditionalStep(child.get(), inductionKey, env, step)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::DeclStmt:
+                return true;
+            case Stmt::Kind::Assign:
+                if (assignKey(s) != inductionKey) return true;
+                if (step) return false;
+                int32_t delta;
+                if (!inductionDelta(s->expr.get(), inductionKey, env, delta) || delta == 0) {
+                    return false;
+                }
+                step = delta;
+                return true;
+            case Stmt::Kind::If:
+                // A path-dependent induction update changes the trip count.
+                return !stmtWritesKey(s, inductionKey);
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool tryDropDeadLoop(unique_ptr<Stmt> &stmt, const ExactEnv &env,
+                         CountedLoop &counted, unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->fastLoopValuesDead ||
+            !extractCondition(stmt->expr.get(), env, counted)) {
+            return false;
+        }
+
+        unordered_set<int> modified;
+        collectModifiedKeys(stmt->body.get(), modified);
+        unordered_set<int> boundKeys;
+        collectExprKeys(counted.boundExpr, boundKeys);
+        for (int key : modified) {
+            if (boundKeys.count(key)) return false;
+        }
+
+        optional<int32_t> step;
+        if (!findUnconditionalStep(stmt->body.get(), counted.inductionKey, env, step) || !step) {
+            return false;
+        }
+        counted.step = *step;
+        auto trip = tripCount(counted);
+        if (!trip) return false;
+        counted.trips = trip->first;
+        counted.finalValue = trip->second;
+
+        for (int key : modified) {
+            if (!isGlobalKey(key)) modifiedLocals.insert(key);
+        }
+        auto empty = make_unique<Stmt>();
+        empty->kind = Stmt::Kind::Empty;
+        stmt = std::move(empty);
+        changed = true;
+        return true;
+    }
+
     static void addModelKey(Model &model, int key, const string &name) {
         if (key < 0 || model.index.count(key)) return;
         model.index[key] = static_cast<int>(model.keys.size());
@@ -2887,6 +3062,14 @@ private:
             case Stmt::Kind::While: {
                 CountedLoop counted;
                 unordered_set<int> modified;
+                if (tryDropDeadLoop(stmt, env, counted, modified)) {
+                    for (int slot : modified) {
+                        if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                            env[static_cast<size_t>(slot)] = nullopt;
+                        }
+                    }
+                    return;
+                }
                 if (trySummarize(stmt, env, counted, modified)) {
                     for (int slot : modified) {
                         if (slot >= 0 && slot < static_cast<int>(env.size())) {
