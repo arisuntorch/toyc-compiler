@@ -47,8 +47,10 @@ def main() -> int:
         print("[FAIL] run `make` first", file=sys.stderr)
         return 1
 
+    generated: dict[str, str] = {}
     for name, source in CASES.items():
         asm = compile_source(source)
+        generated[name] = asm
         lines = asm.splitlines()
         has_runtime_branch = any(
             opcode in asm for opcode in ("blt ", "bge ", "bnez ", "beqz ")
@@ -60,6 +62,35 @@ def main() -> int:
             print(f"[FAIL] {name}: expected runtime loop/control-flow code", file=sys.stderr)
             return 1
         print(f"[OK] {name}: {len(lines)} assembly lines")
+
+    if ".Lwhile_body" in generated["hot_loop"]:
+        print("[FAIL] hot_loop: affine recurrence was not lowered", file=sys.stderr)
+        return 1
+
+    dead_loop = compile_source(
+        "int main(){int i=0;int junk=1;while(i<1000000000){"
+        "if(i%2==0){junk=junk+i;}else{junk=junk*3;}i=i+1;}return 42;}"
+    )
+    if ".Lwhile_body" in dead_loop:
+        print("[FAIL] dead_loop: finite unobservable loop was not removed", file=sys.stderr)
+        return 1
+
+    fallback_cases = {
+        "non_affine": (
+            "int main(){int i=0;int x=2;while(i<100){x=x*x+1;i=i+1;}return x;}"
+        ),
+        "changing_bound": (
+            "int main(){int i=0;int n=100;while(i<n){n=n+1;i=i+1;}return i;}"
+        ),
+        "wrapping_induction": (
+            "int main(){int i=2147483640;while(i<2147483647){i=i+100;}return i;}"
+        ),
+    }
+    for name, source in fallback_cases.items():
+        if ".Lwhile_body" not in compile_source(source):
+            print(f"[FAIL] {name}: unsafe loop optimization did not fall back", file=sys.stderr)
+            return 1
+        print(f"[OK] {name}: retained runtime loop")
 
     print("[DONE] compiler uses static analysis and emits runtime RISC-V code")
     return 0
