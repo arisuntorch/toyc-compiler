@@ -418,6 +418,9 @@ private:
     void resolveStmt(Stmt *stmt, vector<unordered_map<string, int>> &scopes,
                      int &nextLocal) {
         if (!stmt) return;
+        // The analysis may be rerun after an AST rewrite.  Do not retain a
+        // dead-store decision made for the pre-rewrite control-flow graph.
+        stmt->fastDeadStore = false;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
                 scopes.push_back({});
@@ -2233,6 +2236,687 @@ private:
         e->lhs = std::move(lhs);
         e->rhs = std::move(rhs);
         return e;
+    }
+};
+
+// Closed-form optimization for straight-line affine counted loops.
+//
+// For a loop whose body is a sequence of affine assignments, one iteration is
+// a matrix transformation over 32-bit wrapping integers.  If local constant
+// data flow proves the initial induction value, invariant bound, monotonic
+// step, and exact finite trip count, exponentiating that matrix gives the same
+// final state without executing the loop in the compiler.  The rewritten AST
+// keeps an entry-condition branch and computes the final values at runtime.
+class AffineLoopOptimizer {
+public:
+    explicit AffineLoopOptimizer(Program &program) : prog(program) {}
+
+    bool run() {
+        collectProgramInfo();
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func || item.func->fastLocalCount < 0) continue;
+            ExactEnv env(static_cast<size_t>(item.func->fastLocalCount));
+            optimizeStmt(item.func->body, env);
+        }
+        return changed;
+    }
+
+private:
+    static constexpr int kGlobalBit = 1 << 30;
+    using ExactEnv = vector<optional<int32_t>>;
+    using Row = vector<uint32_t>;
+    using Matrix = vector<Row>;
+
+    struct CountedLoop {
+        int inductionKey = -1;
+        string relation;
+        const Expr *boundExpr = nullptr;
+        int32_t start = 0;
+        int32_t bound = 0;
+        int32_t step = 0;
+        int32_t finalValue = 0;
+        uint64_t trips = 0;
+    };
+
+    struct Model {
+        vector<int> keys;
+        unordered_map<int, int> index;
+        unordered_map<int, string> names;
+        unordered_set<int> modified;
+        unordered_set<int> transient;
+        vector<pair<int, const Expr *>> assignments;
+    };
+
+    Program &prog;
+    unordered_map<int, int32_t> exactGlobals;
+    unordered_set<int> constGlobals;
+    unordered_set<string> usedNames;
+    int freshId = 0;
+    bool changed = false;
+
+    static int exprKey(const Expr *e) {
+        if (!e || e->kind != Expr::Kind::Var || e->fastIndex < 0) return -1;
+        return e->fastGlobal ? (kGlobalBit | e->fastIndex) : e->fastIndex;
+    }
+
+    static int assignKey(const Stmt *s) {
+        if (!s || s->kind != Stmt::Kind::Assign || s->fastAssignIndex < 0) return -1;
+        return s->fastAssignGlobal ? (kGlobalBit | s->fastAssignIndex) : s->fastAssignIndex;
+    }
+
+    static bool isGlobalKey(int key) {
+        return key >= 0 && (key & kGlobalBit) != 0;
+    }
+
+    static int globalIndex(int key) {
+        return key & ~kGlobalBit;
+    }
+
+    void collectProgramInfo() {
+        int global = 0;
+        for (auto &item : prog.items) {
+            if (item.kind == TopItem::Kind::Decl) {
+                usedNames.insert(item.decl->name);
+                if (item.decl->isConst) {
+                    if (auto value = foldConstExpr(item.decl->init.get())) {
+                        exactGlobals[global] = *value;
+                    }
+                    constGlobals.insert(global);
+                }
+                ++global;
+            } else {
+                usedNames.insert(item.func->name);
+                for (const string &param : item.func->params) usedNames.insert(param);
+                collectNames(item.func->body.get());
+            }
+        }
+    }
+
+    void collectNames(const Stmt *s) {
+        if (!s) return;
+        if (!s->name.empty()) usedNames.insert(s->name);
+        if (s->decl) usedNames.insert(s->decl->name);
+        for (auto &child : s->stmts) collectNames(child.get());
+        collectNames(s->thenStmt.get());
+        collectNames(s->elseStmt.get());
+        collectNames(s->body.get());
+    }
+
+    string freshName() {
+        while (true) {
+            string name = "__toyc_affine_" + to_string(freshId++);
+            if (usedNames.insert(name).second) return name;
+        }
+    }
+
+    optional<int32_t> evalExact(const Expr *e, const ExactEnv &env) const {
+        if (!e) return nullopt;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var:
+                if (e->fastGlobal) {
+                    auto found = exactGlobals.find(e->fastIndex);
+                    return found == exactGlobals.end() ? nullopt
+                                                       : optional<int32_t>(found->second);
+                }
+                if (e->fastIndex < 0 || e->fastIndex >= static_cast<int>(env.size())) return nullopt;
+                return env[static_cast<size_t>(e->fastIndex)];
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto value = evalExact(e->lhs.get(), env);
+                if (!value) return nullopt;
+                if (e->op == "+") return *value;
+                if (e->op == "-") return sub32(0, *value);
+                if (e->op == "!") return !truthy(*value);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->op == "&&") {
+                    auto lhs = evalExact(e->lhs.get(), env);
+                    if (!lhs) return nullopt;
+                    if (!truthy(*lhs)) return 0;
+                    auto rhs = evalExact(e->rhs.get(), env);
+                    return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
+                }
+                if (e->op == "||") {
+                    auto lhs = evalExact(e->lhs.get(), env);
+                    if (!lhs) return nullopt;
+                    if (truthy(*lhs)) return 1;
+                    auto rhs = evalExact(e->rhs.get(), env);
+                    return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
+                }
+                auto lhs = evalExact(e->lhs.get(), env);
+                auto rhs = evalExact(e->rhs.get(), env);
+                if (!lhs || !rhs) return nullopt;
+                if (e->op == "+") return add32(*lhs, *rhs);
+                if (e->op == "-") return sub32(*lhs, *rhs);
+                if (e->op == "*") return mul32(*lhs, *rhs);
+                if (e->op == "/") return *rhs == 0 ? nullopt : optional<int32_t>(div32(*lhs, *rhs));
+                if (e->op == "%") return *rhs == 0 ? nullopt : optional<int32_t>(mod32(*lhs, *rhs));
+                if (e->op == "<") return *lhs < *rhs;
+                if (e->op == ">") return *lhs > *rhs;
+                if (e->op == "<=") return *lhs <= *rhs;
+                if (e->op == ">=") return *lhs >= *rhs;
+                if (e->op == "==") return *lhs == *rhs;
+                if (e->op == "!=") return *lhs != *rhs;
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
+    static string reverseRelation(const string &op) {
+        if (op == "<") return ">";
+        if (op == "<=") return ">=";
+        if (op == ">") return "<";
+        if (op == ">=") return "<=";
+        return "";
+    }
+
+    bool extractCondition(const Expr *condition, const ExactEnv &env,
+                          CountedLoop &loop) const {
+        if (!condition || condition->kind != Expr::Kind::Binary) return false;
+        static const unordered_set<string> relations = {"<", "<=", ">", ">="};
+        if (!relations.count(condition->op)) return false;
+
+        const Expr *induction = condition->lhs.get();
+        loop.boundExpr = condition->rhs.get();
+        loop.relation = condition->op;
+        if (!induction || induction->kind != Expr::Kind::Var || induction->fastGlobal) {
+            induction = condition->rhs.get();
+            loop.boundExpr = condition->lhs.get();
+            loop.relation = reverseRelation(condition->op);
+        }
+        if (!induction || induction->kind != Expr::Kind::Var || induction->fastGlobal ||
+            loop.relation.empty()) {
+            return false;
+        }
+        loop.inductionKey = exprKey(induction);
+        auto start = evalExact(induction, env);
+        auto bound = evalExact(loop.boundExpr, env);
+        if (!start || !bound) return false;
+        loop.start = *start;
+        loop.bound = *bound;
+        return true;
+    }
+
+    static optional<pair<uint64_t, int32_t>> tripCount(const CountedLoop &loop) {
+        int64_t start = loop.start;
+        int64_t bound = loop.bound;
+        int64_t step = loop.step;
+        uint64_t trips = 0;
+        int64_t finalValue = start;
+
+        if (loop.relation == "<" || loop.relation == "<=") {
+            if (step <= 0) return nullopt;
+            bool enters = loop.relation == "<" ? start < bound : start <= bound;
+            if (enters) {
+                uint64_t distance = static_cast<uint64_t>(bound - start);
+                trips = loop.relation == "<"
+                    ? (distance + static_cast<uint64_t>(step) - 1) / static_cast<uint64_t>(step)
+                    : distance / static_cast<uint64_t>(step) + 1;
+                finalValue = start + static_cast<int64_t>(trips) * step;
+            }
+        } else if (loop.relation == ">" || loop.relation == ">=") {
+            if (step >= 0) return nullopt;
+            bool enters = loop.relation == ">" ? start > bound : start >= bound;
+            if (enters) {
+                uint64_t magnitude = static_cast<uint64_t>(-step);
+                uint64_t distance = static_cast<uint64_t>(start - bound);
+                trips = loop.relation == ">"
+                    ? (distance + magnitude - 1) / magnitude
+                    : distance / magnitude + 1;
+                finalValue = start - static_cast<int64_t>(trips) * static_cast<int64_t>(magnitude);
+            }
+        } else {
+            return nullopt;
+        }
+
+        // If the induction update would wrap, the signed relational loop need
+        // not terminate at the algebraic trip count.  Keep the original loop.
+        if (finalValue < numeric_limits<int32_t>::min() ||
+            finalValue > numeric_limits<int32_t>::max()) {
+            return nullopt;
+        }
+        return pair<uint64_t, int32_t>{trips, static_cast<int32_t>(finalValue)};
+    }
+
+    static bool exprHasCallLocal(const Expr *e) {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Call) return true;
+        if (exprHasCallLocal(e->lhs.get()) || exprHasCallLocal(e->rhs.get())) return true;
+        for (auto &arg : e->args) {
+            if (exprHasCallLocal(arg.get())) return true;
+        }
+        return false;
+    }
+
+    static void addModelKey(Model &model, int key, const string &name) {
+        if (key < 0 || model.index.count(key)) return;
+        model.index[key] = static_cast<int>(model.keys.size());
+        model.keys.push_back(key);
+        model.names[key] = name;
+    }
+
+    static bool collectExprVars(const Expr *e, Model &model) {
+        if (!e) return true;
+        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Var) {
+            int key = exprKey(e);
+            if (key < 0) return false;
+            addModelKey(model, key, e->name);
+            return true;
+        }
+        if (!collectExprVars(e->lhs.get(), model) || !collectExprVars(e->rhs.get(), model)) {
+            return false;
+        }
+        for (auto &arg : e->args) {
+            if (!collectExprVars(arg.get(), model)) return false;
+        }
+        return true;
+    }
+
+    static bool collectBody(const Stmt *s, Model &model) {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!collectBody(child.get(), model)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::Assign: {
+                int key = assignKey(s);
+                if (key < 0 || !collectExprVars(s->expr.get(), model)) return false;
+                addModelKey(model, key, s->name);
+                model.modified.insert(key);
+                model.assignments.push_back({key, s->expr.get()});
+                return true;
+            }
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || s->decl->fastSlot < 0 ||
+                    !collectExprVars(s->decl->init.get(), model)) {
+                    return false;
+                }
+                int key = s->decl->fastSlot;
+                addModelKey(model, key, s->decl->name);
+                model.modified.insert(key);
+                model.transient.insert(key);
+                model.assignments.push_back({key, s->decl->init.get()});
+                return true;
+            }
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallLocal(s->expr.get());
+            case Stmt::Kind::If:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    static bool constRow(const Row &row) {
+        for (size_t i = 0; i + 1 < row.size(); ++i) {
+            if (row[i] != 0) return false;
+        }
+        return true;
+    }
+
+    static bool affineExpr(const Expr *e, const Model &model,
+                           const Matrix &current, Row &out) {
+        const int dimension = static_cast<int>(current.size());
+        out.assign(static_cast<size_t>(dimension), 0);
+        if (!e) return false;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                out.back() = static_cast<uint32_t>(wrap32(e->value));
+                return true;
+            case Expr::Kind::Var: {
+                auto found = model.index.find(exprKey(e));
+                if (found == model.index.end()) return false;
+                out = current[static_cast<size_t>(found->second)];
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                Row value;
+                if (!affineExpr(e->lhs.get(), model, current, value)) return false;
+                if (e->op == "+") {
+                    out = std::move(value);
+                    return true;
+                }
+                if (e->op == "-") {
+                    for (int i = 0; i < dimension; ++i) out[static_cast<size_t>(i)] = 0u - value[static_cast<size_t>(i)];
+                    return true;
+                }
+                return false;
+            }
+            case Expr::Kind::Binary: {
+                Row lhs, rhs;
+                if (!affineExpr(e->lhs.get(), model, current, lhs) ||
+                    !affineExpr(e->rhs.get(), model, current, rhs)) {
+                    return false;
+                }
+                if (e->op == "+" || e->op == "-") {
+                    for (int i = 0; i < dimension; ++i) {
+                        out[static_cast<size_t>(i)] = e->op == "+"
+                            ? lhs[static_cast<size_t>(i)] + rhs[static_cast<size_t>(i)]
+                            : lhs[static_cast<size_t>(i)] - rhs[static_cast<size_t>(i)];
+                    }
+                    return true;
+                }
+                if (e->op == "*") {
+                    if (constRow(lhs)) {
+                        uint32_t factor = lhs.back();
+                        for (int i = 0; i < dimension; ++i) {
+                            out[static_cast<size_t>(i)] = static_cast<uint32_t>(
+                                static_cast<uint64_t>(rhs[static_cast<size_t>(i)]) * factor);
+                        }
+                        return true;
+                    }
+                    if (constRow(rhs)) {
+                        uint32_t factor = rhs.back();
+                        for (int i = 0; i < dimension; ++i) {
+                            out[static_cast<size_t>(i)] = static_cast<uint32_t>(
+                                static_cast<uint64_t>(lhs[static_cast<size_t>(i)]) * factor);
+                        }
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    static Matrix multiply(const Matrix &lhs, const Matrix &rhs) {
+        const int n = static_cast<int>(lhs.size());
+        Matrix out(static_cast<size_t>(n), Row(static_cast<size_t>(n), 0));
+        for (int i = 0; i < n; ++i) {
+            for (int k = 0; k < n; ++k) {
+                uint32_t factor = lhs[static_cast<size_t>(i)][static_cast<size_t>(k)];
+                if (factor == 0) continue;
+                for (int j = 0; j < n; ++j) {
+                    out[static_cast<size_t>(i)][static_cast<size_t>(j)] +=
+                        static_cast<uint32_t>(static_cast<uint64_t>(factor) *
+                                              rhs[static_cast<size_t>(k)][static_cast<size_t>(j)]);
+                }
+            }
+        }
+        return out;
+    }
+
+    static Matrix power(Matrix base, uint64_t exponent) {
+        const int n = static_cast<int>(base.size());
+        Matrix result(static_cast<size_t>(n), Row(static_cast<size_t>(n), 0));
+        for (int i = 0; i < n; ++i) result[static_cast<size_t>(i)][static_cast<size_t>(i)] = 1;
+        while (exponent != 0) {
+            if (exponent & 1u) result = multiply(result, base);
+            exponent >>= 1u;
+            if (exponent != 0) base = multiply(base, base);
+        }
+        return result;
+    }
+
+    static unique_ptr<Expr> varExpr(const string &name) {
+        auto expr = make_unique<Expr>();
+        expr->kind = Expr::Kind::Var;
+        expr->name = name;
+        return expr;
+    }
+
+    static unique_ptr<Expr> binaryExpr(string op, unique_ptr<Expr> lhs,
+                                       unique_ptr<Expr> rhs) {
+        auto expr = make_unique<Expr>();
+        expr->kind = Expr::Kind::Binary;
+        expr->op = std::move(op);
+        expr->lhs = std::move(lhs);
+        expr->rhs = std::move(rhs);
+        return expr;
+    }
+
+    static unique_ptr<Stmt> declStmt(const string &name, unique_ptr<Expr> init) {
+        auto stmt = make_unique<Stmt>();
+        stmt->kind = Stmt::Kind::DeclStmt;
+        stmt->decl = make_unique<Decl>();
+        stmt->decl->name = name;
+        stmt->decl->init = std::move(init);
+        return stmt;
+    }
+
+    static unique_ptr<Stmt> assignStmt(const string &name, unique_ptr<Expr> value) {
+        auto stmt = make_unique<Stmt>();
+        stmt->kind = Stmt::Kind::Assign;
+        stmt->name = name;
+        stmt->expr = std::move(value);
+        return stmt;
+    }
+
+    static unique_ptr<Expr> finalExpr(const Row &row, const Model &model,
+                                      const unordered_map<int, string> &temporaries) {
+        unique_ptr<Expr> sum;
+        auto append = [&](unique_ptr<Expr> term) {
+            if (!sum) sum = std::move(term);
+            else sum = binaryExpr("+", std::move(sum), std::move(term));
+        };
+
+        for (size_t i = 0; i < model.keys.size(); ++i) {
+            uint32_t coefficient = row[i];
+            if (coefficient == 0) continue;
+            int key = model.keys[i];
+            string source = model.names.at(key);
+            auto temp = temporaries.find(key);
+            if (temp != temporaries.end()) source = temp->second;
+            unique_ptr<Expr> term = varExpr(source);
+            if (coefficient != 1) {
+                term = binaryExpr("*", std::move(term),
+                                  makeNumberExpr(static_cast<int32_t>(coefficient)));
+            }
+            append(std::move(term));
+        }
+        uint32_t constant = row.back();
+        if (constant != 0 || !sum) append(makeNumberExpr(static_cast<int32_t>(constant)));
+        return sum;
+    }
+
+    bool trySummarize(unique_ptr<Stmt> &stmt, const ExactEnv &env,
+                      CountedLoop &counted, unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            exprHasCallLocal(stmt->expr.get())) {
+            return false;
+        }
+        if (!extractCondition(stmt->expr.get(), env, counted)) return false;
+
+        Model model;
+        addModelKey(model, counted.inductionKey, stmt->expr->lhs &&
+                    exprKey(stmt->expr->lhs.get()) == counted.inductionKey
+                        ? stmt->expr->lhs->name : stmt->expr->rhs->name);
+        if (!collectBody(stmt->body.get(), model) ||
+            model.keys.size() > 32 || !model.modified.count(counted.inductionKey)) {
+            return false;
+        }
+        for (int key : model.modified) {
+            if (isGlobalKey(key) && constGlobals.count(globalIndex(key))) return false;
+        }
+
+        unordered_set<int> boundKeys;
+        Model boundModel;
+        if (!collectExprVars(counted.boundExpr, boundModel)) return false;
+        for (int key : boundModel.keys) boundKeys.insert(key);
+        for (int key : model.modified) {
+            if (boundKeys.count(key)) return false;
+        }
+
+        const int states = static_cast<int>(model.keys.size());
+        const int dimension = states + 1;
+        Matrix transform(static_cast<size_t>(dimension), Row(static_cast<size_t>(dimension), 0));
+        for (int i = 0; i < dimension; ++i) {
+            transform[static_cast<size_t>(i)][static_cast<size_t>(i)] = 1;
+        }
+        for (auto &[key, expression] : model.assignments) {
+            Row row;
+            if (!affineExpr(expression, model, transform, row)) return false;
+            transform[static_cast<size_t>(model.index.at(key))] = std::move(row);
+        }
+
+        int inductionIndex = model.index.at(counted.inductionKey);
+        const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
+        for (int i = 0; i < states; ++i) {
+            uint32_t expected = i == inductionIndex ? 1u : 0u;
+            if (inductionRow[static_cast<size_t>(i)] != expected) return false;
+        }
+        counted.step = static_cast<int32_t>(inductionRow.back());
+        auto trip = tripCount(counted);
+        if (!trip) return false;
+        counted.trips = trip->first;
+        counted.finalValue = trip->second;
+        if (counted.trips == 0) {
+            auto empty = make_unique<Stmt>();
+            empty->kind = Stmt::Kind::Empty;
+            stmt = std::move(empty);
+            changed = true;
+            return true;
+        }
+        if (counted.trips < 8) return false;
+
+        Matrix closed = power(std::move(transform), counted.trips);
+        vector<int> persistent;
+        for (int key : model.keys) {
+            if (model.modified.count(key) && !model.transient.count(key)) persistent.push_back(key);
+        }
+        if (persistent.empty()) return false;
+        for (int key : persistent) {
+            const Row &row = closed[static_cast<size_t>(model.index.at(key))];
+            for (int transient : model.transient) {
+                if (row[static_cast<size_t>(model.index.at(transient))] != 0) return false;
+            }
+        }
+
+        unordered_map<int, string> temporaries;
+        auto wrapper = make_unique<Stmt>();
+        wrapper->kind = Stmt::Kind::Block;
+        for (int key : persistent) {
+            string temporary = freshName();
+            temporaries[key] = temporary;
+            wrapper->stmts.push_back(declStmt(temporary, varExpr(model.names.at(key))));
+            if (!isGlobalKey(key)) modifiedLocals.insert(key);
+        }
+
+        auto guarded = make_unique<Stmt>();
+        guarded->kind = Stmt::Kind::If;
+        guarded->expr = std::move(stmt->expr);
+        guarded->thenStmt = make_unique<Stmt>();
+        guarded->thenStmt->kind = Stmt::Kind::Block;
+        for (int key : persistent) {
+            const Row &row = closed[static_cast<size_t>(model.index.at(key))];
+            guarded->thenStmt->stmts.push_back(
+                assignStmt(model.names.at(key), finalExpr(row, model, temporaries)));
+        }
+        wrapper->stmts.push_back(std::move(guarded));
+        stmt = std::move(wrapper);
+        changed = true;
+        return true;
+    }
+
+    static void collectAssignedLocals(const Stmt *s, unordered_set<int> &slots) {
+        if (!s) return;
+        if (s->kind == Stmt::Kind::Assign && !s->fastAssignGlobal && s->fastAssignIndex >= 0) {
+            slots.insert(s->fastAssignIndex);
+        } else if (s->kind == Stmt::Kind::DeclStmt && s->decl && s->decl->fastSlot >= 0) {
+            slots.insert(s->decl->fastSlot);
+        }
+        for (auto &child : s->stmts) collectAssignedLocals(child.get(), slots);
+        collectAssignedLocals(s->thenStmt.get(), slots);
+        collectAssignedLocals(s->elseStmt.get(), slots);
+        collectAssignedLocals(s->body.get(), slots);
+    }
+
+    static ExactEnv mergeEnvs(const ExactEnv &lhs, const ExactEnv &rhs) {
+        ExactEnv out = lhs;
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (!lhs[i] || !rhs[i] || *lhs[i] != *rhs[i]) out[i] = nullopt;
+        }
+        return out;
+    }
+
+    void optimizeStmt(unique_ptr<Stmt> &stmt, ExactEnv &env) {
+        if (!stmt) return;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) optimizeStmt(child, env);
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (stmt->decl && stmt->decl->fastSlot >= 0 &&
+                    stmt->decl->fastSlot < static_cast<int>(env.size())) {
+                    env[static_cast<size_t>(stmt->decl->fastSlot)] =
+                        evalExact(stmt->decl->init.get(), env);
+                }
+                return;
+            case Stmt::Kind::Assign:
+                if (!stmt->fastAssignGlobal && stmt->fastAssignIndex >= 0 &&
+                    stmt->fastAssignIndex < static_cast<int>(env.size())) {
+                    env[static_cast<size_t>(stmt->fastAssignIndex)] = evalExact(stmt->expr.get(), env);
+                }
+                return;
+            case Stmt::Kind::If: {
+                auto condition = evalExact(stmt->expr.get(), env);
+                if (condition) {
+                    if (truthy(*condition)) optimizeStmt(stmt->thenStmt, env);
+                    else optimizeStmt(stmt->elseStmt, env);
+                    return;
+                }
+                ExactEnv thenEnv = env;
+                ExactEnv elseEnv = env;
+                optimizeStmt(stmt->thenStmt, thenEnv);
+                optimizeStmt(stmt->elseStmt, elseEnv);
+                env = mergeEnvs(thenEnv, elseEnv);
+                return;
+            }
+            case Stmt::Kind::While: {
+                CountedLoop counted;
+                unordered_set<int> modified;
+                if (trySummarize(stmt, env, counted, modified)) {
+                    for (int slot : modified) {
+                        if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                            env[static_cast<size_t>(slot)] = nullopt;
+                        }
+                    }
+                    if (counted.inductionKey >= 0 && !isGlobalKey(counted.inductionKey) &&
+                        counted.inductionKey < static_cast<int>(env.size())) {
+                        env[static_cast<size_t>(counted.inductionKey)] = counted.finalValue;
+                    }
+                    return;
+                }
+
+                unordered_set<int> assigned;
+                collectAssignedLocals(stmt->body.get(), assigned);
+                ExactEnv bodyEnv = env;
+                for (int slot : assigned) {
+                    if (slot >= 0 && slot < static_cast<int>(bodyEnv.size())) {
+                        bodyEnv[static_cast<size_t>(slot)] = nullopt;
+                    }
+                }
+                optimizeStmt(stmt->body, bodyEnv);
+                for (int slot : assigned) {
+                    if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                        env[static_cast<size_t>(slot)] = nullopt;
+                    }
+                }
+                return;
+            }
+        }
     }
 };
 
@@ -4557,11 +5241,20 @@ int main(int argc, char **argv) {
     StaticAnalyzer analysis(program);
     analysis.run();
 
-    // 3. Prove ranges used by safe instruction-selection shortcuts.
+    // 3. Replace statically proven affine counted loops with closed-form
+    // runtime assignments.  This transforms individual loops; it never calls
+    // or executes a ToyC function.
+    AffineLoopOptimizer loopOptimizer(program);
+    if (loopOptimizer.run()) {
+        StaticAnalyzer rewrittenAnalysis(program);
+        rewrittenAnalysis.run();
+    }
+
+    // 4. Prove ranges used by safe instruction-selection shortcuts.
     RangeAnalyzer rangeAnalysis(program);
     rangeAnalysis.run();
 
-    // 4. Emit the actual runtime RISC-V32 program.
+    // 5. Emit the actual runtime RISC-V32 program.
     CodeGen codegen(program);
     cout << codegen.generate();
     return 0;
