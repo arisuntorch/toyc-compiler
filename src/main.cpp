@@ -2326,9 +2326,12 @@ private:
         unordered_set<int> transient;
     };
 
+    enum class HelperFlow { Fallthrough, Returned, Fail };
+
     Program &prog;
     unordered_map<int, int32_t> exactGlobals;
     unordered_set<int> constGlobals;
+    unordered_map<string, const Function *> branchHelpers;
     unordered_set<string> usedNames;
     int freshId = 0;
     bool changed = false;
@@ -2351,6 +2354,62 @@ private:
         return key & ~kGlobalBit;
     }
 
+    static bool branchHelperShape(const Stmt *s,
+                                  const unordered_set<string> &params,
+                                  int &nodes, bool &alwaysReturns) {
+        alwaysReturns = false;
+        if (!s || ++nodes > 64) return false;
+        switch (s->kind) {
+            case Stmt::Kind::Block: {
+                bool returned = false;
+                for (auto &child : s->stmts) {
+                    if (returned) break;
+                    bool childReturns = false;
+                    if (!branchHelperShape(child.get(), params, nodes, childReturns)) {
+                        return false;
+                    }
+                    returned = childReturns;
+                }
+                alwaysReturns = returned;
+                return true;
+            }
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::If: {
+                if (!s->expr || exprHasCall(s->expr.get()) ||
+                    !exprUsesOnlyVars(s->expr.get(), params)) {
+                    return false;
+                }
+                bool thenReturns = false;
+                bool elseReturns = false;
+                if (!branchHelperShape(s->thenStmt.get(), params, nodes, thenReturns)) {
+                    return false;
+                }
+                if (s->elseStmt &&
+                    !branchHelperShape(s->elseStmt.get(), params, nodes, elseReturns)) {
+                    return false;
+                }
+                alwaysReturns = thenReturns && s->elseStmt && elseReturns;
+                return true;
+            }
+            case Stmt::Kind::Return:
+                if (!s->expr || exprHasCall(s->expr.get()) ||
+                    !exprUsesOnlyVars(s->expr.get(), params)) {
+                    return false;
+                }
+                alwaysReturns = true;
+                return true;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return false;
+        }
+        return false;
+    }
+
     void collectProgramInfo() {
         int global = 0;
         for (auto &item : prog.items) {
@@ -2367,6 +2426,16 @@ private:
                 usedNames.insert(item.func->name);
                 for (const string &param : item.func->params) usedNames.insert(param);
                 collectNames(item.func->body.get());
+                if (!item.func->returnsVoid) {
+                    unordered_set<string> params(item.func->params.begin(),
+                                                 item.func->params.end());
+                    int nodes = 0;
+                    bool alwaysReturns = false;
+                    if (branchHelperShape(item.func->body.get(), params, nodes,
+                                          alwaysReturns) && alwaysReturns) {
+                        branchHelpers[item.func->name] = item.func.get();
+                    }
+                }
             }
         }
     }
@@ -2388,12 +2457,18 @@ private:
         }
     }
 
-    optional<int32_t> evalExact(const Expr *e, const ExactEnv &env) const {
+    optional<int32_t> evalExact(
+        const Expr *e, const ExactEnv &env,
+        const vector<const Expr *> *params = nullptr) const {
         if (!e) return nullopt;
         switch (e->kind) {
             case Expr::Kind::Number:
                 return wrap32(e->value);
             case Expr::Kind::Var:
+                if (params && !e->fastGlobal && e->fastIndex >= 0 &&
+                    e->fastIndex < static_cast<int>(params->size())) {
+                    return evalExact((*params)[static_cast<size_t>(e->fastIndex)], env);
+                }
                 if (e->fastGlobal) {
                     auto found = exactGlobals.find(e->fastIndex);
                     return found == exactGlobals.end() ? nullopt
@@ -2404,7 +2479,7 @@ private:
             case Expr::Kind::Call:
                 return nullopt;
             case Expr::Kind::Unary: {
-                auto value = evalExact(e->lhs.get(), env);
+                auto value = evalExact(e->lhs.get(), env, params);
                 if (!value) return nullopt;
                 if (e->op == "+") return *value;
                 if (e->op == "-") return sub32(0, *value);
@@ -2413,21 +2488,21 @@ private:
             }
             case Expr::Kind::Binary: {
                 if (e->op == "&&") {
-                    auto lhs = evalExact(e->lhs.get(), env);
+                    auto lhs = evalExact(e->lhs.get(), env, params);
                     if (!lhs) return nullopt;
                     if (!truthy(*lhs)) return 0;
-                    auto rhs = evalExact(e->rhs.get(), env);
+                    auto rhs = evalExact(e->rhs.get(), env, params);
                     return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
                 }
                 if (e->op == "||") {
-                    auto lhs = evalExact(e->lhs.get(), env);
+                    auto lhs = evalExact(e->lhs.get(), env, params);
                     if (!lhs) return nullopt;
                     if (truthy(*lhs)) return 1;
-                    auto rhs = evalExact(e->rhs.get(), env);
+                    auto rhs = evalExact(e->rhs.get(), env, params);
                     return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
                 }
-                auto lhs = evalExact(e->lhs.get(), env);
-                auto rhs = evalExact(e->rhs.get(), env);
+                auto lhs = evalExact(e->lhs.get(), env, params);
+                auto rhs = evalExact(e->rhs.get(), env, params);
                 if (!lhs || !rhs) return nullopt;
                 if (e->op == "+") return add32(*lhs, *rhs);
                 if (e->op == "-") return sub32(*lhs, *rhs);
@@ -2532,16 +2607,23 @@ private:
         return false;
     }
 
-    static void collectExprKeys(const Expr *e, unordered_set<int> &keys) {
+    static void collectExprKeys(
+        const Expr *e, unordered_set<int> &keys,
+        const vector<const Expr *> *params = nullptr) {
         if (!e) return;
         if (e->kind == Expr::Kind::Var) {
+            if (params && !e->fastGlobal && e->fastIndex >= 0 &&
+                e->fastIndex < static_cast<int>(params->size())) {
+                collectExprKeys((*params)[static_cast<size_t>(e->fastIndex)], keys);
+                return;
+            }
             int key = exprKey(e);
             if (key >= 0) keys.insert(key);
             return;
         }
-        collectExprKeys(e->lhs.get(), keys);
-        collectExprKeys(e->rhs.get(), keys);
-        for (auto &arg : e->args) collectExprKeys(arg.get(), keys);
+        collectExprKeys(e->lhs.get(), keys, params);
+        collectExprKeys(e->rhs.get(), keys, params);
+        for (auto &arg : e->args) collectExprKeys(arg.get(), keys, params);
     }
 
     static void collectModifiedKeys(const Stmt *s, unordered_set<int> &keys) {
@@ -2676,9 +2758,28 @@ private:
         model.names[key] = name;
     }
 
-    static bool collectExprVars(const Expr *e, Model &model) {
+    const Function *branchHelperCall(const Expr *e) const {
+        if (!e || e->kind != Expr::Kind::Call) return nullptr;
+        auto found = branchHelpers.find(e->name);
+        if (found == branchHelpers.end() ||
+            e->args.size() != found->second->params.size()) {
+            return nullptr;
+        }
+        for (auto &arg : e->args) {
+            if (exprHasCallLocal(arg.get())) return nullptr;
+        }
+        return found->second;
+    }
+
+    bool collectExprVars(const Expr *e, Model &model) const {
         if (!e) return true;
-        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Call) {
+            if (!branchHelperCall(e)) return false;
+            for (auto &arg : e->args) {
+                if (!collectExprVars(arg.get(), model)) return false;
+            }
+            return true;
+        }
         if (e->kind == Expr::Kind::Var) {
             int key = exprKey(e);
             if (key < 0) return false;
@@ -2694,7 +2795,7 @@ private:
         return true;
     }
 
-    static bool collectBody(const Stmt *s, Model &model) {
+    bool collectBody(const Stmt *s, Model &model) const {
         if (!s || s->fastDeadStore) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
@@ -2723,7 +2824,7 @@ private:
                 return true;
             }
             case Stmt::Kind::ExprStmt:
-                return !exprHasCallLocal(s->expr.get());
+                return collectExprVars(s->expr.get(), model);
             case Stmt::Kind::If:
                 return collectExprVars(s->expr.get(), model) &&
                        collectBody(s->thenStmt.get(), model) &&
@@ -2737,14 +2838,74 @@ private:
         return false;
     }
 
-    static optional<int32_t> exactTransformExpr(
+    HelperFlow exactHelperStmt(
+        const Stmt *s, const vector<const Expr *> &args,
+        const Model &model, const Matrix &current,
+        const vector<optional<int32_t>> *base, optional<int32_t> &result) const {
+        if (!s) return HelperFlow::Fallthrough;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    HelperFlow flow = exactHelperStmt(child.get(), args, model,
+                                                      current, base, result);
+                    if (flow != HelperFlow::Fallthrough) return flow;
+                }
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::Empty:
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::If: {
+                auto condition = exactTransformExpr(s->expr.get(), model, current,
+                                                    base, &args);
+                if (!condition) return HelperFlow::Fail;
+                const Stmt *branch = truthy(*condition) ? s->thenStmt.get()
+                                                        : s->elseStmt.get();
+                return branch ? exactHelperStmt(branch, args, model, current,
+                                                 base, result)
+                              : HelperFlow::Fallthrough;
+            }
+            case Stmt::Kind::Return:
+                result = exactTransformExpr(s->expr.get(), model, current, base, &args);
+                return result ? HelperFlow::Returned : HelperFlow::Fail;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return HelperFlow::Fail;
+        }
+        return HelperFlow::Fail;
+    }
+
+    optional<int32_t> exactHelperCall(
+        const Expr *call, const Model &model, const Matrix &current,
+        const vector<optional<int32_t>> *base) const {
+        const Function *function = branchHelperCall(call);
+        if (!function) return nullopt;
+        vector<const Expr *> args;
+        args.reserve(call->args.size());
+        for (auto &arg : call->args) args.push_back(arg.get());
+        optional<int32_t> result;
+        return exactHelperStmt(function->body.get(), args, model, current,
+                               base, result) == HelperFlow::Returned
+            ? result : nullopt;
+    }
+
+    optional<int32_t> exactTransformExpr(
         const Expr *e, const Model &model, const Matrix &current,
-        const vector<optional<int32_t>> *base = nullptr) {
+        const vector<optional<int32_t>> *base = nullptr,
+        const vector<const Expr *> *params = nullptr) const {
         if (!e) return nullopt;
         switch (e->kind) {
             case Expr::Kind::Number:
                 return wrap32(e->value);
             case Expr::Kind::Var: {
+                if (params && !e->fastGlobal && e->fastIndex >= 0 &&
+                    e->fastIndex < static_cast<int>(params->size())) {
+                    return exactTransformExpr(
+                        (*params)[static_cast<size_t>(e->fastIndex)],
+                        model, current, base);
+                }
                 auto found = model.index.find(exprKey(e));
                 if (found == model.index.end()) return nullopt;
                 const Row &row = current[static_cast<size_t>(found->second)];
@@ -2761,9 +2922,9 @@ private:
                 return static_cast<int32_t>(value);
             }
             case Expr::Kind::Call:
-                return nullopt;
+                return params ? nullopt : exactHelperCall(e, model, current, base);
             case Expr::Kind::Unary: {
-                auto value = exactTransformExpr(e->lhs.get(), model, current, base);
+                auto value = exactTransformExpr(e->lhs.get(), model, current, base, params);
                 if (!value) return nullopt;
                 if (e->op == "+") return *value;
                 if (e->op == "-") return sub32(0, *value);
@@ -2772,21 +2933,21 @@ private:
             }
             case Expr::Kind::Binary: {
                 if (e->op == "&&") {
-                    auto lhs = exactTransformExpr(e->lhs.get(), model, current, base);
+                    auto lhs = exactTransformExpr(e->lhs.get(), model, current, base, params);
                     if (!lhs) return nullopt;
                     if (!truthy(*lhs)) return 0;
-                    auto rhs = exactTransformExpr(e->rhs.get(), model, current, base);
+                    auto rhs = exactTransformExpr(e->rhs.get(), model, current, base, params);
                     return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
                 }
                 if (e->op == "||") {
-                    auto lhs = exactTransformExpr(e->lhs.get(), model, current, base);
+                    auto lhs = exactTransformExpr(e->lhs.get(), model, current, base, params);
                     if (!lhs) return nullopt;
                     if (truthy(*lhs)) return 1;
-                    auto rhs = exactTransformExpr(e->rhs.get(), model, current, base);
+                    auto rhs = exactTransformExpr(e->rhs.get(), model, current, base, params);
                     return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
                 }
-                auto lhs = exactTransformExpr(e->lhs.get(), model, current, base);
-                auto rhs = exactTransformExpr(e->rhs.get(), model, current, base);
+                auto lhs = exactTransformExpr(e->lhs.get(), model, current, base, params);
+                auto rhs = exactTransformExpr(e->rhs.get(), model, current, base, params);
                 if (!lhs || !rhs) return nullopt;
                 if (e->op == "+") return add32(*lhs, *rhs);
                 if (e->op == "-") return sub32(*lhs, *rhs);
@@ -2805,9 +2966,9 @@ private:
         return nullopt;
     }
 
-    static bool applyBodyTransform(
+    bool applyBodyTransform(
         const Stmt *s, const Model &model, Matrix &transform,
-        const vector<optional<int32_t>> *base = nullptr) {
+        const vector<optional<int32_t>> *base = nullptr) const {
         if (!s || s->fastDeadStore) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
@@ -2860,9 +3021,61 @@ private:
         return true;
     }
 
-    static bool affineExpr(const Expr *e, const Model &model,
-                           const Matrix &current, Row &out,
-                           const vector<optional<int32_t>> *base = nullptr) {
+    HelperFlow affineHelperStmt(
+        const Stmt *s, const vector<const Expr *> &args,
+        const Model &model, const Matrix &current,
+        const vector<optional<int32_t>> *base, Row &result) const {
+        if (!s) return HelperFlow::Fallthrough;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    HelperFlow flow = affineHelperStmt(child.get(), args, model,
+                                                       current, base, result);
+                    if (flow != HelperFlow::Fallthrough) return flow;
+                }
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::Empty:
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::If: {
+                auto condition = exactTransformExpr(s->expr.get(), model, current,
+                                                    base, &args);
+                if (!condition) return HelperFlow::Fail;
+                const Stmt *branch = truthy(*condition) ? s->thenStmt.get()
+                                                        : s->elseStmt.get();
+                return branch ? affineHelperStmt(branch, args, model, current,
+                                                  base, result)
+                              : HelperFlow::Fallthrough;
+            }
+            case Stmt::Kind::Return:
+                return affineExpr(s->expr.get(), model, current, result, base, &args)
+                    ? HelperFlow::Returned : HelperFlow::Fail;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return HelperFlow::Fail;
+        }
+        return HelperFlow::Fail;
+    }
+
+    bool affineHelperCall(const Expr *call, const Model &model,
+                          const Matrix &current, Row &out,
+                          const vector<optional<int32_t>> *base) const {
+        const Function *function = branchHelperCall(call);
+        if (!function) return false;
+        vector<const Expr *> args;
+        args.reserve(call->args.size());
+        for (auto &arg : call->args) args.push_back(arg.get());
+        return affineHelperStmt(function->body.get(), args, model, current,
+                                base, out) == HelperFlow::Returned;
+    }
+
+    bool affineExpr(const Expr *e, const Model &model,
+                    const Matrix &current, Row &out,
+                    const vector<optional<int32_t>> *base = nullptr,
+                    const vector<const Expr *> *params = nullptr) const {
         const int dimension = static_cast<int>(current.size());
         out.assign(static_cast<size_t>(dimension), 0);
         if (!e) return false;
@@ -2871,16 +3084,21 @@ private:
                 out.back() = static_cast<uint32_t>(wrap32(e->value));
                 return true;
             case Expr::Kind::Var: {
+                if (params && !e->fastGlobal && e->fastIndex >= 0 &&
+                    e->fastIndex < static_cast<int>(params->size())) {
+                    return affineExpr((*params)[static_cast<size_t>(e->fastIndex)],
+                                      model, current, out, base);
+                }
                 auto found = model.index.find(exprKey(e));
                 if (found == model.index.end()) return false;
                 out = current[static_cast<size_t>(found->second)];
                 return true;
             }
             case Expr::Kind::Call:
-                return false;
+                return !params && affineHelperCall(e, model, current, out, base);
             case Expr::Kind::Unary: {
                 Row value;
-                if (!affineExpr(e->lhs.get(), model, current, value, base)) return false;
+                if (!affineExpr(e->lhs.get(), model, current, value, base, params)) return false;
                 if (e->op == "+") {
                     out = std::move(value);
                     return true;
@@ -2890,7 +3108,7 @@ private:
                     return true;
                 }
                 if (base) {
-                    if (auto exact = exactTransformExpr(e, model, current, base)) {
+                    if (auto exact = exactTransformExpr(e, model, current, base, params)) {
                         out.assign(static_cast<size_t>(dimension), 0);
                         out.back() = static_cast<uint32_t>(*exact);
                         return true;
@@ -2900,8 +3118,8 @@ private:
             }
             case Expr::Kind::Binary: {
                 Row lhs, rhs;
-                bool lhsAffine = affineExpr(e->lhs.get(), model, current, lhs, base);
-                bool rhsAffine = affineExpr(e->rhs.get(), model, current, rhs, base);
+                bool lhsAffine = affineExpr(e->lhs.get(), model, current, lhs, base, params);
+                bool rhsAffine = affineExpr(e->rhs.get(), model, current, rhs, base, params);
                 if (e->op == "+" || e->op == "-") {
                     if (!lhsAffine || !rhsAffine) return false;
                     for (int i = 0; i < dimension; ++i) {
@@ -2931,7 +3149,7 @@ private:
                     }
                 }
                 if (base) {
-                    if (auto exact = exactTransformExpr(e, model, current, base)) {
+                    if (auto exact = exactTransformExpr(e, model, current, base, params)) {
                         out.assign(static_cast<size_t>(dimension), 0);
                         out.back() = static_cast<uint32_t>(*exact);
                         return true;
@@ -2988,28 +3206,122 @@ private:
         return key < static_cast<int>(env.size()) && env[static_cast<size_t>(key)].has_value();
     }
 
+    HelperFlow periodicHelperStmt(
+        const Stmt *s, const vector<const Expr *> &args,
+        int inductionKey, const ExactEnv &env, const Model &model,
+        const unordered_set<int> &phaseExactKeys,
+        vector<int32_t> &moduli, bool &sawPeriodic,
+        bool requireExactReturn) const {
+        if (!s) return HelperFlow::Fallthrough;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    HelperFlow flow = periodicHelperStmt(
+                        child.get(), args, inductionKey, env, model,
+                        phaseExactKeys, moduli, sawPeriodic, requireExactReturn);
+                    if (flow != HelperFlow::Fallthrough) return flow;
+                }
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::Empty:
+                return HelperFlow::Fallthrough;
+            case Stmt::Kind::If: {
+                if (!phaseExactExpr(s->expr.get(), inductionKey, env, model,
+                                    phaseExactKeys, moduli, sawPeriodic, &args)) {
+                    return HelperFlow::Fail;
+                }
+                HelperFlow thenFlow = periodicHelperStmt(
+                    s->thenStmt.get(), args, inductionKey, env, model,
+                    phaseExactKeys, moduli, sawPeriodic, requireExactReturn);
+                if (thenFlow == HelperFlow::Fail) return HelperFlow::Fail;
+                HelperFlow elseFlow = s->elseStmt
+                    ? periodicHelperStmt(s->elseStmt.get(), args, inductionKey,
+                                         env, model, phaseExactKeys, moduli,
+                                         sawPeriodic, requireExactReturn)
+                    : HelperFlow::Fallthrough;
+                if (elseFlow == HelperFlow::Fail) return HelperFlow::Fail;
+                return thenFlow == HelperFlow::Returned &&
+                               elseFlow == HelperFlow::Returned
+                    ? HelperFlow::Returned : HelperFlow::Fallthrough;
+            }
+            case Stmt::Kind::Return: {
+                bool valid = requireExactReturn
+                    ? phaseExactExpr(s->expr.get(), inductionKey, env, model,
+                                     phaseExactKeys, moduli, sawPeriodic, &args)
+                    : periodicAffineExpr(s->expr.get(), inductionKey, env, model,
+                                         phaseExactKeys, moduli, sawPeriodic, &args);
+                return valid ? HelperFlow::Returned : HelperFlow::Fail;
+            }
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return HelperFlow::Fail;
+        }
+        return HelperFlow::Fail;
+    }
+
+    bool periodicHelperCall(
+        const Expr *call, int inductionKey, const ExactEnv &env,
+        const Model &model, const unordered_set<int> &phaseExactKeys,
+        vector<int32_t> &moduli, bool &sawPeriodic,
+        bool requireExactReturn) const {
+        const Function *function = branchHelperCall(call);
+        if (!function) return false;
+        vector<const Expr *> args;
+        args.reserve(call->args.size());
+        for (auto &arg : call->args) args.push_back(arg.get());
+        return periodicHelperStmt(function->body.get(), args, inductionKey,
+                                  env, model, phaseExactKeys, moduli,
+                                  sawPeriodic, requireExactReturn) ==
+               HelperFlow::Returned;
+    }
+
     bool phaseExactExpr(const Expr *e, int inductionKey, const ExactEnv &env,
                         const Model &model, const unordered_set<int> &phaseExactKeys,
-                        vector<int32_t> &moduli, bool &sawPeriodic) const {
+                        vector<int32_t> &moduli, bool &sawPeriodic,
+                        const vector<const Expr *> *params = nullptr) const {
         if (!e) return false;
         switch (e->kind) {
             case Expr::Kind::Number:
                 return true;
             case Expr::Kind::Var: {
+                if (params && !e->fastGlobal && e->fastIndex >= 0 &&
+                    e->fastIndex < static_cast<int>(params->size())) {
+                    return phaseExactExpr(
+                        (*params)[static_cast<size_t>(e->fastIndex)],
+                        inductionKey, env, model, phaseExactKeys,
+                        moduli, sawPeriodic);
+                }
                 int key = exprKey(e);
                 return phaseExactKeys.count(key) ||
                        (key != inductionKey && hasExactInvariantValue(key, env, model));
             }
             case Expr::Kind::Call:
-                return false;
+                return !params && periodicHelperCall(
+                    e, inductionKey, env, model, phaseExactKeys,
+                    moduli, sawPeriodic, true);
             case Expr::Kind::Unary:
                 return phaseExactExpr(e->lhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic);
+                                      phaseExactKeys, moduli, sawPeriodic, params);
             case Expr::Kind::Binary:
-                if (e->op == "%" && exprKey(e->lhs.get()) == inductionKey) {
+                if (e->op == "%") {
+                    const Expr *dividend = e->lhs.get();
+                    if (params && dividend && dividend->kind == Expr::Kind::Var &&
+                        !dividend->fastGlobal && dividend->fastIndex >= 0 &&
+                        dividend->fastIndex < static_cast<int>(params->size())) {
+                        dividend = (*params)[static_cast<size_t>(dividend->fastIndex)];
+                    }
+                    if (exprKey(dividend) != inductionKey) {
+                        return phaseExactExpr(e->lhs.get(), inductionKey, env, model,
+                                              phaseExactKeys, moduli, sawPeriodic, params) &&
+                               phaseExactExpr(e->rhs.get(), inductionKey, env, model,
+                                              phaseExactKeys, moduli, sawPeriodic, params);
+                    }
                     unordered_set<int> divisorKeys;
-                    collectExprKeys(e->rhs.get(), divisorKeys);
-                    auto divisor = evalExact(e->rhs.get(), env);
+                    collectExprKeys(e->rhs.get(), divisorKeys, params);
+                    auto divisor = evalExact(e->rhs.get(), env, params);
                     if (!divisor || *divisor <= 0 || divisorKeys.count(inductionKey)) {
                         return false;
                     }
@@ -3018,9 +3330,9 @@ private:
                     return true;
                 }
                 return phaseExactExpr(e->lhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic) &&
+                                      phaseExactKeys, moduli, sawPeriodic, params) &&
                        phaseExactExpr(e->rhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic);
+                                      phaseExactKeys, moduli, sawPeriodic, params);
         }
         return false;
     }
@@ -3028,37 +3340,48 @@ private:
     bool periodicAffineExpr(const Expr *e, int inductionKey, const ExactEnv &env,
                             const Model &model,
                             const unordered_set<int> &phaseExactKeys,
-                            vector<int32_t> &moduli, bool &sawPeriodic) const {
+                            vector<int32_t> &moduli, bool &sawPeriodic,
+                            const vector<const Expr *> *params = nullptr) const {
         if (!e) return false;
+        if (params && e->kind == Expr::Kind::Var && !e->fastGlobal &&
+            e->fastIndex >= 0 && e->fastIndex < static_cast<int>(params->size())) {
+            return periodicAffineExpr(
+                (*params)[static_cast<size_t>(e->fastIndex)], inductionKey,
+                env, model, phaseExactKeys, moduli, sawPeriodic);
+        }
         if (phaseExactExpr(e, inductionKey, env, model, phaseExactKeys,
-                           moduli, sawPeriodic)) {
+                           moduli, sawPeriodic, params)) {
             return true;
         }
         if (e->kind == Expr::Kind::Number || e->kind == Expr::Kind::Var) return true;
-        if (e->kind == Expr::Kind::Call) return false;
+        if (e->kind == Expr::Kind::Call) {
+            return !params && periodicHelperCall(
+                e, inductionKey, env, model, phaseExactKeys,
+                moduli, sawPeriodic, false);
+        }
         if (e->kind == Expr::Kind::Unary) {
             return (e->op == "+" || e->op == "-") &&
                    periodicAffineExpr(e->lhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic);
+                                      phaseExactKeys, moduli, sawPeriodic, params);
         }
         if (e->op == "+" || e->op == "-") {
             return periodicAffineExpr(e->lhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic) &&
+                                      phaseExactKeys, moduli, sawPeriodic, params) &&
                    periodicAffineExpr(e->rhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic);
+                                      phaseExactKeys, moduli, sawPeriodic, params);
         }
         if (e->op == "*") {
             bool lhsExact = phaseExactExpr(e->lhs.get(), inductionKey, env, model,
-                                           phaseExactKeys, moduli, sawPeriodic);
+                                           phaseExactKeys, moduli, sawPeriodic, params);
             if (lhsExact && periodicAffineExpr(e->rhs.get(), inductionKey, env, model,
-                                               phaseExactKeys, moduli, sawPeriodic)) {
+                                               phaseExactKeys, moduli, sawPeriodic, params)) {
                 return true;
             }
             bool rhsExact = phaseExactExpr(e->rhs.get(), inductionKey, env, model,
-                                           phaseExactKeys, moduli, sawPeriodic);
+                                           phaseExactKeys, moduli, sawPeriodic, params);
             return rhsExact &&
                    periodicAffineExpr(e->lhs.get(), inductionKey, env, model,
-                                      phaseExactKeys, moduli, sawPeriodic);
+                                      phaseExactKeys, moduli, sawPeriodic, params);
         }
         return false;
     }

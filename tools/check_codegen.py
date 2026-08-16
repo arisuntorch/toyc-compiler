@@ -34,6 +34,18 @@ CASES = {
         "int twice(int x) { return x + x; } int main() { int i = 0; int s = 0; "
         "while (i < 1000000) { s = s + twice(i); i = i + 1; } return s; }"
     ),
+    "periodic_branch_helper": (
+        "int choose(int x, int y) { if (x == 0) { return y + 3; } "
+        "if (x == 1) { return y * 2; } return 7; } "
+        "int main() { int i = 0; int s = 0; while (i < 10000000) { "
+        "s = s + choose(i % 3, i); i = i + 1; } return s; }"
+    ),
+    "direct_periodic_branch_helper": (
+        "int choose(int x, int y) { if (x % 3 == 0) { return y + x; } "
+        "if (x % 5 == 1) { return y * 2; } return y + 7; } "
+        "int main() { int i = 0; int s = 1; while (i < 1000000) { "
+        "s = choose(i, s); i = i + 1; } return s; }"
+    ),
 }
 
 
@@ -91,6 +103,20 @@ def main() -> int:
         )
         return 1
 
+    if ".Lwhile_body" in generated["periodic_branch_helper"]:
+        print(
+            "[FAIL] periodic_branch_helper: proven pure helper was not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
+    if ".Lwhile_body" in generated["direct_periodic_branch_helper"]:
+        print(
+            "[FAIL] direct_periodic_branch_helper: helper residue proof was not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
     dead_loop = compile_source(
         "int main(){int i=0;int junk=1;while(i<1000000000){"
         "if(i%2==0){junk=junk+i;}else{junk=junk*3;}i=i+1;}return 42;}"
@@ -120,6 +146,26 @@ def main() -> int:
         "oversized_period": (
             "int main(){int i=0;int s=0;while(i<2000){"
             "if(i%257==0){s=s+i;}else{s=s+1;}i=i+1;}return s;}"
+        ),
+        "helper_state_condition": (
+            "int choose(int x,int y){if(x%3==0){return y+1;}return y*2;}"
+            "int main(){int i=0;int s=1;while(i<100){"
+            "s=s+choose(s,i);i=i+1;}return s;}"
+        ),
+        "helper_nonperiodic_condition": (
+            "int choose(int x){if(x<50){return x+1;}return x*2;}"
+            "int main(){int i=0;int s=0;while(i<100){"
+            "s=s+choose(i);i=i+1;}return s;}"
+        ),
+        "helper_global_write": (
+            "int g=0;int choose(int x){if(x%3==0){g=g+1;return x;}return 1;}"
+            "int main(){int i=0;int s=0;while(i<100){"
+            "s=s+choose(i);i=i+1;}return s+g;}"
+        ),
+        "helper_negative_phase": (
+            "int choose(int x){if(x%3==0){return x+1;}return x*2;}"
+            "int main(){int i=-5;int s=0;while(i<100){"
+            "s=s+choose(i);i=i+1;}return s;}"
         ),
     }
     for name, source in fallback_cases.items():
