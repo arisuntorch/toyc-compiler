@@ -1413,6 +1413,7 @@ public:
     void run() {
         collectInlineableFunctions();
         collectProgramNames();
+        collectLocalPureFunctions();
         // Recompute reachability and writes after each rewrite pass.  A first
         // pass can delete a constant-false call or global store, allowing the
         // next pass to prove additional globals immutable from main.
@@ -1452,6 +1453,7 @@ private:
     unordered_map<string, Function *> functions;
     unordered_set<string> globalNames;
     unordered_set<string> assignedGlobalNames;
+    unordered_set<string> localPureFunctions;
     struct LocalInfo {
         optional<int32_t> constVal;
         string copyOf;  // empty = not a copy of another local
@@ -1509,6 +1511,116 @@ private:
             if (it->count(name)) return true;
         }
         return false;
+    }
+
+    bool collectLocalPureExpr(
+        const Expr *expr, const vector<unordered_set<string>> &scopes,
+        unordered_set<string> &called) const {
+        if (!expr) return true;
+        if (expr->kind == Expr::Kind::Var) {
+            return scopeContains(scopes, expr->name);
+        }
+        if (expr->kind == Expr::Kind::Call) {
+            if (!functions.count(expr->name)) return false;
+            called.insert(expr->name);
+        }
+        if (!collectLocalPureExpr(expr->lhs.get(), scopes, called) ||
+            !collectLocalPureExpr(expr->rhs.get(), scopes, called)) {
+            return false;
+        }
+        for (auto &arg : expr->args) {
+            if (!collectLocalPureExpr(arg.get(), scopes, called)) return false;
+        }
+        return true;
+    }
+
+    bool collectLocalPureStmt(
+        const Stmt *stmt, vector<unordered_set<string>> &scopes,
+        unordered_set<string> &called) const {
+        if (!stmt) return true;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                scopes.push_back({});
+                for (auto &child : stmt->stmts) {
+                    if (!collectLocalPureStmt(child.get(), scopes, called)) {
+                        scopes.pop_back();
+                        return false;
+                    }
+                }
+                scopes.pop_back();
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                return collectLocalPureExpr(stmt->expr.get(), scopes, called);
+            case Stmt::Kind::DeclStmt:
+                if (!stmt->decl ||
+                    !collectLocalPureExpr(
+                        stmt->decl->init.get(), scopes, called)) {
+                    return false;
+                }
+                scopes.back().insert(stmt->decl->name);
+                return true;
+            case Stmt::Kind::Assign:
+                return scopeContains(scopes, stmt->name) &&
+                    collectLocalPureExpr(stmt->expr.get(), scopes, called);
+            case Stmt::Kind::If: {
+                if (!collectLocalPureExpr(stmt->expr.get(), scopes, called)) {
+                    return false;
+                }
+                auto thenScopes = scopes;
+                auto elseScopes = scopes;
+                return collectLocalPureStmt(
+                           stmt->thenStmt.get(), thenScopes, called) &&
+                       collectLocalPureStmt(
+                           stmt->elseStmt.get(), elseScopes, called);
+            }
+            case Stmt::Kind::While: {
+                if (!collectLocalPureExpr(stmt->expr.get(), scopes, called)) {
+                    return false;
+                }
+                auto bodyScopes = scopes;
+                return collectLocalPureStmt(
+                    stmt->body.get(), bodyScopes, called);
+            }
+        }
+        return false;
+    }
+
+    void collectLocalPureFunctions() {
+        localPureFunctions.clear();
+        unordered_map<string, unordered_set<string>> calls;
+        for (const auto &[name, function] : functions) {
+            vector<unordered_set<string>> scopes(1);
+            for (const string &param : function->params) {
+                scopes.back().insert(param);
+            }
+            unordered_set<string> called;
+            if (collectLocalPureStmt(function->body.get(), scopes, called)) {
+                localPureFunctions.insert(name);
+                calls[name] = std::move(called);
+            }
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            vector<string> impure;
+            for (const string &name : localPureFunctions) {
+                for (const string &callee : calls.at(name)) {
+                    if (!localPureFunctions.count(callee)) {
+                        impure.push_back(name);
+                        break;
+                    }
+                }
+            }
+            for (const string &name : impure) {
+                changed = localPureFunctions.erase(name) != 0 || changed;
+            }
+        }
     }
 
     void collectGlobalAssignments(
@@ -1699,6 +1811,45 @@ private:
                 return false;  // calls are never treated as equal
         }
         return false;
+    }
+
+    bool csePureValueCall(const Expr *expr) const {
+        if (!expr || expr->kind != Expr::Kind::Call ||
+            !localPureFunctions.count(expr->name)) {
+            return false;
+        }
+        auto found = functions.find(expr->name);
+        return found != functions.end() && !found->second->returnsVoid;
+    }
+
+    bool exprHasCseBarrierCall(const Expr *expr) const {
+        if (!expr) return false;
+        if (expr->kind == Expr::Kind::Call &&
+            !localPureFunctions.count(expr->name)) {
+            return true;
+        }
+        if (exprHasCseBarrierCall(expr->lhs.get()) ||
+            exprHasCseBarrierCall(expr->rhs.get())) {
+            return true;
+        }
+        for (auto &arg : expr->args) {
+            if (exprHasCseBarrierCall(arg.get())) return true;
+        }
+        return false;
+    }
+
+    bool cseExprEq(const Expr *a, const Expr *b) const {
+        if (!a || !b) return a == b;
+        if (a->kind != b->kind) return false;
+        if (a->kind != Expr::Kind::Call) return exprStructEq(a, b);
+        if (!csePureValueCall(a) || !csePureValueCall(b) ||
+            a->name != b->name || a->args.size() != b->args.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < a->args.size(); ++i) {
+            if (!cseExprEq(a->args[i].get(), b->args[i].get())) return false;
+        }
+        return true;
     }
 
     static unique_ptr<Expr> makeBinary(const string &op, unique_ptr<Expr> lhs, unique_ptr<Expr> rhs) {
@@ -2084,8 +2235,13 @@ private:
     };
 
     bool cseCandidate(const Expr *e) const {
-        if (e->kind != Expr::Kind::Binary && e->kind != Expr::Kind::Unary) return false;
-        if (exprHasCall(e)) return false;
+        if (e->kind == Expr::Kind::Call) {
+            return csePureValueCall(e) && !exprHasCseBarrierCall(e);
+        }
+        if (e->kind != Expr::Kind::Binary && e->kind != Expr::Kind::Unary) {
+            return false;
+        }
+        if (exprHasCseBarrierCall(e)) return false;
         if (foldConstExpr(e)) return false;
         int ops = 0;
         bool hasMulDiv = false;
@@ -2130,7 +2286,10 @@ private:
         if (!e) return;
         if (cseCandidate(e.get()) && !(noGlobals && cseReadsGlobal(e.get()))) {
             for (auto &entry : avail) {
-                if (!exprStructEq(*entry.slot ? entry.slot->get() : nullptr, e.get())) continue;
+                if (!cseExprEq(*entry.slot ? entry.slot->get() : nullptr,
+                               e.get())) {
+                    continue;
+                }
                 if (entry.temp.empty()) {
                     entry.temp = "$cse" + to_string(cseCounter++);
                     auto decl = make_unique<Stmt>();
@@ -2170,6 +2329,11 @@ private:
             avail.push_back(std::move(entry));
             // fall through: sub-candidates are recorded too, so a later
             // repeat of an inner piece can still be shared
+        }
+        if (e->kind == Expr::Kind::Binary &&
+            (e->op == "&&" || e->op == "||")) {
+            cseVisitExpr(e->lhs, idx, avail, inserts, noGlobals);
+            return;
         }
         cseVisitExpr(e->lhs, idx, avail, inserts, noGlobals);
         cseVisitExpr(e->rhs, idx, avail, inserts, noGlobals);
@@ -2213,14 +2377,14 @@ private:
             switch (s->kind) {
                 case Stmt::Kind::ExprStmt:
                 case Stmt::Kind::Return: {
-                    bool call = s->expr && exprHasCall(s->expr.get());
+                    bool call = s->expr && exprHasCseBarrierCall(s->expr.get());
                     if (call) cseDropGlobals(avail);
                     cseVisitExpr(s->expr, i, avail, inserts, call);
                     if (call) cseDropGlobals(avail);
                     break;
                 }
                 case Stmt::Kind::Assign: {
-                    bool call = exprHasCall(s->expr.get());
+                    bool call = exprHasCseBarrierCall(s->expr.get());
                     if (call) cseDropGlobals(avail);
                     cseVisitExpr(s->expr, i, avail, inserts, call);
                     if (call) cseDropGlobals(avail);
@@ -2229,7 +2393,7 @@ private:
                 }
                 case Stmt::Kind::DeclStmt:
                     if (s->decl->init) {
-                        bool call = exprHasCall(s->decl->init.get());
+                        bool call = exprHasCseBarrierCall(s->decl->init.get());
                         if (call) cseDropGlobals(avail);
                         cseVisitExpr(s->decl->init, i, avail, inserts, call);
                         if (call) cseDropGlobals(avail);
@@ -2237,7 +2401,7 @@ private:
                     cseInvalidate(avail, {s->decl->name});
                     break;
                 case Stmt::Kind::If: {
-                    bool condCall = exprHasCall(s->expr.get());
+                    bool condCall = exprHasCseBarrierCall(s->expr.get());
                     if (condCall) cseDropGlobals(avail);
                     cseVisitExpr(s->expr, i, avail, inserts, condCall);
                     cseNested(s->thenStmt.get());

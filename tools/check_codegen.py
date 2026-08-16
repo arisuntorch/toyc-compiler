@@ -181,6 +181,47 @@ def main() -> int:
         )
         return 1
 
+    pure_call_cse = compile_source(
+        "int helper(int x){int j=0;int s=x;while(j<8){"
+        "s=s*3+j;j=j+1;}return s;}"
+        "int twice(int x){return helper(x)+helper(x);}"
+        "int main(){return twice(7);}"
+    )
+    if function_assembly(pure_call_cse, "twice").count("call helper") != 1:
+        print(
+            "[FAIL] pure_call_cse: duplicate local-pure call was not reused",
+            file=sys.stderr,
+        )
+        return 1
+
+    effect_call_cse = compile_source(
+        "int g=0;int helper(int x){g=g+1;return x+g;}"
+        "int twice(int x){return helper(x)+helper(x);}"
+        "int main(){return twice(7)+g;}"
+    )
+    if function_assembly(effect_call_cse, "twice").count("call helper") != 2:
+        print(
+            "[FAIL] effect_call_cse: observable calls were incorrectly merged",
+            file=sys.stderr,
+        )
+        return 1
+
+    short_circuit_cse = compile_source(
+        "int spin(int x){while(x>0){}return 7;}"
+        "int guarded(int c){return (c&&spin(1))+(c&&spin(1));}"
+        "int main(){return guarded(0);}"
+    )
+    guarded_assembly = function_assembly(short_circuit_cse, "guarded")
+    guarded_loops = re.findall(
+        r"^\.Lloop_inline_while_body[^:]*:", guarded_assembly, re.MULTILINE
+    )
+    if len(guarded_loops) != 2:
+        print(
+            "[FAIL] short_circuit_cse: guarded pure calls were hoisted",
+            file=sys.stderr,
+        )
+        return 1
+
     if ".Lwhile_body" in generated["periodic_branch_helper"]:
         print(
             "[FAIL] periodic_branch_helper: proven pure helper was not lowered",
