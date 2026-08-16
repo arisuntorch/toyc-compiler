@@ -20,6 +20,11 @@ CASES = {
         "int j = 0; while (j < i) { s = s + j; j = j + 1; } i = i + 1; } "
         "return s; }"
     ),
+    "rectangular_loop": (
+        "int main() { int i = 0; int j = 0; int s = 0; "
+        "while (i < 1000000) { j = 0; while (j < 1000) { "
+        "s = s + i + j; j = j + 1; } i = i + 1; } return s; }"
+    ),
     "helper_loop": (
         "int twice(int x) { return x + x; } int main() { int i = 0; int s = 0; "
         "while (i < 1000000) { s = s + twice(i); i = i + 1; } return s; }"
@@ -65,6 +70,13 @@ def main() -> int:
 
     if ".Lwhile_body" in generated["hot_loop"]:
         print("[FAIL] hot_loop: affine recurrence was not lowered", file=sys.stderr)
+        return 1
+
+    if ".Lwhile_body" in generated["rectangular_loop"]:
+        print(
+            "[FAIL] rectangular_loop: nested affine recurrences were not lowered",
+            file=sys.stderr,
+        )
         return 1
 
     dead_loop = compile_source(

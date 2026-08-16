@@ -2322,7 +2322,6 @@ private:
         unordered_map<int, string> names;
         unordered_set<int> modified;
         unordered_set<int> transient;
-        vector<pair<int, const Expr *>> assignments;
     };
 
     Program &prog;
@@ -2708,7 +2707,6 @@ private:
                 if (key < 0 || !collectExprVars(s->expr.get(), model)) return false;
                 addModelKey(model, key, s->name);
                 model.modified.insert(key);
-                model.assignments.push_back({key, s->expr.get()});
                 return true;
             }
             case Stmt::Kind::DeclStmt: {
@@ -2720,12 +2718,113 @@ private:
                 addModelKey(model, key, s->decl->name);
                 model.modified.insert(key);
                 model.transient.insert(key);
-                model.assignments.push_back({key, s->decl->init.get()});
                 return true;
             }
             case Stmt::Kind::ExprStmt:
                 return !exprHasCallLocal(s->expr.get());
             case Stmt::Kind::If:
+                return collectExprVars(s->expr.get(), model) &&
+                       collectBody(s->thenStmt.get(), model) &&
+                       collectBody(s->elseStmt.get(), model);
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    static optional<int32_t> exactTransformExpr(const Expr *e, const Model &model,
+                                                const Matrix &current) {
+        if (!e) return nullopt;
+        switch (e->kind) {
+            case Expr::Kind::Number:
+                return wrap32(e->value);
+            case Expr::Kind::Var: {
+                auto found = model.index.find(exprKey(e));
+                if (found == model.index.end()) return nullopt;
+                const Row &row = current[static_cast<size_t>(found->second)];
+                if (!constRow(row)) return nullopt;
+                return static_cast<int32_t>(row.back());
+            }
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto value = exactTransformExpr(e->lhs.get(), model, current);
+                if (!value) return nullopt;
+                if (e->op == "+") return *value;
+                if (e->op == "-") return sub32(0, *value);
+                if (e->op == "!") return !truthy(*value);
+                return nullopt;
+            }
+            case Expr::Kind::Binary: {
+                if (e->op == "&&") {
+                    auto lhs = exactTransformExpr(e->lhs.get(), model, current);
+                    if (!lhs) return nullopt;
+                    if (!truthy(*lhs)) return 0;
+                    auto rhs = exactTransformExpr(e->rhs.get(), model, current);
+                    return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
+                }
+                if (e->op == "||") {
+                    auto lhs = exactTransformExpr(e->lhs.get(), model, current);
+                    if (!lhs) return nullopt;
+                    if (truthy(*lhs)) return 1;
+                    auto rhs = exactTransformExpr(e->rhs.get(), model, current);
+                    return rhs ? optional<int32_t>(truthy(*rhs)) : nullopt;
+                }
+                auto lhs = exactTransformExpr(e->lhs.get(), model, current);
+                auto rhs = exactTransformExpr(e->rhs.get(), model, current);
+                if (!lhs || !rhs) return nullopt;
+                if (e->op == "+") return add32(*lhs, *rhs);
+                if (e->op == "-") return sub32(*lhs, *rhs);
+                if (e->op == "*") return mul32(*lhs, *rhs);
+                if (e->op == "/") return *rhs == 0 ? nullopt : optional<int32_t>(div32(*lhs, *rhs));
+                if (e->op == "%") return *rhs == 0 ? nullopt : optional<int32_t>(mod32(*lhs, *rhs));
+                if (e->op == "<") return *lhs < *rhs;
+                if (e->op == ">") return *lhs > *rhs;
+                if (e->op == "<=") return *lhs <= *rhs;
+                if (e->op == ">=") return *lhs >= *rhs;
+                if (e->op == "==") return *lhs == *rhs;
+                if (e->op == "!=") return *lhs != *rhs;
+                return nullopt;
+            }
+        }
+        return nullopt;
+    }
+
+    static bool applyBodyTransform(const Stmt *s, const Model &model, Matrix &transform) {
+        if (!s || s->fastDeadStore) return true;
+        switch (s->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : s->stmts) {
+                    if (!applyBodyTransform(child.get(), model, transform)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+                return true;
+            case Stmt::Kind::Assign: {
+                int key = assignKey(s);
+                Row row;
+                if (key < 0 || !affineExpr(s->expr.get(), model, transform, row)) return false;
+                transform[static_cast<size_t>(model.index.at(key))] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::DeclStmt: {
+                if (!s->decl || s->decl->fastSlot < 0) return false;
+                Row row;
+                if (!affineExpr(s->decl->init.get(), model, transform, row)) return false;
+                transform[static_cast<size_t>(model.index.at(s->decl->fastSlot))] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::If: {
+                auto condition = exactTransformExpr(s->expr.get(), model, transform);
+                if (!condition) return false;
+                return applyBodyTransform(truthy(*condition) ? s->thenStmt.get()
+                                                            : s->elseStmt.get(),
+                                          model, transform);
+            }
             case Stmt::Kind::While:
             case Stmt::Kind::Break:
             case Stmt::Kind::Continue:
@@ -2934,11 +3033,7 @@ private:
         for (int i = 0; i < dimension; ++i) {
             transform[static_cast<size_t>(i)][static_cast<size_t>(i)] = 1;
         }
-        for (auto &[key, expression] : model.assignments) {
-            Row row;
-            if (!affineExpr(expression, model, transform, row)) return false;
-            transform[static_cast<size_t>(model.index.at(key))] = std::move(row);
-        }
+        if (!applyBodyTransform(stmt->body.get(), model, transform)) return false;
 
         int inductionIndex = model.index.at(counted.inductionKey);
         const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
@@ -5427,8 +5522,11 @@ int main(int argc, char **argv) {
     // 3. Replace statically proven affine counted loops with closed-form
     // runtime assignments.  This transforms individual loops; it never calls
     // or executes a ToyC function.
-    AffineLoopOptimizer loopOptimizer(program);
-    if (loopOptimizer.run()) {
+    // Re-resolve after each rewrite round so an outer loop can consume the
+    // closed-form state transition produced for a nested inner loop.
+    for (int round = 0; round < 4; ++round) {
+        AffineLoopOptimizer loopOptimizer(program);
+        if (!loopOptimizer.run()) break;
         StaticAnalyzer rewrittenAnalysis(program);
         rewrittenAnalysis.run();
     }
