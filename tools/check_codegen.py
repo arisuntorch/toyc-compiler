@@ -438,6 +438,36 @@ def main() -> int:
         )
         return 1
 
+    selective_global_entry = compile_source(
+        "int factor=1;int sum=0;int helper(){int i=0;int s=0;"
+        "while(i<100000000){s=s+factor*i;sum=sum+1;i=i+1;}"
+        "return s+sum;}int main(){factor=7;return helper()+factor+sum;}"
+    )
+    selective_helper = function_assembly(selective_global_entry, "helper")
+    selective_main = function_assembly(selective_global_entry, "main")
+    if ".Lwhile_body" in selective_helper or \
+            ".Lglob_factor" in selective_helper or \
+            ".Lglob_factor" in selective_main:
+        print(
+            "[FAIL] selective_global_entry: unrelated writes killed factor",
+            file=sys.stderr,
+        )
+        return 1
+
+    written_global_entry = compile_source(
+        "int factor=1;int sum=0;int helper(){int i=0;int s=0;"
+        "while(i<100000000){factor=factor+1;s=s+factor*i;"
+        "sum=sum+1;i=i+1;}return s+sum;}"
+        "int main(){factor=7;return helper()+factor+sum;}"
+    )
+    if ".Lwhile_body" not in function_assembly(
+            written_global_entry, "helper"):
+        print(
+            "[FAIL] written_global_entry: modified factor was specialized",
+            file=sys.stderr,
+        )
+        return 1
+
     mutable_global = compile_source(
         "int g=7;void set(){g=99;}int main(){set();int i=0;int s=0;"
         "while(i<1000000000){s=s+g;i=i+1;}return s;}"

@@ -1413,7 +1413,7 @@ public:
     void run() {
         collectInlineableFunctions();
         collectProgramNames();
-        collectGlobalWriteFreeFunctions();
+        collectFunctionGlobalWrites();
         collectLocalPureFunctions();
         functionEntryGlobals.clear();
         functionEntrySeen.clear();
@@ -1476,7 +1476,7 @@ private:
     unordered_set<string> globalNames;
     unordered_set<string> assignedGlobalNames;
     unordered_set<string> localPureFunctions;
-    unordered_set<string> globalWriteFreeFunctions;
+    unordered_map<string, unordered_set<string>> functionGlobalWrites;
     unordered_map<string, int32_t> globalInitialValues;
     unordered_map<string, int32_t> knownGlobals;
     unordered_map<string, unordered_map<string, int32_t>> functionEntryGlobals;
@@ -1585,8 +1585,8 @@ private:
         }
     }
 
-    void collectGlobalWriteFreeFunctions() {
-        globalWriteFreeFunctions.clear();
+    void collectFunctionGlobalWrites() {
+        functionGlobalWrites.clear();
         unordered_map<string, unordered_set<string>> calls;
         for (const auto &[name, function] : functions) {
             vector<unordered_set<string>> scopes(1);
@@ -1598,23 +1598,25 @@ private:
             unordered_set<string> called;
             collectCalledFunctions(function->body.get(), called);
             calls[name] = std::move(called);
-            if (writes.empty()) globalWriteFreeFunctions.insert(name);
+            functionGlobalWrites[name] = std::move(writes);
         }
 
         bool changed = true;
         while (changed) {
             changed = false;
-            vector<string> writers;
-            for (const string &name : globalWriteFreeFunctions) {
+            for (const auto &[name, function] : functions) {
+                (void)function;
+                auto &writes = functionGlobalWrites[name];
+                size_t before = writes.size();
                 for (const string &callee : calls.at(name)) {
-                    if (!globalWriteFreeFunctions.count(callee)) {
-                        writers.push_back(name);
-                        break;
+                    auto found = functionGlobalWrites.find(callee);
+                    if (found == functionGlobalWrites.end()) {
+                        writes.insert(globalNames.begin(), globalNames.end());
+                    } else {
+                        writes.insert(found->second.begin(), found->second.end());
                     }
                 }
-            }
-            for (const string &name : writers) {
-                changed = globalWriteFreeFunctions.erase(name) != 0 || changed;
+                changed = changed || writes.size() != before;
             }
         }
     }
@@ -1893,19 +1895,31 @@ private:
                 for (auto &arg : e->args) optExpr(arg);
                 inlinePureCall(e);
                 if (e && e->kind == Expr::Kind::Call) {
+                    auto writes = functionGlobalWrites.find(callee);
                     if (recordFunctionEntries &&
-                        globalWriteFreeFunctions.count(callee)) {
+                        writes != functionGlobalWrites.end()) {
+                        unordered_map<string, int32_t> entryGlobals;
+                        for (const auto &[name, value] : knownGlobals) {
+                            if (!writes->second.count(name)) {
+                                entryGlobals[name] = value;
+                            }
+                        }
                         auto found = functionEntryGlobals.find(callee);
                         if (!functionEntrySeen.count(callee)) {
-                            functionEntryGlobals[callee] = knownGlobals;
+                            functionEntryGlobals[callee] =
+                                std::move(entryGlobals);
                             functionEntrySeen.insert(callee);
                         } else if (found != functionEntryGlobals.end()) {
                             found->second = mergeKnownGlobals(
-                                found->second, knownGlobals);
+                                found->second, entryGlobals);
                         }
                     }
-                    if (!globalWriteFreeFunctions.count(callee)) {
+                    if (writes == functionGlobalWrites.end()) {
                         knownGlobals.clear();
+                    } else {
+                        for (const string &name : writes->second) {
+                            knownGlobals.erase(name);
+                        }
                     }
                 }
                 return;
