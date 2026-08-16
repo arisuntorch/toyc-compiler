@@ -2425,6 +2425,7 @@ private:
         int32_t start = 0;
         int32_t bound = 0;
         int32_t step = 0;
+        int32_t conditionOffset = 0;
         int32_t finalValue = 0;
         uint64_t trips = 0;
     };
@@ -2753,37 +2754,109 @@ private:
         return "";
     }
 
+    static bool extractInductionWithOffset(const Expr *expr, int &key,
+                                           string &name, int32_t &offset) {
+        if (!expr) return false;
+        if (expr->kind == Expr::Kind::Var && !expr->fastGlobal &&
+            expr->fastIndex >= 0) {
+            key = exprKey(expr);
+            name = expr->name;
+            offset = 0;
+            return true;
+        }
+        if (expr->kind == Expr::Kind::Unary && expr->op == "+") {
+            return extractInductionWithOffset(expr->lhs.get(), key, name,
+                                              offset);
+        }
+        if (expr->kind != Expr::Kind::Binary ||
+            (expr->op != "+" && expr->op != "-")) {
+            return false;
+        }
+        int nestedKey = -1;
+        string nestedName;
+        int32_t nestedOffset = 0;
+        if (extractInductionWithOffset(expr->lhs.get(), nestedKey,
+                                       nestedName, nestedOffset)) {
+            auto constant = foldConstExpr(expr->rhs.get());
+            if (!constant) return false;
+            key = nestedKey;
+            name = std::move(nestedName);
+            offset = expr->op == "+"
+                ? add32(nestedOffset, *constant)
+                : sub32(nestedOffset, *constant);
+            return true;
+        }
+        if (expr->op == "+" &&
+            extractInductionWithOffset(expr->rhs.get(), nestedKey,
+                                       nestedName, nestedOffset)) {
+            auto constant = foldConstExpr(expr->lhs.get());
+            if (!constant) return false;
+            key = nestedKey;
+            name = std::move(nestedName);
+            offset = add32(*constant, nestedOffset);
+            return true;
+        }
+        return false;
+    }
+
     bool extractConditionShape(const Expr *condition,
                                CountedLoop &loop) const {
         if (!condition || condition->kind != Expr::Kind::Binary) return false;
+        if (condition->op == "&&") {
+            if (auto lhs = foldConstExpr(condition->lhs.get());
+                lhs && truthy(*lhs)) {
+                return extractConditionShape(condition->rhs.get(), loop);
+            }
+            if (auto rhs = foldConstExpr(condition->rhs.get());
+                rhs && truthy(*rhs)) {
+                return extractConditionShape(condition->lhs.get(), loop);
+            }
+            return false;
+        }
+        if (condition->op == "||") {
+            if (auto lhs = foldConstExpr(condition->lhs.get());
+                lhs && !truthy(*lhs)) {
+                return extractConditionShape(condition->rhs.get(), loop);
+            }
+            if (auto rhs = foldConstExpr(condition->rhs.get());
+                rhs && !truthy(*rhs)) {
+                return extractConditionShape(condition->lhs.get(), loop);
+            }
+            return false;
+        }
         static const unordered_set<string> relations = {"<", "<=", ">", ">="};
         if (!relations.count(condition->op)) return false;
 
-        const Expr *induction = condition->lhs.get();
+        int inductionKey = -1;
+        string inductionName;
+        int32_t inductionOffset = 0;
         loop.boundExpr = condition->rhs.get();
         loop.relation = condition->op;
-        if (!induction || induction->kind != Expr::Kind::Var || induction->fastGlobal) {
-            induction = condition->rhs.get();
+        if (!extractInductionWithOffset(condition->lhs.get(), inductionKey,
+                                        inductionName, inductionOffset)) {
             loop.boundExpr = condition->lhs.get();
             loop.relation = reverseRelation(condition->op);
+            if (!extractInductionWithOffset(condition->rhs.get(), inductionKey,
+                                            inductionName,
+                                            inductionOffset)) {
+                return false;
+            }
         }
-        if (!induction || induction->kind != Expr::Kind::Var || induction->fastGlobal ||
-            loop.relation.empty()) {
-            return false;
-        }
-        loop.inductionKey = exprKey(induction);
-        loop.inductionName = induction->name;
+        if (loop.relation.empty()) return false;
+        loop.inductionKey = inductionKey;
+        loop.inductionName = std::move(inductionName);
+        loop.conditionOffset = inductionOffset;
         return loop.inductionKey >= 0;
     }
 
     bool extractCondition(const Expr *condition, const ExactEnv &env,
-                          CountedLoop &loop) const {
+        CountedLoop &loop) const {
         if (!extractConditionShape(condition, loop)) return false;
-        const Expr *induction = condition->lhs.get();
-        if (exprKey(induction) != loop.inductionKey) {
-            induction = condition->rhs.get();
+        optional<int32_t> start;
+        if (!isGlobalKey(loop.inductionKey) && loop.inductionKey >= 0 &&
+            loop.inductionKey < static_cast<int>(env.size())) {
+            start = env[static_cast<size_t>(loop.inductionKey)];
         }
-        auto start = evalExact(induction, env);
         auto bound = evalExact(loop.boundExpr, env);
         if (!start || !bound) return false;
         loop.start = *start;
@@ -2793,6 +2866,11 @@ private:
 
     static optional<pair<uint64_t, int32_t>> tripCount(const CountedLoop &loop) {
         int64_t start = loop.start;
+        int64_t conditionStart = start + loop.conditionOffset;
+        if (conditionStart < numeric_limits<int32_t>::min() ||
+            conditionStart > numeric_limits<int32_t>::max()) {
+            return nullopt;
+        }
         int64_t bound = loop.bound;
         int64_t step = loop.step;
         uint64_t trips = 0;
@@ -2800,9 +2878,11 @@ private:
 
         if (loop.relation == "<" || loop.relation == "<=") {
             if (step <= 0) return nullopt;
-            bool enters = loop.relation == "<" ? start < bound : start <= bound;
+            bool enters = loop.relation == "<"
+                ? conditionStart < bound : conditionStart <= bound;
             if (enters) {
-                uint64_t distance = static_cast<uint64_t>(bound - start);
+                uint64_t distance =
+                    static_cast<uint64_t>(bound - conditionStart);
                 trips = loop.relation == "<"
                     ? (distance + static_cast<uint64_t>(step) - 1) / static_cast<uint64_t>(step)
                     : distance / static_cast<uint64_t>(step) + 1;
@@ -2810,10 +2890,12 @@ private:
             }
         } else if (loop.relation == ">" || loop.relation == ">=") {
             if (step >= 0) return nullopt;
-            bool enters = loop.relation == ">" ? start > bound : start >= bound;
+            bool enters = loop.relation == ">"
+                ? conditionStart > bound : conditionStart >= bound;
             if (enters) {
                 uint64_t magnitude = static_cast<uint64_t>(-step);
-                uint64_t distance = static_cast<uint64_t>(start - bound);
+                uint64_t distance =
+                    static_cast<uint64_t>(conditionStart - bound);
                 trips = loop.relation == ">"
                     ? (distance + magnitude - 1) / magnitude
                     : distance / magnitude + 1;
@@ -2986,11 +3068,17 @@ private:
             counted.trips = trip->first;
             counted.finalValue = trip->second;
         } else {
-            // Strict unit-step loops reach their int32 bound exactly, so no
-            // induction update can wrap before termination.  This proof does
-            // not require evaluating either runtime endpoint.
-            bool increasing = counted.relation == "<" && counted.step == 1;
-            bool decreasing = counted.relation == ">" && counted.step == -1;
+            // ToyC inputs are guaranteed to contain no undefined signed
+            // overflow and to terminate.  Under those language preconditions,
+            // a positive induction step is monotone for < / <= and a negative
+            // step is monotone for > / >=, even when the endpoints are only
+            // available at runtime.
+            bool increasing =
+                (counted.relation == "<" || counted.relation == "<=") &&
+                counted.step > 0;
+            bool decreasing =
+                (counted.relation == ">" || counted.relation == ">=") &&
+                counted.step < 0;
             if (!increasing && !decreasing) return false;
         }
 
@@ -3180,10 +3268,7 @@ private:
         }
 
         Model model;
-        const Expr *induction = loop->expr->lhs.get();
-        if (exprKey(induction) != counted.inductionKey) induction = loop->expr->rhs.get();
-        if (!induction || induction->kind != Expr::Kind::Var) return false;
-        addModelKey(model, counted.inductionKey, induction->name);
+        addModelKey(model, counted.inductionKey, counted.inductionName);
         if (!collectBody(loop->body.get(), model) || model.keys.size() > 32 ||
             !model.modified.count(counted.inductionKey)) {
             return false;
@@ -4974,9 +5059,7 @@ private:
         if (!extractCondition(stmt->expr.get(), env, counted)) return false;
 
         Model model;
-        addModelKey(model, counted.inductionKey, stmt->expr->lhs &&
-                    exprKey(stmt->expr->lhs.get()) == counted.inductionKey
-                        ? stmt->expr->lhs->name : stmt->expr->rhs->name);
+        addModelKey(model, counted.inductionKey, counted.inductionName);
         if (!collectBody(stmt->body.get(), model) ||
             model.keys.size() > 32 || !model.modified.count(counted.inductionKey)) {
             return false;

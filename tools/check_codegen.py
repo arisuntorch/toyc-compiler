@@ -36,6 +36,10 @@ CASES = {
         "while (i < 1000000000) { int t = i * i + q * i + 7; "
         "s = s + t; i = i + 1; } return s; }"
     ),
+    "offset_condition_loop": (
+        "int main(){int i=-7;int s=3;while(1&&(i+5<1000000000)){"
+        "s=s+i*3+1;i=i+4;}return s+i;}"
+    ),
     "helper_loop": (
         "int twice(int x) { return x + x; } int main() { int i = 0; int s = 0; "
         "while (i < 1000000) { s = s + twice(i); i = i + 1; } return s; }"
@@ -156,6 +160,13 @@ def main() -> int:
         )
         return 1
 
+    if ".Lwhile_body" in generated["offset_condition_loop"]:
+        print(
+            "[FAIL] offset_condition_loop: affine condition offset was not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
     if ".Lwhile_body" in generated["periodic_branch_helper"]:
         print(
             "[FAIL] periodic_branch_helper: proven pure helper was not lowered",
@@ -208,6 +219,19 @@ def main() -> int:
         )
         return 1
     print("[OK] dynamic_dead_loop: removed with runtime endpoints")
+
+    dynamic_dead_stride_loop = compile_source(
+        "int opaque(int x){int y=x;return y;}int main(){int n=opaque(9);"
+        "int j=0;int junk=2;while(j<=n){junk=junk*junk+1;j=j+2;}"
+        "return 42;}"
+    )
+    if ".Lwhile_body" in function_assembly(dynamic_dead_stride_loop, "main"):
+        print(
+            "[FAIL] dynamic_dead_stride_loop: monotone dead loop was not removed",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] dynamic_dead_stride_loop: removed monotone runtime loop")
 
     fallback_cases = {
         "non_affine": (
@@ -270,11 +294,6 @@ def main() -> int:
         "dynamic_nonlinear_state": (
             "int opaque(int x){int y=x;return y;}int main(){int n=opaque(10);"
             "int j=0;int s=2;while(j<n){s=s*s+j;j=j+1;}return s+j;}"
-        ),
-        "dynamic_dead_non_unit_step": (
-            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(9);"
-            "int j=0;int junk=2;while(j<n){junk=junk*junk+1;j=j+2;}"
-            "return 42;}"
         ),
     }
     for name, source in dynamic_fallbacks.items():
