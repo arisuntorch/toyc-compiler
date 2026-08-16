@@ -337,6 +337,17 @@ public:
             analyzeStmt(item.func->body.get(), live, nullptr, nullptr, true);
         }
         markDeadGlobalStores();
+        // A function whose only apparent effect was a now-dead global store
+        // is itself side-effect-free.  Recompute the call-graph property, then
+        // let local DCE remove newly dead calls and close global dependencies
+        // once more.
+        computeSideEffectFreeFunctions();
+        for (auto &item : prog.items) {
+            if (item.kind != TopItem::Kind::Func) continue;
+            unordered_set<int> live;
+            analyzeStmt(item.func->body.get(), live, nullptr, nullptr, true);
+        }
+        markDeadGlobalStores();
         // Global dead-store marks can make an enclosing local loop wholly
         // unobservable.  Recompute local liveness once with those stores
         // ignored so the loop optimizer can remove or summarize it.
@@ -505,7 +516,7 @@ private:
     }
 
     bool sideEffectFreeStmt(const Stmt *stmt) const {
-        if (!stmt) return true;
+        if (!stmt || stmt->fastDeadStore) return true;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : stmt->stmts) {
@@ -538,16 +549,23 @@ private:
 
     void computeSideEffectFreeFunctions() {
         sideEffectFreeFunctions.clear();
+        for (const auto &[name, function] : functions) {
+            (void)name;
+            sideEffectFreeFunctions.insert(function);
+        }
         bool changed = true;
         while (changed) {
             changed = false;
+            vector<const Function *> impure;
             for (const auto &[name, function] : functions) {
                 (void)name;
-                if (sideEffectFreeFunctions.count(function)) continue;
-                if (sideEffectFreeStmt(function->body.get())) {
-                    sideEffectFreeFunctions.insert(function);
-                    changed = true;
+                if (!sideEffectFreeFunctions.count(function)) continue;
+                if (!sideEffectFreeStmt(function->body.get())) {
+                    impure.push_back(function);
                 }
+            }
+            for (const Function *function : impure) {
+                changed = sideEffectFreeFunctions.erase(function) != 0 || changed;
             }
         }
     }
@@ -740,14 +758,40 @@ private:
         for (auto &arg : expr->args) collectGlobalReads(arg.get(), reads);
     }
 
-    void collectGlobalStoreDependencies(
-        Stmt *stmt, unordered_set<int> &roots,
-        vector<GlobalStoreDependency> &stores) const {
+    void collectObservedReturns(const Expr *expr, bool valueUsed,
+                                unordered_set<string> &observed) const {
+        if (!expr) return;
+        if (expr->kind == Expr::Kind::Call) {
+            if (valueUsed && functions.count(expr->name)) {
+                observed.insert(expr->name);
+            }
+            for (auto &arg : expr->args) {
+                collectObservedReturns(arg.get(), true, observed);
+            }
+            return;
+        }
+        if (expr->kind == Expr::Kind::Unary) {
+            collectObservedReturns(expr->lhs.get(), valueUsed, observed);
+            return;
+        }
+        if (expr->kind == Expr::Kind::Binary) {
+            if (expr->op == "&&" || expr->op == "||") {
+                collectObservedReturns(expr->lhs.get(), true, observed);
+                collectObservedReturns(expr->rhs.get(), valueUsed, observed);
+            } else {
+                collectObservedReturns(expr->lhs.get(), valueUsed, observed);
+                collectObservedReturns(expr->rhs.get(), valueUsed, observed);
+            }
+        }
+    }
+
+    void collectObservedReturns(const Stmt *stmt, bool returnUsed,
+                                unordered_set<string> &observed) const {
         if (!stmt || stmt->fastDeadStore) return;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : stmt->stmts) {
-                    collectGlobalStoreDependencies(child.get(), roots, stores);
+                    collectObservedReturns(child.get(), returnUsed, observed);
                 }
                 return;
             case Stmt::Kind::Empty:
@@ -755,8 +799,85 @@ private:
             case Stmt::Kind::Continue:
                 return;
             case Stmt::Kind::ExprStmt:
+                collectObservedReturns(stmt->expr.get(), false, observed);
+                return;
             case Stmt::Kind::Return:
-                collectGlobalReads(stmt->expr.get(), roots);
+                collectObservedReturns(stmt->expr.get(), returnUsed, observed);
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (stmt->decl) {
+                    collectObservedReturns(stmt->decl->init.get(), true,
+                                           observed);
+                }
+                return;
+            case Stmt::Kind::Assign:
+                collectObservedReturns(stmt->expr.get(), true, observed);
+                return;
+            case Stmt::Kind::If:
+                collectObservedReturns(stmt->expr.get(), true, observed);
+                collectObservedReturns(stmt->thenStmt.get(), returnUsed,
+                                       observed);
+                collectObservedReturns(stmt->elseStmt.get(), returnUsed,
+                                       observed);
+                return;
+            case Stmt::Kind::While:
+                collectObservedReturns(stmt->expr.get(), true, observed);
+                collectObservedReturns(stmt->body.get(), returnUsed, observed);
+                return;
+        }
+    }
+
+    static void collectRequiredGlobalReads(const Expr *expr, bool valueUsed,
+                                           unordered_set<int> &reads) {
+        if (!expr) return;
+        if (expr->kind == Expr::Kind::Var) {
+            if (valueUsed && expr->fastGlobal && expr->fastIndex >= 0) {
+                reads.insert(expr->fastIndex);
+            }
+            return;
+        }
+        if (expr->kind == Expr::Kind::Call) {
+            for (auto &arg : expr->args) {
+                collectRequiredGlobalReads(arg.get(), true, reads);
+            }
+            return;
+        }
+        if (expr->kind == Expr::Kind::Unary) {
+            collectRequiredGlobalReads(expr->lhs.get(), valueUsed, reads);
+            return;
+        }
+        if (expr->kind == Expr::Kind::Binary) {
+            if (expr->op == "&&" || expr->op == "||") {
+                collectRequiredGlobalReads(expr->lhs.get(), true, reads);
+                collectRequiredGlobalReads(expr->rhs.get(), valueUsed, reads);
+            } else {
+                collectRequiredGlobalReads(expr->lhs.get(), valueUsed, reads);
+                collectRequiredGlobalReads(expr->rhs.get(), valueUsed, reads);
+            }
+        }
+    }
+
+    void collectGlobalStoreDependencies(
+        Stmt *stmt, unordered_set<int> &roots,
+        vector<GlobalStoreDependency> &stores,
+        bool returnUsed) const {
+        if (!stmt || stmt->fastDeadStore) return;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) {
+                    collectGlobalStoreDependencies(child.get(), roots, stores,
+                                                   returnUsed);
+                }
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return;
+            case Stmt::Kind::ExprStmt:
+                collectRequiredGlobalReads(stmt->expr.get(), false, roots);
+                return;
+            case Stmt::Kind::Return:
+                collectRequiredGlobalReads(stmt->expr.get(), returnUsed, roots);
                 return;
             case Stmt::Kind::DeclStmt:
                 if (stmt->decl) collectGlobalReads(stmt->decl->init.get(), roots);
@@ -779,13 +900,14 @@ private:
             case Stmt::Kind::If:
                 collectGlobalReads(stmt->expr.get(), roots);
                 collectGlobalStoreDependencies(stmt->thenStmt.get(), roots,
-                                               stores);
+                                               stores, returnUsed);
                 collectGlobalStoreDependencies(stmt->elseStmt.get(), roots,
-                                               stores);
+                                               stores, returnUsed);
                 return;
             case Stmt::Kind::While:
                 collectGlobalReads(stmt->expr.get(), roots);
-                collectGlobalStoreDependencies(stmt->body.get(), roots, stores);
+                collectGlobalStoreDependencies(stmt->body.get(), roots, stores,
+                                               returnUsed);
                 return;
         }
     }
@@ -808,11 +930,25 @@ private:
             }
         }
 
+        unordered_set<string> observedReturns;
+        if (reachable.count("main")) observedReturns.insert("main");
+        bool observedGrew = true;
+        while (observedGrew) {
+            size_t before = observedReturns.size();
+            for (const string &name : reachable) {
+                collectObservedReturns(
+                    functions.at(name)->body.get(),
+                    observedReturns.count(name) != 0, observedReturns);
+            }
+            observedGrew = observedReturns.size() != before;
+        }
+
         unordered_set<int> liveGlobals;
         vector<GlobalStoreDependency> stores;
         for (const string &name : reachable) {
             collectGlobalStoreDependencies(functions.at(name)->body.get(),
-                                           liveGlobals, stores);
+                                           liveGlobals, stores,
+                                           observedReturns.count(name) != 0);
         }
         bool grew = true;
         while (grew) {

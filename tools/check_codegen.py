@@ -386,7 +386,7 @@ def main() -> int:
 
     live_effect_call_loop = compile_source(
         "int g=0;int effect(int x){g=g+x;return g;}int main(){int i=0;"
-        "int junk=0;while(i<20){junk=effect(i);i=i+1;}return 42;}"
+        "int junk=0;while(i<20){junk=effect(i);i=i+1;}return g;}"
     )
     live_effect_main = function_assembly(live_effect_call_loop, "main")
     if "call effect" not in live_effect_main or ".Lwhile_body" not in live_effect_main:
@@ -396,6 +396,35 @@ def main() -> int:
         )
         return 1
     print("[OK] live_effect_call_loop: retained observable calls")
+
+    dead_unobserved_global_call = compile_source(
+        "int trash=0;int write_trash(int x){trash=trash+x;return trash;}"
+        "int main(){int i=0;int junk=0;while(i<1000000000){"
+        "junk=write_trash(i);i=i+1;}return 42;}"
+    )
+    dead_unobserved_main = function_assembly(dead_unobserved_global_call, "main")
+    if "call write_trash" in dead_unobserved_main or \
+            ".Lwhile_body" in dead_unobserved_main:
+        print(
+            "[FAIL] dead_unobserved_global_call: unused effect chain was retained",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] dead_unobserved_global_call: removed unused global effect chain")
+
+    observed_helper_return = compile_source(
+        "int state=1;int update(int x){state=state*3+x;return state;}"
+        "int main(){return update(7);}"
+    )
+    observed_return_main = function_assembly(observed_helper_return, "main")
+    if "call update" not in observed_return_main or \
+            ".Lglob_state" not in observed_helper_return:
+        print(
+            "[FAIL] observed_helper_return: used return dependency was deleted",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] observed_helper_return: retained used helper return state")
 
     loop_helper_fallbacks = {
         "non_affine_loop_helper": (
