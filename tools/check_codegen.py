@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -124,6 +125,16 @@ def main() -> int:
         print("[FAIL] hot_loop: affine recurrence was not lowered", file=sys.stderr)
         return 1
 
+    nested_loop_labels = re.findall(
+        r"^\.Lwhile_body[^:]*:", generated["nested_loop"], re.MULTILINE
+    )
+    if len(nested_loop_labels) != 1:
+        print(
+            "[FAIL] nested_loop: dynamic triangular inner loop was not lowered",
+            file=sys.stderr,
+        )
+        return 1
+
     if ".Lwhile_body" in generated["rectangular_loop"]:
         print(
             "[FAIL] rectangular_loop: nested affine recurrences were not lowered",
@@ -233,6 +244,54 @@ def main() -> int:
             print(f"[FAIL] {name}: unsafe loop optimization did not fall back", file=sys.stderr)
             return 1
         print(f"[OK] {name}: retained runtime loop")
+
+    dynamic_fallbacks = {
+        "dynamic_changing_bound": (
+            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(-1);"
+            "int j=0;int s=0;while(j<n){s=s+j;n=n+1;j=j+1;}return s+j+n;}"
+        ),
+        "dynamic_non_unit_step": (
+            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(20);"
+            "int j=0;int s=0;while(j<n){s=s+j;j=j+2;}return s+j;}"
+        ),
+        "dynamic_nonlinear_state": (
+            "int opaque(int x){int y=x;return y;}int main(){int n=opaque(10);"
+            "int j=0;int s=2;while(j<n){s=s*s+j;j=j+1;}return s+j;}"
+        ),
+    }
+    for name, source in dynamic_fallbacks.items():
+        if ".Lwhile_body" not in function_assembly(compile_source(source), "main"):
+            print(
+                f"[FAIL] {name}: unsafe dynamic loop did not fall back",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[OK] {name}: retained runtime loop")
+
+    immutable_global = compile_source(
+        "int g=7;void dead(){g=99;}int main(){{int g=1;g=2;}"
+        "int i=0;int s=0;while(i<1000000000){s=s+g;i=i+1;}return s;}"
+    )
+    immutable_main = function_assembly(immutable_global, "main")
+    if ".Lglob_g" in immutable_main or ".Lwhile_body" in immutable_main:
+        print(
+            "[FAIL] immutable_global: unreachable write or local shadow blocked propagation",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] immutable_global: propagated through reachable call graph")
+
+    mutable_global = compile_source(
+        "int g=7;void set(){g=99;}int main(){set();int i=0;int s=0;"
+        "while(i<1000000000){s=s+g;i=i+1;}return s;}"
+    )
+    if ".Lglob_g" not in function_assembly(mutable_global, "main"):
+        print(
+            "[FAIL] mutable_global: reachable write was treated as immutable",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] mutable_global: retained reachable runtime state")
 
     loop_helper_fallbacks = {
         "non_affine_loop_helper": (

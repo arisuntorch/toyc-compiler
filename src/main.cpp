@@ -1050,23 +1050,35 @@ public:
 
     void run() {
         collectInlineableFunctions();
-        collectGlobalAssignments();
-        for (auto &item : prog.items) {
-            if (item.kind == TopItem::Kind::Decl) {
+        collectProgramNames();
+        // Recompute reachability and writes after each rewrite pass.  A first
+        // pass can delete a constant-false call or global store, allowing the
+        // next pass to prove additional globals immutable from main.
+        for (int programRound = 0; programRound < 3; ++programRound) {
+            collectGlobalAssignments();
+            globalConsts.clear();
+            env.clear();
+            for (auto &item : prog.items) {
+                if (item.kind != TopItem::Kind::Decl) continue;
                 optExpr(item.decl->init);
-                if (item.decl->isConst || !assignedGlobalNames.count(item.decl->name)) {
-                    if (auto v = foldConstExpr(item.decl->init.get())) globalConsts[item.decl->name] = *v;
+                if (item.decl->isConst ||
+                    !assignedGlobalNames.count(item.decl->name)) {
+                    if (auto value = foldConstExpr(item.decl->init.get())) {
+                        globalConsts[item.decl->name] = *value;
+                    }
                 }
-            } else {
-                for (int round = 0; round < 3; ++round) {
-                    env.clear();
-                    enter();
-                    for (const string &param : item.func->params) env.back()[param] = LocalInfo{};
-                    optStmt(item.func->body);
-                    leave();
-                    cseFunction(*item.func);
-                    dceFunction(*item.func);
+            }
+            for (auto &item : prog.items) {
+                if (item.kind != TopItem::Kind::Func) continue;
+                env.clear();
+                enter();
+                for (const string &param : item.func->params) {
+                    env.back()[param] = LocalInfo{};
                 }
+                optStmt(item.func->body);
+                leave();
+                cseFunction(*item.func);
+                dceFunction(*item.func);
             }
         }
     }
@@ -1075,6 +1087,7 @@ private:
     Program &prog;
     unordered_map<string, int32_t> globalConsts;
     unordered_map<string, Function *> inlineableFuncs;
+    unordered_map<string, Function *> functions;
     unordered_set<string> globalNames;
     unordered_set<string> assignedGlobalNames;
     struct LocalInfo {
@@ -1097,26 +1110,107 @@ private:
         }
     }
 
-    void collectGlobalAssignments() {
+    void collectProgramNames() {
+        functions.clear();
         globalNames.clear();
-        assignedGlobalNames.clear();
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl) globalNames.insert(item.decl->name);
-        }
-        for (auto &item : prog.items) {
-            if (item.kind == TopItem::Kind::Func) collectGlobalAssignments(item.func->body.get());
+            else functions[item.func->name] = item.func.get();
         }
     }
 
-    void collectGlobalAssignments(const Stmt *s) {
-        if (!s) return;
-        if (s->kind == Stmt::Kind::Assign && globalNames.count(s->name)) {
-            assignedGlobalNames.insert(s->name);
+    static void collectCalledFunctions(const Expr *expr,
+                                       unordered_set<string> &called) {
+        if (!expr) return;
+        if (expr->kind == Expr::Kind::Call) called.insert(expr->name);
+        collectCalledFunctions(expr->lhs.get(), called);
+        collectCalledFunctions(expr->rhs.get(), called);
+        for (auto &arg : expr->args) collectCalledFunctions(arg.get(), called);
+    }
+
+    static void collectCalledFunctions(const Stmt *stmt,
+                                       unordered_set<string> &called) {
+        if (!stmt) return;
+        collectCalledFunctions(stmt->expr.get(), called);
+        if (stmt->decl) collectCalledFunctions(stmt->decl->init.get(), called);
+        for (auto &child : stmt->stmts) {
+            collectCalledFunctions(child.get(), called);
         }
-        for (auto &child : s->stmts) collectGlobalAssignments(child.get());
-        collectGlobalAssignments(s->thenStmt.get());
-        collectGlobalAssignments(s->elseStmt.get());
-        collectGlobalAssignments(s->body.get());
+        collectCalledFunctions(stmt->thenStmt.get(), called);
+        collectCalledFunctions(stmt->elseStmt.get(), called);
+        collectCalledFunctions(stmt->body.get(), called);
+    }
+
+    static bool scopeContains(
+        const vector<unordered_set<string>> &scopes, const string &name) {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            if (it->count(name)) return true;
+        }
+        return false;
+    }
+
+    void collectGlobalAssignments(
+        const Stmt *stmt, vector<unordered_set<string>> &scopes) {
+        if (!stmt) return;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                scopes.push_back({});
+                for (auto &child : stmt->stmts) {
+                    collectGlobalAssignments(child.get(), scopes);
+                }
+                scopes.pop_back();
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (stmt->decl) scopes.back().insert(stmt->decl->name);
+                return;
+            case Stmt::Kind::Assign:
+                if (!scopeContains(scopes, stmt->name) &&
+                    globalNames.count(stmt->name)) {
+                    assignedGlobalNames.insert(stmt->name);
+                }
+                return;
+            case Stmt::Kind::If:
+                collectGlobalAssignments(stmt->thenStmt.get(), scopes);
+                collectGlobalAssignments(stmt->elseStmt.get(), scopes);
+                return;
+            case Stmt::Kind::While:
+                collectGlobalAssignments(stmt->body.get(), scopes);
+                return;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return;
+        }
+    }
+
+    void collectGlobalAssignments() {
+        assignedGlobalNames.clear();
+        unordered_set<string> reachable;
+        vector<string> pending;
+        if (functions.count("main")) {
+            reachable.insert("main");
+            pending.push_back("main");
+        }
+        for (size_t next = 0; next < pending.size(); ++next) {
+            Function *function = functions.at(pending[next]);
+            unordered_set<string> called;
+            collectCalledFunctions(function->body.get(), called);
+            for (const string &name : called) {
+                if (functions.count(name) && reachable.insert(name).second) {
+                    pending.push_back(name);
+                }
+            }
+        }
+        for (const string &name : reachable) {
+            Function *function = functions.at(name);
+            vector<unordered_set<string>> scopes(1);
+            for (const string &param : function->params) {
+                scopes.back().insert(param);
+            }
+            collectGlobalAssignments(function->body.get(), scopes);
+        }
     }
 
     void enter() { env.push_back({}); }
@@ -2316,6 +2410,11 @@ private:
 
     struct Polynomial {
         array<uint32_t, kPolynomialTerms> coefficients{};
+    };
+
+    struct SymbolicAffine {
+        unique_ptr<Expr> constant;
+        unique_ptr<Expr> linear;
     };
 
     struct CountedLoop {
@@ -4297,6 +4396,375 @@ private:
         return false;
     }
 
+    static unique_ptr<Expr> cloneExprPlain(const Expr *expr) {
+        static const unordered_map<string, const Expr *> noSubstitutions;
+        return cloneExprSubstGeneric(expr, noSubstitutions);
+    }
+
+    static unique_ptr<Expr> addSymbolicExpr(unique_ptr<Expr> lhs,
+                                            unique_ptr<Expr> rhs) {
+        if (!lhs) return rhs;
+        if (!rhs) return lhs;
+        return binaryExpr("+", std::move(lhs), std::move(rhs));
+    }
+
+    static unique_ptr<Expr> negateSymbolicExpr(unique_ptr<Expr> value) {
+        if (!value) return nullptr;
+        return binaryExpr("-", makeNumberExpr(0), std::move(value));
+    }
+
+    static unique_ptr<Expr> multiplySymbolicExpr(unique_ptr<Expr> lhs,
+                                                 unique_ptr<Expr> rhs) {
+        if (!lhs || !rhs) return nullptr;
+        if (auto value = foldConstExpr(lhs.get())) {
+            if (*value == 0) return nullptr;
+            if (*value == 1) return rhs;
+        }
+        if (auto value = foldConstExpr(rhs.get())) {
+            if (*value == 0) return nullptr;
+            if (*value == 1) return lhs;
+        }
+        return binaryExpr("*", std::move(lhs), std::move(rhs));
+    }
+
+    static SymbolicAffine cloneSymbolicAffine(const SymbolicAffine &value) {
+        return SymbolicAffine{
+            cloneExprPlain(value.constant.get()),
+            cloneExprPlain(value.linear.get()),
+        };
+    }
+
+    static SymbolicAffine addSymbolicAffine(SymbolicAffine lhs,
+                                             SymbolicAffine rhs) {
+        lhs.constant = addSymbolicExpr(std::move(lhs.constant),
+                                       std::move(rhs.constant));
+        lhs.linear = addSymbolicExpr(std::move(lhs.linear),
+                                     std::move(rhs.linear));
+        return lhs;
+    }
+
+    static SymbolicAffine negateSymbolicAffine(SymbolicAffine value) {
+        value.constant = negateSymbolicExpr(std::move(value.constant));
+        value.linear = negateSymbolicExpr(std::move(value.linear));
+        return value;
+    }
+
+    static SymbolicAffine scaleSymbolicAffine(SymbolicAffine value,
+                                               const Expr *factor) {
+        value.constant = multiplySymbolicExpr(
+            std::move(value.constant), cloneExprPlain(factor));
+        value.linear = multiplySymbolicExpr(
+            std::move(value.linear), cloneExprPlain(factor));
+        return value;
+    }
+
+    static bool runtimeInvariantExpr(const Expr *expr,
+                                     const unordered_set<int> &changing) {
+        if (!expr || exprHasCallLocal(expr)) return false;
+        unordered_set<int> keys;
+        collectExprKeys(expr, keys);
+        for (int key : keys) {
+            if (changing.count(key)) return false;
+        }
+        return true;
+    }
+
+    bool symbolicAffineExpr(
+        const Expr *expr, int inductionKey,
+        const unordered_set<int> &changing,
+        const unordered_map<int, SymbolicAffine> &aliases,
+        SymbolicAffine &out) const {
+        if (!expr) return false;
+        if (runtimeInvariantExpr(expr, changing)) {
+            out = SymbolicAffine{cloneExprPlain(expr), nullptr};
+            return true;
+        }
+        switch (expr->kind) {
+            case Expr::Kind::Number:
+                out = SymbolicAffine{cloneExprPlain(expr), nullptr};
+                return true;
+            case Expr::Kind::Var: {
+                int key = exprKey(expr);
+                auto alias = aliases.find(key);
+                if (alias != aliases.end()) {
+                    out = cloneSymbolicAffine(alias->second);
+                    return true;
+                }
+                if (key != inductionKey) return false;
+                out = SymbolicAffine{nullptr, makeNumberExpr(1)};
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary:
+                if (!symbolicAffineExpr(expr->lhs.get(), inductionKey,
+                                        changing, aliases, out)) {
+                    return false;
+                }
+                if (expr->op == "+") return true;
+                if (expr->op == "-") {
+                    out = negateSymbolicAffine(std::move(out));
+                    return true;
+                }
+                return false;
+            case Expr::Kind::Binary: {
+                if (expr->op == "+" || expr->op == "-") {
+                    SymbolicAffine lhs;
+                    SymbolicAffine rhs;
+                    if (!symbolicAffineExpr(expr->lhs.get(), inductionKey,
+                                            changing, aliases, lhs) ||
+                        !symbolicAffineExpr(expr->rhs.get(), inductionKey,
+                                            changing, aliases, rhs)) {
+                        return false;
+                    }
+                    if (expr->op == "-") {
+                        rhs = negateSymbolicAffine(std::move(rhs));
+                    }
+                    out = addSymbolicAffine(std::move(lhs), std::move(rhs));
+                    return true;
+                }
+                if (expr->op != "*") return false;
+                if (runtimeInvariantExpr(expr->lhs.get(), changing)) {
+                    if (!symbolicAffineExpr(expr->rhs.get(), inductionKey,
+                                            changing, aliases, out)) {
+                        return false;
+                    }
+                    out = scaleSymbolicAffine(std::move(out), expr->lhs.get());
+                    return true;
+                }
+                if (runtimeInvariantExpr(expr->rhs.get(), changing)) {
+                    if (!symbolicAffineExpr(expr->lhs.get(), inductionKey,
+                                            changing, aliases, out)) {
+                        return false;
+                    }
+                    out = scaleSymbolicAffine(std::move(out), expr->rhs.get());
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool extractDynamicUnitCondition(const Expr *condition,
+                                     const ExactEnv &env,
+                                     CountedLoop &loop) const {
+        if (!condition || condition->kind != Expr::Kind::Binary) return false;
+        const Expr *induction = nullptr;
+        if (condition->op == "<" && condition->lhs &&
+            condition->lhs->kind == Expr::Kind::Var &&
+            !condition->lhs->fastGlobal) {
+            induction = condition->lhs.get();
+            loop.boundExpr = condition->rhs.get();
+        } else if (condition->op == ">" && condition->rhs &&
+                   condition->rhs->kind == Expr::Kind::Var &&
+                   !condition->rhs->fastGlobal) {
+            induction = condition->rhs.get();
+            loop.boundExpr = condition->lhs.get();
+        } else {
+            return false;
+        }
+        auto start = evalExact(induction, env);
+        if (!start || *start != 0 || evalExact(loop.boundExpr, env) ||
+            exprHasCallLocal(loop.boundExpr)) {
+            return false;
+        }
+        loop.inductionKey = exprKey(induction);
+        loop.inductionName = induction->name;
+        loop.start = 0;
+        loop.step = 1;
+        loop.relation = "<";
+        return loop.inductionKey >= 0;
+    }
+
+    bool trySummarizeDynamicUnitLoop(
+        unique_ptr<Stmt> &stmt, const ExactEnv &env,
+        unordered_set<int> &modifiedLocals) {
+        CountedLoop loop;
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            !extractDynamicUnitCondition(stmt->expr.get(), env, loop)) {
+            return false;
+        }
+
+        vector<const Stmt *> flat;
+        if (!flattenPolynomialBody(stmt->body.get(), flat) || flat.empty()) {
+            return false;
+        }
+        unordered_set<int> changing;
+        unordered_set<int> transient;
+        unordered_map<int, string> names;
+        names[loop.inductionKey] = loop.inductionName;
+        for (const Stmt *item : flat) {
+            if (item->kind == Stmt::Kind::Assign) {
+                int key = assignKey(item);
+                if (key < 0 ||
+                    (isGlobalKey(key) &&
+                     constGlobals.count(globalIndex(key)))) {
+                    return false;
+                }
+                changing.insert(key);
+                names[key] = item->name;
+            } else if (item->kind == Stmt::Kind::DeclStmt) {
+                int key = item->decl->fastSlot;
+                changing.insert(key);
+                transient.insert(key);
+                names[key] = item->decl->name;
+            }
+        }
+        if (!changing.count(loop.inductionKey)) return false;
+
+        unordered_set<int> boundKeys;
+        collectExprKeys(loop.boundExpr, boundKeys);
+        for (int key : changing) {
+            if (boundKeys.count(key)) return false;
+        }
+
+        int inductionUpdates = 0;
+        int lastEffect = -1;
+        for (int index = 0; index < static_cast<int>(flat.size()); ++index) {
+            const Stmt *item = flat[static_cast<size_t>(index)];
+            if (item->kind == Stmt::Kind::Assign ||
+                item->kind == Stmt::Kind::DeclStmt) {
+                lastEffect = index;
+            }
+            if (item->kind != Stmt::Kind::Assign ||
+                assignKey(item) != loop.inductionKey) {
+                continue;
+            }
+            int32_t delta = 0;
+            if (!polynomialInductionDelta(item->expr.get(),
+                                          loop.inductionKey, env,
+                                          changing, delta) ||
+                delta != 1) {
+                return false;
+            }
+            ++inductionUpdates;
+            if (lastEffect != index) return false;
+        }
+        if (inductionUpdates != 1 || lastEffect < 0 ||
+            flat[static_cast<size_t>(lastEffect)]->kind != Stmt::Kind::Assign ||
+            assignKey(flat[static_cast<size_t>(lastEffect)]) !=
+                loop.inductionKey) {
+            return false;
+        }
+
+        unordered_map<int, SymbolicAffine> aliases;
+        unordered_map<int, SymbolicAffine> deltas;
+        bool sawAccumulator = false;
+        for (int index = 0; index < lastEffect; ++index) {
+            const Stmt *item = flat[static_cast<size_t>(index)];
+            if (item->kind == Stmt::Kind::Empty ||
+                item->kind == Stmt::Kind::ExprStmt) {
+                continue;
+            }
+            if (item->kind == Stmt::Kind::DeclStmt) {
+                SymbolicAffine value;
+                if (!symbolicAffineExpr(item->decl->init.get(),
+                                        loop.inductionKey, changing,
+                                        aliases, value)) {
+                    return false;
+                }
+                aliases[item->decl->fastSlot] = std::move(value);
+                continue;
+            }
+
+            int key = assignKey(item);
+            if (key == loop.inductionKey) return false;
+            if (transient.count(key)) {
+                SymbolicAffine value;
+                if (!symbolicAffineExpr(item->expr.get(), loop.inductionKey,
+                                        changing, aliases, value)) {
+                    return false;
+                }
+                aliases[key] = std::move(value);
+                continue;
+            }
+
+            int coefficient = 0;
+            vector<pair<int, const Expr *>> terms;
+            if (!collectAccumulatorTerms(item->expr.get(), key, 1,
+                                         coefficient, terms) ||
+                coefficient != 1) {
+                return false;
+            }
+            for (const auto &[sign, termExpr] : terms) {
+                SymbolicAffine term;
+                if (!symbolicAffineExpr(termExpr, loop.inductionKey,
+                                        changing, aliases, term)) {
+                    return false;
+                }
+                if (sign < 0) {
+                    term = negateSymbolicAffine(std::move(term));
+                }
+                auto found = deltas.find(key);
+                if (found == deltas.end()) {
+                    deltas.emplace(key, std::move(term));
+                } else {
+                    found->second = addSymbolicAffine(
+                        std::move(found->second), std::move(term));
+                }
+            }
+            aliases.erase(key);
+            sawAccumulator = true;
+        }
+        if (!sawAccumulator) return false;
+
+        string countName = freshName();
+        string halfName = freshName();
+        string triangularName = freshName();
+        auto wrapper = make_unique<Stmt>();
+        wrapper->kind = Stmt::Kind::Block;
+        wrapper->stmts.push_back(
+            declStmt(countName, cloneExprPlain(loop.boundExpr)));
+
+        auto guarded = make_unique<Stmt>();
+        guarded->kind = Stmt::Kind::If;
+        guarded->expr = binaryExpr("<", varExpr(loop.inductionName),
+                                   varExpr(countName));
+        guarded->thenStmt = make_unique<Stmt>();
+        guarded->thenStmt->kind = Stmt::Kind::Block;
+        guarded->thenStmt->stmts.push_back(declStmt(
+            halfName,
+            binaryExpr("/", varExpr(countName), makeNumberExpr(2))));
+        auto odd = binaryExpr("%", varExpr(countName), makeNumberExpr(2));
+        auto otherFactor = binaryExpr(
+            "+", binaryExpr("-", varExpr(countName), makeNumberExpr(1)),
+            std::move(odd));
+        guarded->thenStmt->stmts.push_back(declStmt(
+            triangularName,
+            binaryExpr("*", varExpr(halfName), std::move(otherFactor))));
+
+        vector<int> accumulatorKeys;
+        accumulatorKeys.reserve(deltas.size());
+        for (const auto &[key, unused] : deltas) {
+            (void)unused;
+            accumulatorKeys.push_back(key);
+        }
+        sort(accumulatorKeys.begin(), accumulatorKeys.end());
+        for (int key : accumulatorKeys) {
+            SymbolicAffine delta = std::move(deltas.at(key));
+            unique_ptr<Expr> total = multiplySymbolicExpr(
+                std::move(delta.constant), varExpr(countName));
+            total = addSymbolicExpr(
+                std::move(total),
+                multiplySymbolicExpr(std::move(delta.linear),
+                                     varExpr(triangularName)));
+            if (!total) continue;
+            guarded->thenStmt->stmts.push_back(assignStmt(
+                names.at(key),
+                binaryExpr("+", varExpr(names.at(key)), std::move(total))));
+        }
+        guarded->thenStmt->stmts.push_back(
+            assignStmt(loop.inductionName, varExpr(countName)));
+        wrapper->stmts.push_back(std::move(guarded));
+        stmt = std::move(wrapper);
+        for (int key : changing) {
+            if (!isGlobalKey(key)) modifiedLocals.insert(key);
+        }
+        changed = true;
+        return true;
+    }
+
     bool trySummarizePolynomial(unique_ptr<Stmt> &stmt, const ExactEnv &env,
                                 CountedLoop &counted,
                                 unordered_set<int> &modifiedLocals) {
@@ -4615,6 +5083,15 @@ private:
                     if (counted.inductionKey >= 0 && !isGlobalKey(counted.inductionKey) &&
                         counted.inductionKey < static_cast<int>(env.size())) {
                         env[static_cast<size_t>(counted.inductionKey)] = counted.finalValue;
+                    }
+                    return;
+                }
+                modified.clear();
+                if (trySummarizeDynamicUnitLoop(stmt, env, modified)) {
+                    for (int slot : modified) {
+                        if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                            env[static_cast<size_t>(slot)] = nullopt;
+                        }
                     }
                     return;
                 }
