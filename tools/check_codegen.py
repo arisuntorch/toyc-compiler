@@ -370,6 +370,33 @@ def main() -> int:
         return 1
     print("[OK] global_call_store: retained call side effects")
 
+    dead_pure_call_loop = compile_source(
+        "int pure(int x){int j=0;int s=x;while(j<5){s=s*3+j;j=j+1;}"
+        "return s;}int main(){int i=0;int junk=0;while(i<1000000000){"
+        "junk=pure(i);i=i+1;}return 42;}"
+    )
+    dead_pure_main = function_assembly(dead_pure_call_loop, "main")
+    if "call pure" in dead_pure_main or ".Lwhile_body" in dead_pure_main:
+        print(
+            "[FAIL] dead_pure_call_loop: side-effect-free dead call was retained",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] dead_pure_call_loop: removed pure calls and enclosing loop")
+
+    live_effect_call_loop = compile_source(
+        "int g=0;int effect(int x){g=g+x;return g;}int main(){int i=0;"
+        "int junk=0;while(i<20){junk=effect(i);i=i+1;}return 42;}"
+    )
+    live_effect_main = function_assembly(live_effect_call_loop, "main")
+    if "call effect" not in live_effect_main or ".Lwhile_body" not in live_effect_main:
+        print(
+            "[FAIL] live_effect_call_loop: observable helper call was deleted",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] live_effect_call_loop: retained observable calls")
+
     loop_helper_fallbacks = {
         "non_affine_loop_helper": (
             "int helper(int n,int x){int j=0;while(j<n){x=x*x+1;j=j+1;}"

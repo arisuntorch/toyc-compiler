@@ -330,6 +330,7 @@ public:
                 resolveFunction(item.func.get());
             }
         }
+        computeSideEffectFreeFunctions();
         for (auto &item : prog.items) {
             if (item.kind != TopItem::Kind::Func) continue;
             unordered_set<int> live;
@@ -354,6 +355,8 @@ private:
 
     Program &prog;
     unordered_map<string, int> globalIndex;
+    unordered_map<string, Function *> functions;
+    unordered_set<const Function *> sideEffectFreeFunctions;
     int loopCount = 0;
 
     static int encodeBinaryOp(const string &op) {
@@ -385,6 +388,8 @@ private:
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl) {
                 globalIndex[item.decl->name] = index++;
+            } else {
+                functions[item.func->name] = item.func.get();
             }
         }
     }
@@ -481,6 +486,72 @@ private:
         return false;
     }
 
+    bool hasObservableCall(const Expr *expr) const {
+        if (!expr) return false;
+        bool observable = false;
+        if (expr->kind == Expr::Kind::Call) {
+            auto found = functions.find(expr->name);
+            observable = found == functions.end() ||
+                !sideEffectFreeFunctions.count(found->second);
+        }
+        if (observable || hasObservableCall(expr->lhs.get()) ||
+            hasObservableCall(expr->rhs.get())) {
+            return true;
+        }
+        for (auto &arg : expr->args) {
+            if (hasObservableCall(arg.get())) return true;
+        }
+        return false;
+    }
+
+    bool sideEffectFreeStmt(const Stmt *stmt) const {
+        if (!stmt) return true;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) {
+                    if (!sideEffectFreeStmt(child.get())) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+                return true;
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Return:
+                return !hasObservableCall(stmt->expr.get());
+            case Stmt::Kind::DeclStmt:
+                return stmt->decl &&
+                    !hasObservableCall(stmt->decl->init.get());
+            case Stmt::Kind::Assign:
+                return !stmt->fastAssignGlobal &&
+                    !hasObservableCall(stmt->expr.get());
+            case Stmt::Kind::If:
+                return !hasObservableCall(stmt->expr.get()) &&
+                    sideEffectFreeStmt(stmt->thenStmt.get()) &&
+                    sideEffectFreeStmt(stmt->elseStmt.get());
+            case Stmt::Kind::While:
+                return !hasObservableCall(stmt->expr.get()) &&
+                    sideEffectFreeStmt(stmt->body.get());
+        }
+        return false;
+    }
+
+    void computeSideEffectFreeFunctions() {
+        sideEffectFreeFunctions.clear();
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto &[name, function] : functions) {
+                (void)name;
+                if (sideEffectFreeFunctions.count(function)) continue;
+                if (sideEffectFreeStmt(function->body.get())) {
+                    sideEffectFreeFunctions.insert(function);
+                    changed = true;
+                }
+            }
+        }
+    }
+
     static void addReads(const Expr *expr, unordered_set<int> &live) {
         if (!expr) return;
         if (expr->kind == Expr::Kind::Var) {
@@ -492,8 +563,8 @@ private:
         for (auto &arg : expr->args) addReads(arg.get(), live);
     }
 
-    static bool loopWritesAreUnobservable(const Stmt *stmt,
-                                          const unordered_set<int> &liveAfter) {
+    bool loopWritesAreUnobservable(const Stmt *stmt,
+                                   const unordered_set<int> &liveAfter) const {
         if (!stmt || stmt->fastDeadStore) return true;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
@@ -504,15 +575,17 @@ private:
             case Stmt::Kind::Empty:
                 return true;
             case Stmt::Kind::ExprStmt:
-                return !hasCall(stmt->expr.get());
+                return !hasObservableCall(stmt->expr.get());
             case Stmt::Kind::Assign:
-                return !stmt->fastAssignGlobal && !hasCall(stmt->expr.get()) &&
+                return !stmt->fastAssignGlobal &&
+                       !hasObservableCall(stmt->expr.get()) &&
                        !liveAfter.count(stmt->fastAssignIndex);
             case Stmt::Kind::DeclStmt:
-                return stmt->decl && !hasCall(stmt->decl->init.get()) &&
+                return stmt->decl &&
+                       !hasObservableCall(stmt->decl->init.get()) &&
                        !liveAfter.count(stmt->decl->fastSlot);
             case Stmt::Kind::If:
-                return !hasCall(stmt->expr.get()) &&
+                return !hasObservableCall(stmt->expr.get()) &&
                        loopWritesAreUnobservable(stmt->thenStmt.get(), liveAfter) &&
                        loopWritesAreUnobservable(stmt->elseStmt.get(), liveAfter);
             case Stmt::Kind::While:
@@ -547,7 +620,9 @@ private:
             case Stmt::Kind::Empty:
                 return;
             case Stmt::Kind::ExprStmt:
-                if (hasCall(stmt->expr.get())) addReads(stmt->expr.get(), live);
+                if (hasObservableCall(stmt->expr.get())) {
+                    addReads(stmt->expr.get(), live);
+                }
                 else if (mark) stmt->fastDeadStore = true;
                 return;
             case Stmt::Kind::Return:
@@ -573,7 +648,8 @@ private:
             case Stmt::Kind::While: {
                 const unordered_set<int> after = live;
                 if (mark) {
-                    stmt->fastLoopValuesDead = !hasCall(stmt->expr.get()) &&
+                    stmt->fastLoopValuesDead =
+                        !hasObservableCall(stmt->expr.get()) &&
                         loopWritesAreUnobservable(stmt->body.get(), after);
                 }
                 unordered_set<int> head = after;
@@ -600,7 +676,8 @@ private:
                     return;
                 }
                 int slot = stmt->fastAssignIndex;
-                if (!live.count(slot) && !hasCall(stmt->expr.get())) {
+                if (!live.count(slot) &&
+                    !hasObservableCall(stmt->expr.get())) {
                     if (mark) stmt->fastDeadStore = true;
                     return;
                 }
@@ -610,7 +687,8 @@ private:
             }
             case Stmt::Kind::DeclStmt: {
                 int slot = stmt->decl->fastSlot;
-                if (!live.count(slot) && !hasCall(stmt->decl->init.get())) {
+                if (!live.count(slot) &&
+                    !hasObservableCall(stmt->decl->init.get())) {
                     if (mark) stmt->fastDeadStore = true;
                     return;
                 }
@@ -662,9 +740,9 @@ private:
         for (auto &arg : expr->args) collectGlobalReads(arg.get(), reads);
     }
 
-    static void collectGlobalStoreDependencies(
+    void collectGlobalStoreDependencies(
         Stmt *stmt, unordered_set<int> &roots,
-        vector<GlobalStoreDependency> &stores) {
+        vector<GlobalStoreDependency> &stores) const {
         if (!stmt || stmt->fastDeadStore) return;
         switch (stmt->kind) {
             case Stmt::Kind::Block:
@@ -690,7 +768,7 @@ private:
                 }
                 unordered_set<int> reads;
                 collectGlobalReads(stmt->expr.get(), reads);
-                if (hasCall(stmt->expr.get())) {
+                if (hasObservableCall(stmt->expr.get())) {
                     roots.insert(reads.begin(), reads.end());
                     return;
                 }
@@ -713,12 +791,6 @@ private:
     }
 
     void markDeadGlobalStores() {
-        unordered_map<string, Function *> functions;
-        for (auto &item : prog.items) {
-            if (item.kind == TopItem::Kind::Func) {
-                functions[item.func->name] = item.func.get();
-            }
-        }
         unordered_set<string> reachable;
         vector<string> pending;
         if (functions.count("main")) {
