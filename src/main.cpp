@@ -4175,8 +4175,8 @@ public:
     explicit CodeGen(Program &program) : prog(program) {}
 
     string generate() {
-        collectFunctions();
         collectImmutableGlobals();
+        collectFunctions();
         processGlobals();
         out << ".text\n";
         for (auto &item : prog.items) {
@@ -4194,6 +4194,8 @@ private:
     unordered_map<string, Function *> branchInlineableFuncs;
     unordered_map<string, Function *> loopInlineableFuncs;
     unordered_map<string, vector<int>> loopInlineRegisterSlots;
+    unordered_set<string> globalNames;
+    unordered_set<string> writableGlobalNames;
     unordered_set<string> immutableGlobals;
     vector<unordered_map<string, Symbol>> scopes;
     vector<string> breakLabels;
@@ -4327,8 +4329,9 @@ private:
         if (!e) return true;
         if (++nodes > 256 || e->kind == Expr::Kind::Call) return false;
         if (e->kind == Expr::Kind::Var) {
-            return !e->fastGlobal && e->fastIndex >= 0 &&
-                   e->fastIndex < localCount;
+            if (e->fastIndex < 0) return false;
+            return e->fastGlobal ? globalNames.count(e->name) != 0
+                                 : e->fastIndex < localCount;
         }
         if (!loopInlineExprShape(e->lhs.get(), localCount, nodes) ||
             !loopInlineExprShape(e->rhs.get(), localCount, nodes)) {
@@ -4380,10 +4383,14 @@ private:
                 flow = InlineFallthrough;
                 return true;
             case Stmt::Kind::Assign:
-                if (s->fastAssignGlobal || s->fastAssignIndex < 0 ||
-                    s->fastAssignIndex >= localCount ||
-                    !mutableSlots.count(s->fastAssignIndex) ||
+                if (s->fastAssignIndex < 0 ||
                     !loopInlineExprShape(s->expr.get(), localCount, nodes)) {
+                    return false;
+                }
+                if (s->fastAssignGlobal) {
+                    if (!writableGlobalNames.count(s->name)) return false;
+                } else if (s->fastAssignIndex >= localCount ||
+                           !mutableSlots.count(s->fastAssignIndex)) {
                     return false;
                 }
                 flow = InlineFallthrough;
@@ -4558,14 +4565,15 @@ private:
     }
 
     void collectImmutableGlobals() {
-        unordered_set<string> globalNames;
         unordered_set<string> assignedGlobalNames;
+        globalNames.clear();
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl) globalNames.insert(item.decl->name);
         }
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Func) collectGlobalAssignments(item.func->body.get(), globalNames, assignedGlobalNames);
         }
+        writableGlobalNames = assignedGlobalNames;
         immutableGlobals.clear();
         for (auto &item : prog.items) {
             if (item.kind == TopItem::Kind::Decl && !item.decl->isConst && !assignedGlobalNames.count(item.decl->name)) {
@@ -6655,7 +6663,7 @@ private:
             }
             case Stmt::Kind::Assign: {
                 auto symbol = lookup(s->name);
-                if (!symbol || symbol->isConst || symbol->isGlobal) {
+                if (!symbol || symbol->isConst) {
                     throw logic_error("invalid loop-inline assignment");
                 }
                 genExprNoCall(s->expr.get(), "a0",

@@ -259,13 +259,45 @@ def main() -> int:
         "int main(){g=2;int i=0;int s=0;while(i<20){"
         "s=s+helper(i);i=i+1;}return s;}"
     )
-    if "call helper" not in function_assembly(global_helper, "main"):
+    global_helper_main = function_assembly(global_helper, "main")
+    if ".Lwhile_body" not in global_helper_main:
         print(
-            "[FAIL] global_loop_helper: helper with global access was inlined",
+            "[FAIL] global_loop_helper: stateful helper was summarized statically",
             file=sys.stderr,
         )
         return 1
-    print("[OK] global_loop_helper: retained runtime call")
+    if "call helper" in global_helper_main or \
+            ".Lloop_inline_while_body" not in global_helper_main:
+        print(
+            "[FAIL] global_loop_helper: stateful helper was not runtime-inlined",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] global_loop_helper: retained runtime state and removed call")
+
+    global_write_helper = compile_source(
+        "int g=1;int helper(int n){int s=0;while(n>0){g=g+n;"
+        "if(n==3){break;}if(n%2==0){n=n-1;continue;}"
+        "s=s+g;n=n-1;}return s;}int main(){int i=0;int s=0;"
+        "while(i<20){s=s+helper(i%7+1);i=i+1;}return s+g;}"
+    )
+    global_write_main = function_assembly(global_write_helper, "main")
+    if ".Lwhile_body" not in global_write_main:
+        print(
+            "[FAIL] global_write_loop_helper: stateful loop was summarized statically",
+            file=sys.stderr,
+        )
+        return 1
+    if "call helper" in global_write_main or \
+            ".Lloop_inline_while_body" not in global_write_main or \
+            ".Lglob_g" not in global_write_main or \
+            "sw a0, 0(t6)" not in global_write_main:
+        print(
+            "[FAIL] global_write_loop_helper: global write was not runtime-inlined",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] global_write_loop_helper: emitted inline runtime global writes")
 
     print("[DONE] compiler uses static analysis and emits runtime RISC-V code")
     return 0
