@@ -1413,7 +1413,10 @@ public:
     void run() {
         collectInlineableFunctions();
         collectProgramNames();
+        collectGlobalWriteFreeFunctions();
         collectLocalPureFunctions();
+        functionEntryGlobals.clear();
+        functionEntrySeen.clear();
         // Recompute reachability and writes after each rewrite pass.  A first
         // pass can delete a constant-false call or global store, allowing the
         // next pass to prove additional globals immutable from main.
@@ -1442,6 +1445,15 @@ public:
                 env.clear();
                 knownGlobals = item.func->name == "main"
                     ? globalInitialValues : globalConsts;
+                auto entry = functionEntryGlobals.find(item.func->name);
+                if (programRound == 2 &&
+                    entry != functionEntryGlobals.end()) {
+                    for (const auto &[name, value] : entry->second) {
+                        knownGlobals[name] = value;
+                    }
+                }
+                recordFunctionEntries = programRound < 2 &&
+                    item.func->name == "main";
                 enter();
                 for (const string &param : item.func->params) {
                     env.back()[param] = LocalInfo{};
@@ -1450,6 +1462,7 @@ public:
                 leave();
                 cseFunction(*item.func);
                 dceFunction(*item.func);
+                recordFunctionEntries = false;
             }
             knownGlobals.clear();
         }
@@ -1463,8 +1476,12 @@ private:
     unordered_set<string> globalNames;
     unordered_set<string> assignedGlobalNames;
     unordered_set<string> localPureFunctions;
+    unordered_set<string> globalWriteFreeFunctions;
     unordered_map<string, int32_t> globalInitialValues;
     unordered_map<string, int32_t> knownGlobals;
+    unordered_map<string, unordered_map<string, int32_t>> functionEntryGlobals;
+    unordered_set<string> functionEntrySeen;
+    bool recordFunctionEntries = false;
     struct LocalInfo {
         optional<int32_t> constVal;
         string copyOf;  // empty = not a copy of another local
@@ -1522,6 +1539,84 @@ private:
             if (it->count(name)) return true;
         }
         return false;
+    }
+
+    void collectDirectGlobalWrites(
+        const Stmt *stmt, vector<unordered_set<string>> &scopes,
+        unordered_set<string> &writes) const {
+        if (!stmt) return;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                scopes.push_back({});
+                for (auto &child : stmt->stmts) {
+                    collectDirectGlobalWrites(child.get(), scopes, writes);
+                }
+                scopes.pop_back();
+                return;
+            case Stmt::Kind::DeclStmt:
+                if (stmt->decl) scopes.back().insert(stmt->decl->name);
+                return;
+            case Stmt::Kind::Assign:
+                if (!scopeContains(scopes, stmt->name) &&
+                    globalNames.count(stmt->name)) {
+                    writes.insert(stmt->name);
+                }
+                return;
+            case Stmt::Kind::If: {
+                auto thenScopes = scopes;
+                auto elseScopes = scopes;
+                collectDirectGlobalWrites(
+                    stmt->thenStmt.get(), thenScopes, writes);
+                collectDirectGlobalWrites(
+                    stmt->elseStmt.get(), elseScopes, writes);
+                return;
+            }
+            case Stmt::Kind::While: {
+                auto bodyScopes = scopes;
+                collectDirectGlobalWrites(stmt->body.get(), bodyScopes, writes);
+                return;
+            }
+            case Stmt::Kind::Empty:
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return;
+        }
+    }
+
+    void collectGlobalWriteFreeFunctions() {
+        globalWriteFreeFunctions.clear();
+        unordered_map<string, unordered_set<string>> calls;
+        for (const auto &[name, function] : functions) {
+            vector<unordered_set<string>> scopes(1);
+            for (const string &param : function->params) {
+                scopes.back().insert(param);
+            }
+            unordered_set<string> writes;
+            collectDirectGlobalWrites(function->body.get(), scopes, writes);
+            unordered_set<string> called;
+            collectCalledFunctions(function->body.get(), called);
+            calls[name] = std::move(called);
+            if (writes.empty()) globalWriteFreeFunctions.insert(name);
+        }
+
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            vector<string> writers;
+            for (const string &name : globalWriteFreeFunctions) {
+                for (const string &callee : calls.at(name)) {
+                    if (!globalWriteFreeFunctions.count(callee)) {
+                        writers.push_back(name);
+                        break;
+                    }
+                }
+            }
+            for (const string &name : writers) {
+                changed = globalWriteFreeFunctions.erase(name) != 0 || changed;
+            }
+        }
     }
 
     bool collectLocalPureExpr(
@@ -1797,9 +1892,21 @@ private:
                 string callee = e->name;
                 for (auto &arg : e->args) optExpr(arg);
                 inlinePureCall(e);
-                if (e && e->kind == Expr::Kind::Call &&
-                    !localPureFunctions.count(callee)) {
-                    knownGlobals.clear();
+                if (e && e->kind == Expr::Kind::Call) {
+                    if (recordFunctionEntries &&
+                        globalWriteFreeFunctions.count(callee)) {
+                        auto found = functionEntryGlobals.find(callee);
+                        if (!functionEntrySeen.count(callee)) {
+                            functionEntryGlobals[callee] = knownGlobals;
+                            functionEntrySeen.insert(callee);
+                        } else if (found != functionEntryGlobals.end()) {
+                            found->second = mergeKnownGlobals(
+                                found->second, knownGlobals);
+                        }
+                    }
+                    if (!globalWriteFreeFunctions.count(callee)) {
+                        knownGlobals.clear();
+                    }
                 }
                 return;
             }

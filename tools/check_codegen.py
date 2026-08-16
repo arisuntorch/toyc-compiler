@@ -412,6 +412,32 @@ def main() -> int:
         )
         return 1
 
+    readonly_global_entry = compile_source(
+        "int g=1;int helper(){int i=0;int s=0;while(i<100000000){"
+        "s=s+g*i;i=i+1;}return s;}"
+        "int main(){g=7;return helper();}"
+    )
+    readonly_helper = function_assembly(readonly_global_entry, "helper")
+    if ".Lwhile_body" in readonly_helper or ".Lglob_g" in readonly_helper:
+        print(
+            "[FAIL] readonly_global_entry: call-site constant was not imported",
+            file=sys.stderr,
+        )
+        return 1
+
+    divergent_global_entry = compile_source(
+        "int g=1;int helper(){int i=0;int s=0;while(i<100000000){"
+        "s=s+g*i;i=i+1;}return s;}"
+        "int main(){g=7;int a=helper();g=8;int b=helper();return a+b;}"
+    )
+    if ".Lwhile_body" not in function_assembly(
+            divergent_global_entry, "helper"):
+        print(
+            "[FAIL] divergent_global_entry: incompatible call sites were merged",
+            file=sys.stderr,
+        )
+        return 1
+
     mutable_global = compile_source(
         "int g=7;void set(){g=99;}int main(){set();int i=0;int s=0;"
         "while(i<1000000000){s=s+g;i=i+1;}return s;}"
