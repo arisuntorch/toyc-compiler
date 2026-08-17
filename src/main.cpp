@@ -1411,16 +1411,16 @@ public:
     explicit SafeOptimizer(Program &program) : prog(program) {}
 
     void run() {
+        collectInlineableFunctions();
         collectProgramNames();
+        collectFunctionGlobalWrites();
+        collectLocalPureFunctions();
         functionEntryGlobals.clear();
         functionEntrySeen.clear();
-        // Recompute reachability and writes after each rewrite pass.  A first
-        // pass can delete a constant-false call or global store, allowing the
-        // next pass to prove additional globals immutable from main.
+        // Recompute direct global assignments after each rewrite pass. A first
+        // pass can delete a constant-false store, allowing the next pass to
+        // prove additional globals immutable from main.
         for (int programRound = 0; programRound < 3; ++programRound) {
-            collectInlineableFunctions();
-            collectFunctionGlobalWrites();
-            collectLocalPureFunctions();
             collectGlobalAssignments();
             globalConsts.clear();
             globalInitialValues.clear();
