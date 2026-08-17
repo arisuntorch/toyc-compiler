@@ -198,6 +198,30 @@ def main() -> int:
         return 1
     print("[OK] straight_line_summary: removed helper call and loop backedge")
 
+    summary_spill = compile_source(
+        "int helper(int x,int y){"
+        "int z0=x+y;int z1=x-y;int z2=x*y;int z3=x+y*3;"
+        "int z4=x*5-y;int z5=x-y*7;int z6=x*9+y;int z7=x+y*11;"
+        "int r7=z7+x;int r6=z6+r7;int r5=z5+r6;int r4=z4+r5;"
+        "int r3=z3+r4;int r2=z2+r3;int r1=z1+r2;int r0=z0+r1;"
+        "return r0;}"
+        "int main(){int i=0;int s=123;while(i<2){"
+        "s=helper(s,i+7);i=i+1;}return s;}"
+    )
+    summary_spill_main = function_assembly(summary_spill, "main")
+    preserves_assignment_target = re.search(
+        r"\bsw ([ast][0-9]+), 12\(sp\).*\blw \1, 28\(sp\)",
+        summary_spill_main,
+        re.DOTALL,
+    )
+    if "call helper" in summary_spill_main or not preserves_assignment_target:
+        print(
+            "[FAIL] summary_spill: deep inline expression clobbers its input",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] summary_spill: preserved self-assignment input across spills")
+
     pure_call_cse = compile_source(
         "int helper(int x){int j=0;int s=x;while(j<8){"
         "s=s*3+j;j=j+1;}return s;}"

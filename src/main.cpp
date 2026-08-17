@@ -8107,6 +8107,22 @@ private:
         }
     }
 
+    bool exprReadsRegister(const Expr *e, const string &reg) const {
+        if (!e) return false;
+        if (e->kind == Expr::Kind::Var) {
+            auto symbol = lookup(e->name);
+            return symbol && !symbol->isConst && symbol->reg == reg;
+        }
+        if (exprReadsRegister(e->lhs.get(), reg) ||
+            exprReadsRegister(e->rhs.get(), reg)) {
+            return true;
+        }
+        for (auto &arg : e->args) {
+            if (exprReadsRegister(arg.get(), reg)) return true;
+        }
+        return false;
+    }
+
     void genExprNoCall(const Expr *e, const string &dst, vector<string> regs) {
         if (auto v = tryConst(e)) {
             emitLoadConst(dst, *v);
@@ -8336,10 +8352,16 @@ private:
         }
 
         if (regs.empty()) {
+            // The rhs can still need the assignment target's old value. Keep
+            // that value below the lhs spill until rhs generation has read it.
+            bool preserveDst = exprReadsRegister(e->rhs.get(), dst);
+            if (preserveDst) pushReg(dst);
             genExprNoCall(e->lhs.get(), dst, regs);
             pushReg(dst);
+            if (preserveDst) loadMem(dst, "sp", 28);
             genExprNoCall(e->rhs.get(), dst, {});
             popTo("t6");
+            if (preserveDst) adjustSp(16);
             emitBinaryReg(e->op, dst, "t6", dst);
             return;
         }
