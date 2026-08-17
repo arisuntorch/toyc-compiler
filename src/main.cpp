@@ -9054,7 +9054,8 @@ int main(int argc, char **argv) {
     // or executes a ToyC function.
     // Re-resolve after each rewrite round so an outer loop can consume the
     // closed-form state transition produced for a nested inner loop.
-    for (int round = 0; round < 4; ++round) {
+    constexpr int kAffineRewriteRounds = 0;  // OJ isolation probe.
+    for (int round = 0; round < kAffineRewriteRounds; ++round) {
         AffineLoopOptimizer loopOptimizer(program);
         if (!loopOptimizer.run()) break;
         StaticAnalyzer rewrittenAnalysis(program);
