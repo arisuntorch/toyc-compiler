@@ -284,14 +284,17 @@ static const Stmt *functionOptimizationBody(const Function *function) {
         ? function->straightLineSummary.get() : function->body.get();
 }
 
-static const Expr *functionInlineExpr(const Function *function) {
-    const Stmt *body = functionOptimizationBody(function);
+static const Expr *singleReturnExpr(const Stmt *body) {
     if (!body || body->kind != Stmt::Kind::Block || body->stmts.size() != 1) {
         return nullptr;
     }
     const Stmt *ret = body->stmts[0].get();
     if (!ret || ret->kind != Stmt::Kind::Return) return nullptr;
     return ret->expr.get();
+}
+
+static const Expr *functionInlineExpr(const Function *function) {
+    return singleReturnExpr(functionOptimizationBody(function));
 }
 
 static int32_t wrap32(long long x) {
@@ -7864,7 +7867,10 @@ private:
                 genBinary(e);
                 break;
             case Expr::Kind::Call:
-                if (tryGenInlineCall(e, "a0")) break;
+                if (tryGenInlineCall(
+                        e, "a0", {"t0", "t1", "t2", "t3", "t4", "t5"})) {
+                    break;
+                }
                 genCall(e);
                 break;
         }
@@ -7994,15 +8000,24 @@ private:
         return false;
     }
 
-    string pickScratch(initializer_list<string> blocked, const vector<string> &preferred = {}) const {
+    optional<string> pickScratch(initializer_list<string> blocked,
+                                 const vector<string> &preferred = {}) const {
         for (const string &r : preferred) {
             if (!regBlocked(r, blocked)) return r;
         }
-        static const vector<string> regs = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
-        for (const string &r : regs) {
-            if (!regBlocked(r, blocked)) return r;
+        if (!regBlocked("t6", blocked)) return "t6";
+        return nullopt;
+    }
+
+    void emitDirectDivModConst(const string &dst, const string &src,
+                               int divisor, bool isMod) {
+        string divisorReg = constReg(divisor);
+        if (divisorReg.empty()) {
+            emit("li t6, " + to_string(divisor));
+            divisorReg = "t6";
         }
-        return "t6";
+        emit(string(isMod ? "rem " : "div ") + dst + ", " + src +
+             ", " + divisorReg);
     }
 
     void emitQuotientConst(const string &dst, const string &src, int divisor, const string &tmp) {
@@ -8067,13 +8082,25 @@ private:
         }
         if (!isMod) {
             if (dst == src) {
-                string orig = pickScratch({dst, src}, scratchPrefs);
-                string tmp = pickScratch({dst, src, orig}, scratchPrefs);
-                emit("mv " + orig + ", " + src);
-                emitQuotientConst(dst, orig, divisor, tmp);
+                auto orig = pickScratch({dst, src}, scratchPrefs);
+                if (!orig) {
+                    emitDirectDivModConst(dst, src, divisor, false);
+                    return;
+                }
+                auto tmp = pickScratch({dst, src, *orig}, scratchPrefs);
+                if (!tmp) {
+                    emitDirectDivModConst(dst, src, divisor, false);
+                    return;
+                }
+                emit("mv " + *orig + ", " + src);
+                emitQuotientConst(dst, *orig, divisor, *tmp);
             } else {
-                string tmp = pickScratch({dst, src}, scratchPrefs);
-                emitQuotientConst(dst, src, divisor, tmp);
+                auto tmp = pickScratch({dst, src}, scratchPrefs);
+                if (!tmp) {
+                    emitDirectDivModConst(dst, src, divisor, false);
+                    return;
+                }
+                emitQuotientConst(dst, src, divisor, *tmp);
             }
             return;
         }
@@ -8082,35 +8109,47 @@ private:
             return;
         }
         if (dst != src) {
-            string tmp = pickScratch({dst, src}, scratchPrefs);
-            emitQuotientConst(dst, src, divisor, tmp);
+            auto tmp = pickScratch({dst, src}, scratchPrefs);
+            if (!tmp) {
+                emitDirectDivModConst(dst, src, divisor, true);
+                return;
+            }
+            emitQuotientConst(dst, src, divisor, *tmp);
             if (isPowerOfTwo(divisor)) {
                 emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(divisor)));
             } else {
                 string dreg = constReg(divisor);
                 if (dreg.empty()) {
-                    emit("li " + tmp + ", " + to_string(divisor));
-                    dreg = tmp;
+                    emit("li " + *tmp + ", " + to_string(divisor));
+                    dreg = *tmp;
                 }
                 emit("mul " + dst + ", " + dst + ", " + dreg);
             }
             emit("sub " + dst + ", " + src + ", " + dst);
             return;
         }
-        string orig = pickScratch({dst, src}, scratchPrefs);
-        string tmp = pickScratch({dst, src, orig}, scratchPrefs);
-        emit("mv " + orig + ", " + src);
-        emitQuotientConst(dst, orig, divisor, tmp);
+        auto orig = pickScratch({dst, src}, scratchPrefs);
+        if (!orig) {
+            emitDirectDivModConst(dst, src, divisor, true);
+            return;
+        }
+        auto tmp = pickScratch({dst, src, *orig}, scratchPrefs);
+        if (!tmp) {
+            emitDirectDivModConst(dst, src, divisor, true);
+            return;
+        }
+        emit("mv " + *orig + ", " + src);
+        emitQuotientConst(dst, *orig, divisor, *tmp);
         if (isPowerOfTwo(divisor)) emit("slli " + dst + ", " + dst + ", " + to_string(log2Int(divisor)));
         else {
             string dreg = constReg(divisor);
             if (dreg.empty()) {
-                emit("li " + tmp + ", " + to_string(divisor));
-                dreg = tmp;
+                emit("li " + *tmp + ", " + to_string(divisor));
+                dreg = *tmp;
             }
             emit("mul " + dst + ", " + dst + ", " + dreg);
         }
-        emit("sub " + dst + ", " + orig + ", " + dst);
+        emit("sub " + dst + ", " + *orig + ", " + dst);
     }
 
     void emitBinaryReg(const string &op, const string &dst, const string &lhs, const string &rhs) {
@@ -8165,7 +8204,7 @@ private:
                 loadVarTo(e->name, dst);
                 return;
             case Expr::Kind::Call:
-                if (tryGenInlineCall(e, dst)) return;
+                if (tryGenInlineCall(e, dst, regs)) return;
                 genExpr(e);
                 if (dst != "a0") emit("mv " + dst + ", a0");
                 return;
@@ -8973,7 +9012,8 @@ private:
         return true;
     }
 
-    bool tryGenInlineCall(const Expr *e, const string &dst) {
+    bool tryGenInlineCall(const Expr *e, const string &dst,
+                          vector<string> scratchRegs) {
         if (!e || e->kind != Expr::Kind::Call) return false;
         auto found = inlineableFuncs.find(e->name);
         if (found != inlineableFuncs.end()) {
@@ -8989,7 +9029,14 @@ private:
             const Expr *ret = functionInlineExpr(f);
             if (!ret) return false;
             auto expanded = cloneExprSubstGeneric(ret, subst);
-            genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
+            string resultReg = dst;
+            if (exprReadsRegister(expanded.get(), dst)) {
+                if (scratchRegs.empty()) return false;
+                resultReg = scratchRegs.front();
+                scratchRegs.erase(scratchRegs.begin());
+            }
+            genExprNoCall(expanded.get(), resultReg, std::move(scratchRegs));
+            if (resultReg != dst) emit("mv " + dst + ", " + resultReg);
             return true;
         }
 
