@@ -262,6 +262,10 @@ struct Function {
     vector<string> params;
     int fastLocalCount = -1;
     unique_ptr<Stmt> body;
+    // A closed-form, call-free expression used by optimization passes.  Keep
+    // the executable body intact so binding, effect, and ABI metadata remain
+    // attached to the original statement graph.
+    unique_ptr<Stmt> straightLineSummary;
 };
 
 struct TopItem {
@@ -273,6 +277,22 @@ struct TopItem {
 struct Program {
     vector<TopItem> items;
 };
+
+static const Stmt *functionOptimizationBody(const Function *function) {
+    if (!function) return nullptr;
+    return function->straightLineSummary
+        ? function->straightLineSummary.get() : function->body.get();
+}
+
+static const Expr *functionInlineExpr(const Function *function) {
+    const Stmt *body = functionOptimizationBody(function);
+    if (!body || body->kind != Stmt::Kind::Block || body->stmts.size() != 1) {
+        return nullptr;
+    }
+    const Stmt *ret = body->stmts[0].get();
+    if (!ret || ret->kind != Stmt::Kind::Return) return nullptr;
+    return ret->expr.get();
+}
 
 static int32_t wrap32(long long x) {
     return static_cast<int32_t>(static_cast<uint32_t>(x));
@@ -424,6 +444,10 @@ private:
             scopes.back()[param] = nextLocal++;
         }
         resolveStmt(function->body.get(), scopes, nextLocal);
+        if (function->straightLineSummary) {
+            int summaryLocal = static_cast<int>(function->params.size());
+            resolveStmt(function->straightLineSummary.get(), scopes, summaryLocal);
+        }
         function->fastLocalCount = nextLocal;
     }
 
@@ -1629,6 +1653,7 @@ private:
     }
 
     bool summarizeStraightLineFunction(Function &function) {
+        function.straightLineSummary.reset();
         if (function.returnsVoid || !function.body) return false;
 
         vector<unordered_map<string, int>> scopes(1);
@@ -1674,7 +1699,7 @@ private:
         ret->kind = Stmt::Kind::Return;
         ret->expr = std::move(result);
         body->stmts.push_back(std::move(ret));
-        function.body = std::move(body);
+        function.straightLineSummary = std::move(body);
         return true;
     }
 
@@ -1682,12 +1707,10 @@ private:
         inlineableFuncs.clear();
         for (auto &item : prog.items) {
             if (item.kind != TopItem::Kind::Func || item.func->returnsVoid) continue;
-            const Stmt *body = item.func->body.get();
-            if (!body || body->kind != Stmt::Kind::Block || body->stmts.size() != 1) continue;
-            const Stmt *ret = body->stmts[0].get();
-            if (ret->kind != Stmt::Kind::Return || !ret->expr || exprHasCall(ret->expr.get())) continue;
+            const Expr *expr = functionInlineExpr(item.func.get());
+            if (!expr || exprHasCall(expr)) continue;
             unordered_set<string> params(item.func->params.begin(), item.func->params.end());
-            if (!exprUsesOnlyVars(ret->expr.get(), params)) continue;
+            if (!exprUsesOnlyVars(expr, params)) continue;
             inlineableFuncs[item.func->name] = item.func.get();
         }
     }
@@ -2276,7 +2299,9 @@ private:
         }
         unordered_map<string, const Expr *> subst;
         for (size_t i = 0; i < f->params.size(); ++i) subst[f->params[i]] = e->args[i].get();
-        e = cloneExprSubstGeneric(f->body->stmts[0]->expr.get(), subst);
+        const Expr *summary = functionInlineExpr(f);
+        if (!summary) return;
+        e = cloneExprSubstGeneric(summary, subst);
         optExpr(e);
     }
 
@@ -3536,7 +3561,8 @@ private:
                                                  item.func->params.end());
                     int nodes = 0;
                     bool alwaysReturns = false;
-                    if (branchHelperShape(item.func->body.get(), params, nodes,
+                    if (branchHelperShape(functionOptimizationBody(item.func.get()),
+                                          params, nodes,
                                           alwaysReturns) && alwaysReturns) {
                         branchHelpers[item.func->name] = item.func.get();
                     }
@@ -4281,7 +4307,8 @@ private:
             args.reserve(call->args.size());
             for (auto &arg : call->args) args.push_back(arg.get());
             optional<int32_t> result;
-            if (exactHelperStmt(function->body.get(), args, model, current,
+            if (exactHelperStmt(functionOptimizationBody(function), args,
+                                model, current,
                                 base, result) == HelperFlow::Returned) {
                 return result;
             }
@@ -4465,7 +4492,8 @@ private:
             vector<const Expr *> args;
             args.reserve(call->args.size());
             for (auto &arg : call->args) args.push_back(arg.get());
-            if (affineHelperStmt(function->body.get(), args, model, current,
+            if (affineHelperStmt(functionOptimizationBody(function), args,
+                                 model, current,
                                  base, out) == HelperFlow::Returned) {
                 return true;
             }
@@ -4677,7 +4705,8 @@ private:
         vector<const Expr *> args;
         args.reserve(call->args.size());
         for (auto &arg : call->args) args.push_back(arg.get());
-        return periodicHelperStmt(function->body.get(), args, inductionKey,
+        return periodicHelperStmt(functionOptimizationBody(function), args,
+                                  inductionKey,
                                   env, model, phaseExactKeys, moduli,
                                   sawPeriodic, requireExactReturn) ==
                HelperFlow::Returned;
@@ -6662,11 +6691,11 @@ private:
                 funcs[function->name] = FuncInfo{function->returnsVoid,
                                                  static_cast<int>(function->params.size())};
                 const Stmt *body = function->body.get();
-                if (!function->returnsVoid && body && body->kind == Stmt::Kind::Block &&
-                    body->stmts.size() == 1 && body->stmts[0]->kind == Stmt::Kind::Return &&
-                    body->stmts[0]->expr && !exprHasCall(body->stmts[0]->expr.get())) {
+                const Expr *inlineExpr = functionInlineExpr(function);
+                if (!function->returnsVoid && inlineExpr &&
+                    !exprHasCall(inlineExpr)) {
                     unordered_set<string> params(function->params.begin(), function->params.end());
-                    if (exprUsesOnlyVars(body->stmts[0]->expr.get(), params)) {
+                    if (exprUsesOnlyVars(inlineExpr, params)) {
                         inlineableFuncs[function->name] = function;
                     }
                 }
@@ -8957,7 +8986,8 @@ private:
             for (size_t i = 0; i < f->params.size(); ++i) {
                 subst[f->params[i]] = e->args[i].get();
             }
-            const Expr *ret = f->body->stmts[0]->expr.get();
+            const Expr *ret = functionInlineExpr(f);
+            if (!ret) return false;
             auto expanded = cloneExprSubstGeneric(ret, subst);
             genExprNoCall(expanded.get(), dst, {"t0", "t1", "t2", "t3", "t4", "t5"});
             return true;

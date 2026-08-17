@@ -222,6 +222,28 @@ def main() -> int:
         return 1
     print("[OK] summary_spill: preserved self-assignment input across spills")
 
+    detached_summary = compile_source(
+        "int id(int x){if(x<0){return x;}return x;}"
+        "int helper(int x){int v0=x+1;int v1=v0+2;int v2=v1+3;"
+        "int v3=v2+4;int v4=v3+5;int v5=v4+6;int v6=v5+7;"
+        "int v7=v6+8;int v8=v7+9;int v9=v8+10;int v10=v9+11;"
+        "int v11=v10+12;int v12=v11+13;int v13=v12+14;"
+        "int v14=v13+15;int v15=v14+16;int v16=v15+17;"
+        "int v17=v16+18;int v18=v17+19;int v19=v18+20;return v19;}"
+        "int main(){return helper(id(7));}"
+    )
+    detached_main = function_assembly(detached_summary, "main")
+    detached_helper = function_assembly(detached_summary, "helper")
+    helper_frame = re.search(r"^\s+addi sp, sp, -(\d+)$", detached_helper, re.MULTILINE)
+    if "call helper" not in detached_main or not helper_frame or \
+            int(helper_frame.group(1)) < 96:
+        print(
+            "[FAIL] detached_summary: executable helper body was replaced by its summary",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] detached_summary: preserved executable helper slots on ABI path")
+
     pure_call_cse = compile_source(
         "int helper(int x){int j=0;int s=x;while(j<8){"
         "s=s*3+j;j=j+1;}return s;}"
