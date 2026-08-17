@@ -7729,7 +7729,38 @@ private:
                 if (!hasCall(rhs) && !exprHasShortCircuit(rhs)) {
                     auto sym = lookup(s->name);
                     if (sym && !sym->isConst && !sym->reg.empty()) {
-                        genExprNoCall(rhs, sym->reg, {"t0", "t1", "t2", "t3", "t4", "t5"});
+                        if (exprReadsRegister(rhs, sym->reg)) {
+                            // The expanded RHS may read the old assignment
+                            // target more than once. Evaluate it in a scratch
+                            // home first so the target register stays stable.
+                            static const vector<string> scratch = {
+                                "t0", "t1", "t2", "t3", "t4", "t5"};
+                            string resultReg;
+                            for (const string &candidate : scratch) {
+                                if (candidate != sym->reg &&
+                                    !exprReadsRegister(rhs, candidate)) {
+                                    resultReg = candidate;
+                                    break;
+                                }
+                            }
+                            if (!resultReg.empty()) {
+                                vector<string> pool;
+                                for (const string &candidate : scratch) {
+                                    if (candidate != resultReg) pool.push_back(candidate);
+                                }
+                                genExprNoCall(rhs, resultReg, std::move(pool));
+                                emit("mv " + sym->reg + ", " + resultReg);
+                                break;
+                            }
+                        } else {
+                            genExprNoCall(rhs, sym->reg,
+                                          {"t0", "t1", "t2", "t3", "t4", "t5"});
+                            break;
+                        }
+                        // No independent scratch home was available; use the
+                        // normal result register and ABI-safe store path.
+                        genExpr(rhs);
+                        storeVar(s->name);
                         break;
                     }
                 }

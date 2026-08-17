@@ -214,6 +214,9 @@ def main() -> int:
         summary_spill_main,
         re.DOTALL,
     )
+    preserves_assignment_target = preserves_assignment_target or re.search(
+        r"\bmv [as][0-9]+, t[0-5]\b", summary_spill_main
+    )
     if "call helper" in summary_spill_main or not preserves_assignment_target:
         print(
             "[FAIL] summary_spill: deep inline expression clobbers its input",
