@@ -1657,7 +1657,10 @@ private:
 
     bool summarizeStraightLineFunction(Function &function) {
         function.straightLineSummary.reset();
-        if (function.returnsVoid || !function.body) return false;
+        if (function.returnsVoid || !function.body ||
+            function.params.size() > 2) {
+            return false;
+        }
 
         vector<unordered_map<string, int>> scopes(1);
         vector<unique_ptr<Expr>> values;

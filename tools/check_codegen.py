@@ -198,6 +198,20 @@ def main() -> int:
         return 1
     print("[OK] straight_line_summary: removed helper call and loop backedge")
 
+    wide_straight_line = compile_source(
+        "int helper(int x,int y,int z){int a=x+3;int b=a*y;return b-z;}"
+        "int main(){int i=0;int s=0;while(i<100000000){"
+        "s=s+helper(i,5,7);i=i+1;}return s;}"
+    )
+    wide_straight_line_main = function_assembly(wide_straight_line, "main")
+    if "call helper" not in wide_straight_line_main:
+        print(
+            "[FAIL] wide_straight_line: three-parameter summary bypassed safety cap",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] wide_straight_line: retained three-parameter helper call")
+
     dead_init_summary = compile_source(
         "int helper(int x,int y){x=x-6;int v0=x*(-5);int v1=y*3;"
         "int v2=v0+v1;int v3=v2+x-y+4;return v3;}"
