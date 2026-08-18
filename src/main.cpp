@@ -3346,6 +3346,11 @@ private:
         array<uint32_t, kPolynomialTerms> coefficients{};
     };
 
+    struct ModularRange {
+        int64_t lo;
+        int64_t hi;
+    };
+
     struct SymbolicAffine {
         unique_ptr<Expr> constant;
         unique_ptr<Expr> linear;
@@ -4982,9 +4987,10 @@ private:
         vector<int32_t> moduli;
         bool sawPeriodic = false;
         unordered_set<int> phaseExactKeys;
-        if (!collectPeriodicStructure(loop->body.get(), counted.inductionKey, env,
-                                      model, phaseExactKeys, moduli, sawPeriodic) ||
-            !sawPeriodic) {
+        bool periodicShape = collectPeriodicStructure(
+            loop->body.get(), counted.inductionKey, env,
+            model, phaseExactKeys, moduli, sawPeriodic);
+        if (!periodicShape || !sawPeriodic) {
             return false;
         }
 
@@ -5022,14 +5028,18 @@ private:
             auto base = periodicBase(model, env, counted.inductionKey,
                                      static_cast<int32_t>(phaseValue));
             Matrix transform = identityMatrix(dimension);
-            if (!applyBodyTransform(loop->body.get(), model, transform, &base)) return false;
+            if (!applyBodyTransform(loop->body.get(), model, transform, &base)) {
+                return false;
+            }
 
             const Row &inductionRow = transform[static_cast<size_t>(inductionIndex)];
             for (int i = 0; i < states; ++i) {
                 uint32_t expected = i == inductionIndex ? 1u : 0u;
                 if (inductionRow[static_cast<size_t>(i)] != expected) return false;
             }
-            if (static_cast<int32_t>(inductionRow.back()) != counted.step) return false;
+            if (static_cast<int32_t>(inductionRow.back()) != counted.step) {
+                return false;
+            }
             periodTransform = multiply(transform, periodTransform);
             phases.push_back(std::move(transform));
         }
@@ -5049,6 +5059,777 @@ private:
             closed = multiply(phases[static_cast<size_t>(phase)], closed);
         }
         return true;
+    }
+
+    static void reduceRow(Row &row, uint32_t modulus) {
+        if (modulus == 0) return;
+        for (uint32_t &value : row) value %= modulus;
+    }
+
+    static Matrix multiplyModular(const Matrix &lhs, const Matrix &rhs,
+                                  const vector<uint32_t> &rowModuli) {
+        const int n = static_cast<int>(lhs.size());
+        Matrix out(static_cast<size_t>(n), Row(static_cast<size_t>(n), 0));
+        for (int i = 0; i < n; ++i) {
+            uint32_t modulus = rowModuli[static_cast<size_t>(i)];
+            for (int k = 0; k < n; ++k) {
+                uint32_t factor = lhs[static_cast<size_t>(i)][static_cast<size_t>(k)];
+                if (factor == 0) continue;
+                for (int j = 0; j < n; ++j) {
+                    uint32_t value = rhs[static_cast<size_t>(k)][static_cast<size_t>(j)];
+                    if (value == 0) continue;
+                    if (modulus == 0) {
+                        out[static_cast<size_t>(i)][static_cast<size_t>(j)] +=
+                            static_cast<uint32_t>(static_cast<uint64_t>(factor) * value);
+                    } else {
+                        uint64_t product =
+                            static_cast<uint64_t>(factor % modulus) * (value % modulus);
+                        uint64_t sum = out[static_cast<size_t>(i)][static_cast<size_t>(j)] +
+                                       product;
+                        out[static_cast<size_t>(i)][static_cast<size_t>(j)] =
+                            static_cast<uint32_t>(sum % modulus);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    static Matrix powerModular(Matrix base, uint64_t exponent,
+                               const vector<uint32_t> &rowModuli) {
+        Matrix result = identityMatrix(static_cast<int>(base.size()));
+        while (exponent != 0) {
+            if (exponent & 1u) result = multiplyModular(result, base, rowModuli);
+            exponent >>= 1u;
+            if (exponent != 0) base = multiplyModular(base, base, rowModuli);
+        }
+        return result;
+    }
+
+    optional<uint32_t> positiveDivisor(const Expr *expr,
+                                       const ExactEnv &env) const {
+        if (!expr || expr->kind != Expr::Kind::Binary || expr->op != "%") {
+            return nullopt;
+        }
+        auto divisor = evalExact(expr->rhs.get(), env);
+        if (!divisor || *divisor <= 1) return nullopt;
+        return static_cast<uint32_t>(*divisor);
+    }
+
+    optional<ModularRange> modularExprRange(
+        const Expr *expr, const Model &model, const Matrix &current,
+        const vector<uint32_t> &stateModuli, const ExactEnv &env,
+        const vector<optional<int32_t>> *base) const {
+        if (!expr) return nullopt;
+        if (auto exact = exactTransformExpr(expr, model, current, base)) {
+            return ModularRange{*exact, *exact};
+        }
+
+        auto bounded = [](int64_t lo, int64_t hi)
+            -> optional<ModularRange> {
+            if (lo < numeric_limits<int32_t>::min() ||
+                hi > numeric_limits<int32_t>::max() || lo > hi) {
+                return nullopt;
+            }
+            return ModularRange{lo, hi};
+        };
+        auto annotated = [&]() -> optional<ModularRange> {
+            if (!expr->rangeAnalyzed) return nullopt;
+            return ModularRange{expr->rangeMin, expr->rangeMax};
+        };
+
+        switch (expr->kind) {
+            case Expr::Kind::Number: {
+                int32_t value = wrap32(expr->value);
+                return ModularRange{value, value};
+            }
+            case Expr::Kind::Var: {
+                int key = exprKey(expr);
+                auto found = model.index.find(key);
+                if (found != model.index.end()) {
+                    uint32_t modulus =
+                        stateModuli[static_cast<size_t>(found->second)];
+                    if (modulus != 0) {
+                        return ModularRange{0, static_cast<int64_t>(modulus - 1)};
+                    }
+                }
+                if (!model.modified.count(key)) {
+                    auto exact = evalExact(expr, env);
+                    if (exact) return ModularRange{*exact, *exact};
+                }
+                return annotated();
+            }
+            case Expr::Kind::Call:
+                return nullopt;
+            case Expr::Kind::Unary: {
+                auto value = modularExprRange(expr->lhs.get(), model, current,
+                                              stateModuli, env, base);
+                if (!value) return nullopt;
+                if (expr->op == "+") return value;
+                if (expr->op == "!") return ModularRange{0, 1};
+                if (expr->op == "-") {
+                    return bounded(-value->hi, -value->lo);
+                }
+                return nullopt;
+            }
+            case Expr::Kind::Binary:
+                break;
+        }
+
+        auto lhs = modularExprRange(expr->lhs.get(), model, current,
+                                    stateModuli, env, base);
+        auto rhs = modularExprRange(expr->rhs.get(), model, current,
+                                    stateModuli, env, base);
+        if (!lhs || !rhs) return annotated();
+        if (expr->op == "<" || expr->op == ">" || expr->op == "<=" ||
+            expr->op == ">=" || expr->op == "==" || expr->op == "!=" ||
+            expr->op == "&&" || expr->op == "||") {
+            return ModularRange{0, 1};
+        }
+        if (expr->op == "+") {
+            return bounded(lhs->lo + rhs->lo, lhs->hi + rhs->hi);
+        }
+        if (expr->op == "-") {
+            return bounded(lhs->lo - rhs->hi, lhs->hi - rhs->lo);
+        }
+        if (expr->op == "*") {
+            array<int64_t, 4> products = {
+                lhs->lo * rhs->lo, lhs->lo * rhs->hi,
+                lhs->hi * rhs->lo, lhs->hi * rhs->hi,
+            };
+            return bounded(*min_element(products.begin(), products.end()),
+                           *max_element(products.begin(), products.end()));
+        }
+        if (rhs->lo != rhs->hi || rhs->lo == 0) return nullopt;
+        int64_t divisor = rhs->lo;
+        if (expr->op == "/") {
+            if (divisor == -1 && lhs->lo == numeric_limits<int32_t>::min()) {
+                return nullopt;
+            }
+            int64_t first = lhs->lo / divisor;
+            int64_t last = lhs->hi / divisor;
+            return bounded(min(first, last), max(first, last));
+        }
+        if (expr->op == "%") {
+            int64_t magnitude = divisor < 0 ? -divisor : divisor;
+            int64_t limit = magnitude - 1;
+            if (lhs->lo >= 0) {
+                return ModularRange{0, min(lhs->hi, limit)};
+            }
+            if (lhs->hi <= 0) {
+                return ModularRange{max(lhs->lo, -limit), 0};
+            }
+            return ModularRange{max(lhs->lo, -limit), min(lhs->hi, limit)};
+        }
+        return nullopt;
+    }
+
+    bool nonnegativeModularExpr(
+        const Expr *expr, const Model &model, const Matrix &current,
+        const vector<uint32_t> &stateModuli, const ExactEnv &env,
+        const vector<optional<int32_t>> *base) const {
+        auto range = modularExprRange(expr, model, current, stateModuli,
+                                      env, base);
+        return range && range->lo >= 0;
+    }
+
+    void collectInductionModuli(const Expr *expr, int inductionKey,
+                                const ExactEnv &env,
+                                vector<uint32_t> &moduli) const {
+        if (!expr) return;
+        if (expr->kind == Expr::Kind::Binary && expr->op == "%" &&
+            exprKey(expr->lhs.get()) == inductionKey) {
+            auto divisor = evalExact(expr->rhs.get(), env);
+            if (divisor && *divisor > 1) {
+                moduli.push_back(static_cast<uint32_t>(*divisor));
+            }
+        }
+        collectInductionModuli(expr->lhs.get(), inductionKey, env, moduli);
+        collectInductionModuli(expr->rhs.get(), inductionKey, env, moduli);
+        for (auto &arg : expr->args) {
+            collectInductionModuli(arg.get(), inductionKey, env, moduli);
+        }
+    }
+
+    void collectInductionModuli(const Stmt *stmt, int inductionKey,
+                                const ExactEnv &env,
+                                vector<uint32_t> &moduli) const {
+        if (!stmt || stmt->fastDeadStore) return;
+        collectInductionModuli(stmt->expr.get(), inductionKey, env, moduli);
+        if (stmt->decl) {
+            collectInductionModuli(stmt->decl->init.get(), inductionKey, env, moduli);
+        }
+        for (auto &child : stmt->stmts) {
+            collectInductionModuli(child.get(), inductionKey, env, moduli);
+        }
+        collectInductionModuli(stmt->thenStmt.get(), inductionKey, env, moduli);
+        collectInductionModuli(stmt->elseStmt.get(), inductionKey, env, moduli);
+    }
+
+    bool collectAssignedModuli(const Stmt *stmt, const ExactEnv &env,
+                               const Model &model,
+                               vector<uint32_t> &stateModuli,
+                               unordered_set<int> &plainAssigned) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        if (stmt->kind == Stmt::Kind::Block) {
+            for (auto &child : stmt->stmts) {
+                if (!collectAssignedModuli(child.get(), env, model,
+                                           stateModuli, plainAssigned)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (stmt->kind == Stmt::Kind::If) {
+            return collectAssignedModuli(stmt->thenStmt.get(), env, model,
+                                         stateModuli, plainAssigned) &&
+                   collectAssignedModuli(stmt->elseStmt.get(), env, model,
+                                         stateModuli, plainAssigned);
+        }
+        const Expr *value = nullptr;
+        int key = -1;
+        if (stmt->kind == Stmt::Kind::Assign) {
+            key = assignKey(stmt);
+            value = stmt->expr.get();
+        } else if (stmt->kind == Stmt::Kind::DeclStmt && stmt->decl) {
+            key = stmt->decl->fastSlot;
+            value = stmt->decl->init.get();
+        } else {
+            return stmt->kind == Stmt::Kind::Empty ||
+                   (stmt->kind == Stmt::Kind::ExprStmt &&
+                    !exprHasCallLocal(stmt->expr.get()));
+        }
+        auto found = model.index.find(key);
+        if (found == model.index.end()) return false;
+        size_t index = static_cast<size_t>(found->second);
+        if (auto modulus = positiveDivisor(value, env)) {
+            if (plainAssigned.count(key) ||
+                (stateModuli[index] != 0 && stateModuli[index] != *modulus)) {
+                return false;
+            }
+            stateModuli[index] = *modulus;
+        } else {
+            if (stateModuli[index] != 0) return false;
+            plainAssigned.insert(key);
+        }
+        return true;
+    }
+
+    bool propagateCopiedModuli(const Stmt *stmt, const ExactEnv &env,
+                               const Model &model,
+                               vector<uint32_t> &stateModuli,
+                               bool &changed) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        if (stmt->kind == Stmt::Kind::Block) {
+            for (auto &child : stmt->stmts) {
+                if (!propagateCopiedModuli(child.get(), env, model,
+                                            stateModuli, changed)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (stmt->kind == Stmt::Kind::If) {
+            return propagateCopiedModuli(stmt->thenStmt.get(), env, model,
+                                         stateModuli, changed) &&
+                   propagateCopiedModuli(stmt->elseStmt.get(), env, model,
+                                         stateModuli, changed);
+        }
+        const Expr *value = nullptr;
+        int key = -1;
+        if (stmt->kind == Stmt::Kind::Assign) {
+            key = assignKey(stmt);
+            value = stmt->expr.get();
+        } else if (stmt->kind == Stmt::Kind::DeclStmt && stmt->decl) {
+            key = stmt->decl->fastSlot;
+            value = stmt->decl->init.get();
+        } else {
+            return true;
+        }
+        if (positiveDivisor(value, env)) return true;
+        auto destination = model.index.find(key);
+        if (destination == model.index.end()) return false;
+        size_t destinationIndex = static_cast<size_t>(destination->second);
+        if (!value || value->kind != Expr::Kind::Var) {
+            return stateModuli[destinationIndex] == 0;
+        }
+        auto source = model.index.find(exprKey(value));
+        if (source == model.index.end()) return false;
+        uint32_t sourceModulus = stateModuli[static_cast<size_t>(source->second)];
+        if (sourceModulus == 0) return stateModuli[destinationIndex] == 0;
+        if (stateModuli[destinationIndex] == 0) {
+            stateModuli[destinationIndex] = sourceModulus;
+            changed = true;
+            return true;
+        }
+        return stateModuli[destinationIndex] == sourceModulus;
+    }
+
+    // C's signed remainder matches the residue-ring model only when every
+    // read feeding a modular state is already a canonical nonnegative value.
+    bool modularReadCanonicalExpr(const Expr *expr, int key,
+                                  uint32_t modulus) const {
+        if (!expr) return true;
+        if (expr->kind == Expr::Kind::Var && exprKey(expr) == key) {
+            return expr->rangeAnalyzed && expr->rangeMin >= 0 &&
+                   static_cast<uint64_t>(expr->rangeMax) < modulus;
+        }
+        if (!modularReadCanonicalExpr(expr->lhs.get(), key, modulus) ||
+            !modularReadCanonicalExpr(expr->rhs.get(), key, modulus)) {
+            return false;
+        }
+        for (const auto &arg : expr->args) {
+            if (!modularReadCanonicalExpr(arg.get(), key, modulus)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool modularReadsCanonical(const Stmt *stmt, int key, uint32_t modulus) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        if (!modularReadCanonicalExpr(stmt->expr.get(), key, modulus)) {
+            return false;
+        }
+        if (stmt->decl &&
+            !modularReadCanonicalExpr(stmt->decl->init.get(), key, modulus)) {
+            return false;
+        }
+        for (const auto &child : stmt->stmts) {
+            if (!modularReadsCanonical(child.get(), key, modulus)) {
+                return false;
+            }
+        }
+        return modularReadsCanonical(stmt->thenStmt.get(), key, modulus) &&
+               modularReadsCanonical(stmt->elseStmt.get(), key, modulus) &&
+               modularReadsCanonical(stmt->body.get(), key, modulus);
+    }
+
+    optional<int32_t> modularEntryValue(int key, const ExactEnv &env,
+                                        const CountedLoop &counted) const {
+        if (key == counted.inductionKey) return counted.start;
+        if (isGlobalKey(key)) {
+            auto found = exactGlobals.find(globalIndex(key));
+            return found == exactGlobals.end()
+                ? nullopt : optional<int32_t>(found->second);
+        }
+        if (key < 0 || key >= static_cast<int>(env.size())) return nullopt;
+        return env[static_cast<size_t>(key)];
+    }
+
+    bool modularReadMaximumExpr(const Expr *expr, int key, bool &sawRead,
+                                uint64_t &maximum) const {
+        if (!expr) return true;
+        if (expr->kind == Expr::Kind::Var && exprKey(expr) == key) {
+            if (!expr->rangeAnalyzed || expr->rangeMin < 0) return false;
+            sawRead = true;
+            maximum = max(maximum, static_cast<uint64_t>(expr->rangeMax));
+            return true;
+        }
+        if (!modularReadMaximumExpr(expr->lhs.get(), key, sawRead, maximum) ||
+            !modularReadMaximumExpr(expr->rhs.get(), key, sawRead, maximum)) {
+            return false;
+        }
+        for (const auto &arg : expr->args) {
+            if (!modularReadMaximumExpr(arg.get(), key, sawRead, maximum)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool modularReadMaximum(const Stmt *stmt, int key, bool &sawRead,
+                            uint64_t &maximum) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        if (!modularReadMaximumExpr(stmt->expr.get(), key, sawRead, maximum)) {
+            return false;
+        }
+        if (stmt->decl &&
+            !modularReadMaximumExpr(stmt->decl->init.get(), key, sawRead,
+                                    maximum)) {
+            return false;
+        }
+        for (const auto &child : stmt->stmts) {
+            if (!modularReadMaximum(child.get(), key, sawRead, maximum)) {
+                return false;
+            }
+        }
+        return modularReadMaximum(stmt->thenStmt.get(), key, sawRead, maximum) &&
+               modularReadMaximum(stmt->elseStmt.get(), key, sawRead, maximum) &&
+               modularReadMaximum(stmt->body.get(), key, sawRead, maximum);
+    }
+
+    bool modularFinalRowsSafe(const Model &model, const Matrix &closed,
+                              const vector<uint32_t> &stateModuli,
+                              const ExactEnv &env, const Stmt *loopBody,
+                              const CountedLoop &counted) const {
+        static constexpr uint64_t kMaxSigned =
+            static_cast<uint64_t>(numeric_limits<int32_t>::max());
+        for (int key : model.keys) {
+            if (!model.modified.count(key) || model.transient.count(key)) continue;
+            size_t rowIndex = static_cast<size_t>(model.index.at(key));
+            uint32_t modulus = stateModuli[rowIndex];
+            if (modulus == 0) continue;
+            const Row &row = closed[rowIndex];
+            uint64_t total = row.back();
+            for (size_t sourceIndex = 0; sourceIndex < model.keys.size();
+                 ++sourceIndex) {
+                uint32_t coefficient = row[sourceIndex];
+                if (coefficient == 0) continue;
+                int sourceKey = model.keys[sourceIndex];
+                uint64_t maximum = 0;
+                uint32_t sourceModulus = stateModuli[sourceIndex];
+                if (sourceModulus != 0) {
+                    maximum = static_cast<uint64_t>(sourceModulus - 1);
+                } else {
+                    if (model.modified.count(sourceKey) &&
+                        sourceKey != counted.inductionKey) {
+                        return false;
+                    }
+                    auto exact = modularEntryValue(sourceKey, env, counted);
+                    if (exact) {
+                        if (*exact < 0) return false;
+                        maximum = static_cast<uint64_t>(*exact);
+                    } else {
+                        bool sawRead = false;
+                        if (!modularReadMaximum(loopBody, sourceKey, sawRead,
+                                                maximum) ||
+                            !sawRead) {
+                            return false;
+                        }
+                    }
+                }
+                uint64_t product =
+                    static_cast<uint64_t>(coefficient) * maximum;
+                if (product > kMaxSigned || total > kMaxSigned - product) {
+                    return false;
+                }
+                total += product;
+            }
+        }
+        return true;
+    }
+
+    bool modularAffineExpr(const Expr *expr, const Model &model,
+                           const Matrix &current,
+                           const vector<uint32_t> &stateModuli,
+                           const ExactEnv &env,
+                           const vector<optional<int32_t>> *base,
+                           int inductionKey, uint32_t targetModulus,
+                           Row &out) const {
+        const size_t dimension = current.size();
+        out.assign(dimension, 0);
+        if (!expr) return false;
+        switch (expr->kind) {
+            case Expr::Kind::Number:
+                out.back() = static_cast<uint32_t>(wrap32(expr->value));
+                reduceRow(out, targetModulus);
+                return true;
+            case Expr::Kind::Var: {
+                auto found = model.index.find(exprKey(expr));
+                if (found == model.index.end()) return false;
+                size_t index = static_cast<size_t>(found->second);
+                out = current[index];
+                uint32_t sourceModulus = stateModuli[index];
+                if (sourceModulus != 0 && sourceModulus != targetModulus &&
+                    !constRow(out)) {
+                    return false;
+                }
+                if (targetModulus == 0 && sourceModulus != 0 && !constRow(out)) {
+                    return false;
+                }
+                reduceRow(out, targetModulus);
+                return true;
+            }
+            case Expr::Kind::Call:
+                return false;
+            case Expr::Kind::Unary: {
+                if (expr->op != "+" && expr->op != "-") return false;
+                if (!modularAffineExpr(expr->lhs.get(), model, current,
+                                       stateModuli, env, base, inductionKey,
+                                       targetModulus, out)) {
+                    return false;
+                }
+                if (expr->op == "-") {
+                    for (uint32_t &value : out) value = 0u - value;
+                    reduceRow(out, targetModulus);
+                }
+                return true;
+            }
+            case Expr::Kind::Binary:
+                break;
+        }
+
+        if (expr->op == "%") {
+            auto divisor = evalExact(expr->rhs.get(), env);
+            if (!divisor || *divisor <= 1) return false;
+            uint32_t modulus = static_cast<uint32_t>(*divisor);
+            if (targetModulus == modulus &&
+                nonnegativeModularExpr(expr->lhs.get(), model, current,
+                                       stateModuli, env, base)) {
+                return modularAffineExpr(expr->lhs.get(), model, current,
+                                         stateModuli, env, base, inductionKey,
+                                         modulus, out);
+            }
+            if (exprKey(expr->lhs.get()) == inductionKey && base) {
+                auto exact = exactTransformExpr(expr, model, current, base);
+                if (!exact) return false;
+                out.back() = static_cast<uint32_t>(*exact);
+                reduceRow(out, targetModulus);
+                return true;
+            }
+            return false;
+        }
+
+        Row lhs;
+        Row rhs;
+        if (!modularAffineExpr(expr->lhs.get(), model, current,
+                               stateModuli, env, base, inductionKey,
+                               targetModulus, lhs) ||
+            !modularAffineExpr(expr->rhs.get(), model, current,
+                               stateModuli, env, base, inductionKey,
+                               targetModulus, rhs)) {
+            return false;
+        }
+        if (expr->op == "+" || expr->op == "-") {
+            for (size_t i = 0; i < dimension; ++i) {
+                out[i] = expr->op == "+" ? lhs[i] + rhs[i] : lhs[i] - rhs[i];
+            }
+            reduceRow(out, targetModulus);
+            return true;
+        }
+        if (expr->op != "*") return false;
+        const Row *affine = nullptr;
+        uint32_t factor = 0;
+        if (constRow(lhs)) {
+            affine = &rhs;
+            factor = lhs.back();
+        } else if (constRow(rhs)) {
+            affine = &lhs;
+            factor = rhs.back();
+        } else {
+            return false;
+        }
+        for (size_t i = 0; i < dimension; ++i) {
+            if (targetModulus == 0) {
+                out[i] = static_cast<uint32_t>(
+                    static_cast<uint64_t>((*affine)[i]) * factor);
+            } else {
+                out[i] = static_cast<uint32_t>(
+                    (static_cast<uint64_t>((*affine)[i] % targetModulus) *
+                     (factor % targetModulus)) % targetModulus);
+            }
+        }
+        return true;
+    }
+
+    bool modularConditionIsExact(const Expr *condition, const Model &model,
+                                 const Matrix &current,
+                                 const vector<optional<int32_t>> &base) const {
+        unordered_set<int> keys;
+        collectExprKeys(condition, keys);
+        for (int key : keys) {
+            auto found = model.index.find(key);
+            if (found == model.index.end() ||
+                !constRow(current[static_cast<size_t>(found->second)])) {
+                return false;
+            }
+        }
+        return exactTransformExpr(condition, model, current, &base).has_value();
+    }
+
+    bool applyModularBody(const Stmt *stmt, const ExactEnv &env,
+                          const Model &model,
+                          const vector<uint32_t> &stateModuli,
+                          const vector<optional<int32_t>> &base,
+                          int inductionKey, Matrix &transform) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (auto &child : stmt->stmts) {
+                    if (!applyModularBody(child.get(), env, model, stateModuli,
+                                          base, inductionKey, transform)) {
+                        return false;
+                    }
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::ExprStmt:
+                return !exprHasCallLocal(stmt->expr.get());
+            case Stmt::Kind::Assign:
+            case Stmt::Kind::DeclStmt: {
+                int key = stmt->kind == Stmt::Kind::Assign
+                    ? assignKey(stmt) : stmt->decl->fastSlot;
+                const Expr *value = stmt->kind == Stmt::Kind::Assign
+                    ? stmt->expr.get() : stmt->decl->init.get();
+                auto found = model.index.find(key);
+                if (found == model.index.end()) return false;
+                size_t index = static_cast<size_t>(found->second);
+                Row row;
+                if (!modularAffineExpr(value, model, transform, stateModuli,
+                                       env, &base, inductionKey,
+                                       stateModuli[index], row)) {
+                    return false;
+                }
+                transform[index] = std::move(row);
+                return true;
+            }
+            case Stmt::Kind::If: {
+                if (!modularConditionIsExact(stmt->expr.get(), model,
+                                             transform, base)) {
+                    return false;
+                }
+                auto condition = exactTransformExpr(stmt->expr.get(), model,
+                                                    transform, &base);
+                const Stmt *branch = truthy(*condition)
+                    ? stmt->thenStmt.get() : stmt->elseStmt.get();
+                return applyModularBody(branch, env, model, stateModuli,
+                                        base, inductionKey, transform);
+            }
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool trySummarizeModular(unique_ptr<Stmt> &stmt, const ExactEnv &env,
+                             CountedLoop &counted,
+                             unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            exprHasCallLocal(stmt->expr.get()) ||
+            !extractCondition(stmt->expr.get(), env, counted)) {
+            return false;
+        }
+
+        Model model;
+        addModelKey(model, counted.inductionKey, counted.inductionName);
+        if (!collectBody(stmt->body.get(), model) || model.keys.size() > 32 ||
+            !model.modified.count(counted.inductionKey)) {
+            return false;
+        }
+        unordered_set<int> boundKeys;
+        collectExprKeys(counted.boundExpr, boundKeys);
+        for (int key : model.modified) {
+            if (boundKeys.count(key) ||
+                (isGlobalKey(key) && constGlobals.count(globalIndex(key)))) {
+                return false;
+            }
+        }
+
+        optional<int32_t> step;
+        if (!findUnconditionalStep(stmt->body.get(), counted.inductionKey,
+                                   env, step) || !step || *step == 0) {
+            return false;
+        }
+        counted.step = *step;
+        auto trip = tripCount(counted);
+        if (!trip || trip->first < 8) return false;
+        counted.trips = trip->first;
+        counted.finalValue = trip->second;
+
+        const size_t states = model.keys.size();
+        const size_t dimension = states + 1;
+        vector<uint32_t> stateModuli(states, 0);
+        unordered_set<int> plainAssigned;
+        if (!collectAssignedModuli(stmt->body.get(), env, model,
+                                   stateModuli, plainAssigned) ||
+            none_of(stateModuli.begin(), stateModuli.end(),
+                    [](uint32_t value) { return value != 0; })) {
+            return false;
+        }
+        for (size_t pass = 0; pass < states; ++pass) {
+            bool copied = false;
+            if (!propagateCopiedModuli(stmt->body.get(), env, model,
+                                       stateModuli, copied)) {
+                return false;
+            }
+            if (!copied) break;
+        }
+        for (size_t index = 0; index < states; ++index) {
+            uint32_t modulus = stateModuli[index];
+            if (modulus == 0) continue;
+            auto entry = modularEntryValue(model.keys[index], env, counted);
+            bool entryCanonical = entry && *entry >= 0 &&
+                static_cast<uint64_t>(*entry) < modulus;
+            if (!entryCanonical &&
+                !modularReadsCanonical(stmt->body.get(), model.keys[index],
+                                       modulus)) {
+                return false;
+            }
+        }
+        vector<uint32_t> rowModuli = stateModuli;
+        rowModuli.push_back(0);
+
+        vector<uint32_t> phaseModuli;
+        collectInductionModuli(stmt->body.get(), counted.inductionKey,
+                               env, phaseModuli);
+        uint64_t period = 1;
+        uint64_t stepMagnitude = counted.step < 0
+            ? static_cast<uint64_t>(-static_cast<int64_t>(counted.step))
+            : static_cast<uint64_t>(counted.step);
+        for (uint32_t modulus : phaseModuli) {
+            uint64_t phaseCount = modulus /
+                std::gcd<uint64_t>(modulus, stepMagnitude % modulus);
+            uint64_t common = std::gcd(period, phaseCount);
+            uint64_t factor = phaseCount / common;
+            if (period > 4096 / factor) return false;
+            period *= factor;
+        }
+        if (period == 0 || period > 4096 ||
+            counted.trips < max<uint64_t>(8, period * 2)) {
+            return false;
+        }
+
+        Matrix periodTransform = identityMatrix(static_cast<int>(dimension));
+        vector<Matrix> phases;
+        phases.reserve(static_cast<size_t>(period));
+        for (uint64_t phase = 0; phase < period; ++phase) {
+            int64_t inductionValue = static_cast<int64_t>(counted.start) +
+                                     static_cast<int64_t>(phase) * counted.step;
+            if (inductionValue < 0 ||
+                inductionValue > numeric_limits<int32_t>::max()) {
+                return false;
+            }
+            auto base = periodicBase(model, env, counted.inductionKey,
+                                     static_cast<int32_t>(inductionValue));
+            Matrix transform = identityMatrix(static_cast<int>(dimension));
+            if (!applyModularBody(stmt->body.get(), env, model, stateModuli,
+                                  base, counted.inductionKey, transform)) {
+                return false;
+            }
+            size_t inductionIndex = static_cast<size_t>(
+                model.index.at(counted.inductionKey));
+            const Row &inductionRow = transform[inductionIndex];
+            for (size_t i = 0; i < states; ++i) {
+                uint32_t expected = i == inductionIndex ? 1u : 0u;
+                if (inductionRow[i] != expected) return false;
+            }
+            if (static_cast<int32_t>(inductionRow.back()) != counted.step) {
+                return false;
+            }
+            periodTransform = multiplyModular(transform, periodTransform,
+                                               rowModuli);
+            phases.push_back(std::move(transform));
+        }
+
+        uint64_t wholePeriods = counted.trips / period;
+        uint64_t remainder = counted.trips % period;
+        Matrix closed = powerModular(std::move(periodTransform), wholePeriods,
+                                     rowModuli);
+        for (uint64_t phase = 0; phase < remainder; ++phase) {
+            closed = multiplyModular(phases[static_cast<size_t>(phase)], closed,
+                                     rowModuli);
+        }
+        if (!modularFinalRowsSafe(model, closed, stateModuli, env,
+                                  stmt->body.get(), counted)) {
+            return false;
+        }
+        return rewriteClosedLoop(stmt, model, closed, modifiedLocals,
+                                 &stateModuli);
     }
 
     static unique_ptr<Expr> varExpr(const string &name) {
@@ -5208,8 +5989,10 @@ private:
                    stmt->body.get(), inductionKey, modified);
     }
 
-    static unique_ptr<Expr> finalExpr(const Row &row, const Model &model,
-                                      const unordered_map<int, string> &temporaries) {
+    static unique_ptr<Expr> finalExpr(
+        const Row &row, const Model &model,
+        const unordered_map<int, string> &temporaries,
+        uint32_t modulus = 0) {
         unique_ptr<Expr> sum;
         auto append = [&](unique_ptr<Expr> term) {
             if (!sum) sum = std::move(term);
@@ -5232,12 +6015,17 @@ private:
         }
         uint32_t constant = row.back();
         if (constant != 0 || !sum) append(makeNumberExpr(static_cast<int32_t>(constant)));
+        if (modulus != 0) {
+            sum = binaryExpr("%", std::move(sum),
+                             makeNumberExpr(static_cast<int32_t>(modulus)));
+        }
         return sum;
     }
 
     bool rewriteClosedLoop(unique_ptr<Stmt> &stmt, const Model &model,
                            const Matrix &closed,
-                           unordered_set<int> &modifiedLocals) {
+                           unordered_set<int> &modifiedLocals,
+                           const vector<uint32_t> *stateModuli = nullptr) {
         vector<int> persistent;
         for (int key : model.keys) {
             if (model.modified.count(key) && !model.transient.count(key)) {
@@ -5269,8 +6057,11 @@ private:
         guarded->thenStmt->kind = Stmt::Kind::Block;
         for (int key : persistent) {
             const Row &row = closed[static_cast<size_t>(model.index.at(key))];
+            uint32_t modulus = stateModuli
+                ? (*stateModuli)[static_cast<size_t>(model.index.at(key))] : 0;
             guarded->thenStmt->stmts.push_back(
-                assignStmt(model.names.at(key), finalExpr(row, model, temporaries)));
+                assignStmt(model.names.at(key),
+                           finalExpr(row, model, temporaries, modulus)));
         }
         wrapper->stmts.push_back(std::move(guarded));
         stmt = std::move(wrapper);
@@ -6311,6 +7102,11 @@ private:
                     return;
                 }
                 bool summarized = trySummarize(stmt, env, counted, modified);
+                if (!summarized) {
+                    counted = CountedLoop{};
+                    modified.clear();
+                    summarized = trySummarizeModular(stmt, env, counted, modified);
+                }
                 if (!summarized) {
                     counted = CountedLoop{};
                     modified.clear();
@@ -9218,6 +10014,11 @@ int main(int argc, char **argv) {
     StaticAnalyzer analysis(program);
     analysis.run();
 
+    // Modular loop summaries rely on interval proofs that C's signed remainder
+    // agrees with the nonnegative residue-ring representation.
+    RangeAnalyzer initialRanges(program);
+    initialRanges.run();
+
     // 3. Replace statically proven affine counted loops with closed-form
     // runtime assignments.  This transforms individual loops; it never calls
     // or executes a ToyC function.
@@ -9228,6 +10029,8 @@ int main(int argc, char **argv) {
         if (!loopOptimizer.run()) break;
         StaticAnalyzer rewrittenAnalysis(program);
         rewrittenAnalysis.run();
+        RangeAnalyzer rewrittenRanges(program);
+        rewrittenRanges.run();
     }
 
     // 4. Prove ranges used by safe instruction-selection shortcuts.
