@@ -303,7 +303,7 @@ static bool directSummaryInlineSafe(const Function *function) {
         return true;
     }
     return function->body && function->body->kind == Stmt::Kind::Block &&
-           function->body->stmts.size() <= 4;
+           function->body->stmts.size() <= 8;
 }
 
 static int32_t wrap32(long long x) {
