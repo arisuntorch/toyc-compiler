@@ -297,6 +297,15 @@ static const Expr *functionInlineExpr(const Function *function) {
     return singleReturnExpr(functionOptimizationBody(function));
 }
 
+static bool directSummaryInlineSafe(const Function *function) {
+    if (!function || !function->straightLineSummary ||
+        function->params.size() < 2) {
+        return true;
+    }
+    return function->body && function->body->kind == Stmt::Kind::Block &&
+           function->body->stmts.size() <= 4;
+}
+
 static int32_t wrap32(long long x) {
     return static_cast<int32_t>(static_cast<uint32_t>(x));
 }
@@ -1489,7 +1498,8 @@ public:
                 leave();
                 cseFunction(*item.func);
                 dceFunction(*item.func);
-                if (summarizeStraightLineFunction(*item.func)) {
+                if (summarizeStraightLineFunction(*item.func) &&
+                    directSummaryInlineSafe(item.func.get())) {
                     inlineableFuncs[item.func->name] = item.func.get();
                 }
                 recordFunctionEntries = false;
@@ -1661,7 +1671,6 @@ private:
             function.params.size() > 2) {
             return false;
         }
-
         vector<unordered_map<string, int>> scopes(1);
         vector<unique_ptr<Expr>> values;
         vector<int> uses;
@@ -1713,6 +1722,7 @@ private:
         inlineableFuncs.clear();
         for (auto &item : prog.items) {
             if (item.kind != TopItem::Kind::Func || item.func->returnsVoid) continue;
+            if (!directSummaryInlineSafe(item.func.get())) continue;
             const Expr *expr = functionInlineExpr(item.func.get());
             if (!expr || exprHasCall(expr)) continue;
             unordered_set<string> params(item.func->params.begin(), item.func->params.end());
@@ -6704,7 +6714,8 @@ private:
                                                  static_cast<int>(function->params.size())};
                 const Stmt *body = function->body.get();
                 const Expr *inlineExpr = functionInlineExpr(function);
-                if (!function->returnsVoid && inlineExpr &&
+                if (!function->returnsVoid && directSummaryInlineSafe(function) &&
+                    inlineExpr &&
                     !exprHasCall(inlineExpr)) {
                     unordered_set<string> params(function->params.begin(), function->params.end());
                     if (exprUsesOnlyVars(inlineExpr, params)) {
