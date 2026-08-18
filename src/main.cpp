@@ -248,6 +248,9 @@ struct Stmt {
     int fastAssignIndex = -1;
     bool fastDeadStore = false;
     bool fastLoopValuesDead = false;
+    // Marks a loop whose finite-state cycle proof intentionally retained the
+    // original transition code with a bounded runtime trip counter.
+    bool fastFiniteCycleReduced = false;
     int fastLoopId = -1;
     int fastRuntimeUnroll = 1;
     unique_ptr<Expr> expr;
@@ -5696,6 +5699,414 @@ private:
         return false;
     }
 
+    // A bounded finite-state proof for nonlinear modular recurrences.  This
+    // path is deliberately narrower than the affine summary above: the body
+    // must be straight-line and call-free, the induction variable is only
+    // stepped (never read by the state transition), and every persistent
+    // state is assigned a fixed positive remainder.  We inspect at most a
+    // small number of transition states; the ToyC loop is never run here.
+    static constexpr uint64_t kFiniteCycleStateLimit = 4096;
+    static constexpr uint64_t kFiniteCycleRuntimeLimit = 256;
+    static constexpr uint32_t kFiniteCycleModulusLimit = 1u << 20;
+
+    bool finiteCycleStraightLineShape(const Stmt *stmt, int inductionKey,
+                                      bool &sawInduction) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (const auto &child : stmt->stmts) {
+                    if (!finiteCycleStraightLineShape(child.get(), inductionKey,
+                                                      sawInduction)) {
+                        return false;
+                    }
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt:
+                return stmt->decl && stmt->decl->init &&
+                       !exprHasCallLocal(stmt->decl->init.get()) &&
+                       !expressionContainsKey(stmt->decl->init.get(), inductionKey);
+            case Stmt::Kind::Assign: {
+                int key = assignKey(stmt);
+                if (key < 0 || isGlobalKey(key) || exprHasCallLocal(stmt->expr.get())) {
+                    return false;
+                }
+                if (key == inductionKey) {
+                    if (sawInduction) return false;
+                    sawInduction = true;
+                    return true;
+                }
+                // The state transition must not depend on the absolute loop
+                // phase.  This is what makes a repeated state a proof of a
+                // repeated suffix rather than merely a coincidental value.
+                return !expressionContainsKey(stmt->expr.get(), inductionKey);
+            }
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::If:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool finiteCycleModulusExpr(const Expr *expr, const ExactEnv &env,
+                                const unordered_set<int> &changing,
+                                uint32_t &modulus) const {
+        if (!expr || expr->kind != Expr::Kind::Binary || expr->op != "%") {
+            return false;
+        }
+        unordered_set<int> divisorKeys;
+        collectExprKeys(expr->rhs.get(), divisorKeys);
+        for (int key : divisorKeys) {
+            if (changing.count(key)) return false;
+        }
+        auto divisor = evalExact(expr->rhs.get(), env);
+        if (!divisor || *divisor <= 1 ||
+            static_cast<uint64_t>(*divisor) > kFiniteCycleModulusLimit) {
+            return false;
+        }
+        modulus = static_cast<uint32_t>(*divisor);
+        return true;
+    }
+
+    bool collectFiniteCycleModuli(
+        const Stmt *stmt, int inductionKey,
+        const unordered_set<int> &persistent,
+        const unordered_set<int> &changing, const ExactEnv &env,
+        unordered_map<int, uint32_t> &moduli) const {
+        unordered_map<int, int> copies;
+        function<bool(const Stmt *)> collect = [&](const Stmt *current) -> bool {
+            if (!current || current->fastDeadStore) return true;
+            if (current->kind == Stmt::Kind::Block) {
+                for (const auto &child : current->stmts) {
+                    if (!collect(child.get())) return false;
+                }
+                return true;
+            }
+            if (current->kind == Stmt::Kind::Empty) return true;
+
+            int key = -1;
+            const Expr *value = nullptr;
+            if (current->kind == Stmt::Kind::DeclStmt) {
+                if (!current->decl || current->decl->fastSlot < 0) return false;
+                key = current->decl->fastSlot;
+                value = current->decl->init.get();
+            } else if (current->kind == Stmt::Kind::Assign) {
+                key = assignKey(current);
+                value = current->expr.get();
+            } else {
+                return false;
+            }
+            if (key < 0 || isGlobalKey(key) || key == inductionKey) return true;
+            if (!changing.count(key)) return false;
+
+            uint32_t modulus = 0;
+            if (finiteCycleModulusExpr(value, env, changing, modulus)) {
+                auto found = moduli.find(key);
+                if (found != moduli.end() && found->second != modulus) return false;
+                moduli[key] = modulus;
+                copies.erase(key);
+                return true;
+            }
+            if (value && value->kind == Expr::Kind::Var) {
+                int source = exprKey(value);
+                if (source >= 0 && changing.count(source)) {
+                    copies[key] = source;
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!collect(stmt)) return false;
+
+        // A temporary such as `n00` may carry the remainder proof into the
+        // persistent state through a plain copy (`m00 = n00`).
+        for (size_t pass = 0; pass <= changing.size(); ++pass) {
+            bool progress = false;
+            for (const auto &[destination, source] : copies) {
+                auto found = moduli.find(source);
+                if (found == moduli.end()) continue;
+                auto existing = moduli.find(destination);
+                if (existing != moduli.end() && existing->second != found->second) {
+                    return false;
+                }
+                if (existing == moduli.end()) {
+                    moduli[destination] = found->second;
+                    progress = true;
+                }
+            }
+            if (!progress) break;
+        }
+        for (int key : persistent) {
+            if (!moduli.count(key)) return false;
+        }
+        return true;
+    }
+
+    bool evaluateFiniteCycleBody(const Stmt *stmt, ExactEnv &values) const {
+        if (!stmt || stmt->fastDeadStore) return true;
+        switch (stmt->kind) {
+            case Stmt::Kind::Block:
+                for (const auto &child : stmt->stmts) {
+                    if (!evaluateFiniteCycleBody(child.get(), values)) return false;
+                }
+                return true;
+            case Stmt::Kind::Empty:
+                return true;
+            case Stmt::Kind::DeclStmt: {
+                if (!stmt->decl || stmt->decl->fastSlot < 0 ||
+                    stmt->decl->fastSlot >= static_cast<int>(values.size())) {
+                    return false;
+                }
+                auto value = evalExact(stmt->decl->init.get(), values);
+                if (!value) return false;
+                values[static_cast<size_t>(stmt->decl->fastSlot)] = *value;
+                return true;
+            }
+            case Stmt::Kind::Assign: {
+                if (stmt->fastAssignGlobal || stmt->fastAssignIndex < 0 ||
+                    stmt->fastAssignIndex >= static_cast<int>(values.size())) {
+                    return false;
+                }
+                auto value = evalExact(stmt->expr.get(), values);
+                if (!value) return false;
+                values[static_cast<size_t>(stmt->fastAssignIndex)] = *value;
+                return true;
+            }
+            // Calls and control-flow effects are excluded by the shape proof.
+            case Stmt::Kind::ExprStmt:
+            case Stmt::Kind::If:
+            case Stmt::Kind::While:
+            case Stmt::Kind::Break:
+            case Stmt::Kind::Continue:
+            case Stmt::Kind::Return:
+                return false;
+        }
+        return false;
+    }
+
+    bool rewriteFiniteCycleLoop(unique_ptr<Stmt> &stmt,
+                                const CountedLoop &counted,
+                                uint64_t residual,
+                                const Model &model,
+                                unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || residual == 0 ||
+            residual > kFiniteCycleRuntimeLimit || !stmt->body) {
+            return false;
+        }
+
+        string remainingName = freshName();
+        auto loop = std::move(stmt);
+        loop->fastFiniteCycleReduced = true;
+
+        auto body = std::move(loop->body);
+        if (body->kind != Stmt::Kind::Block) {
+            auto block = make_unique<Stmt>();
+            block->kind = Stmt::Kind::Block;
+            block->stmts.push_back(std::move(body));
+            body = std::move(block);
+        }
+        body->stmts.push_back(assignStmt(
+            remainingName,
+            binaryExpr("-", varExpr(remainingName), makeNumberExpr(1))));
+        loop->body = std::move(body);
+        loop->expr = binaryExpr(
+            "&&", std::move(loop->expr),
+            binaryExpr(">", varExpr(remainingName), makeNumberExpr(0)));
+
+        auto wrapper = make_unique<Stmt>();
+        wrapper->kind = Stmt::Kind::Block;
+        wrapper->stmts.push_back(
+            declStmt(remainingName, makeNumberExpr(residual)));
+        wrapper->stmts.push_back(std::move(loop));
+        // The reduced loop performs the same state suffix, but its induction
+        // variable must still expose the original post-loop value.
+        wrapper->stmts.push_back(assignStmt(
+            counted.inductionName,
+            makeNumberExpr(counted.finalValue)));
+        stmt = std::move(wrapper);
+
+        for (int key : model.modified) {
+            if (!isGlobalKey(key)) modifiedLocals.insert(key);
+        }
+        changed = true;
+        return true;
+    }
+
+    bool trySummarizeFiniteCycle(unique_ptr<Stmt> &stmt,
+                                 const ExactEnv &env,
+                                 CountedLoop &counted,
+                                 unordered_set<int> &modifiedLocals) {
+        if (!stmt || stmt->kind != Stmt::Kind::While || !stmt->expr ||
+            stmt->fastFiniteCycleReduced || exprHasCallLocal(stmt->expr.get()) ||
+            !extractCondition(stmt->expr.get(), env, counted)) {
+            return false;
+        }
+
+        optional<int32_t> step;
+        if (!findUnconditionalStep(stmt->body.get(), counted.inductionKey,
+                                   env, step) || !step || *step == 0) {
+            return false;
+        }
+        counted.step = *step;
+        auto trip = tripCount(counted);
+        if (!trip || trip->first < 32) return false;
+        counted.trips = trip->first;
+        counted.finalValue = trip->second;
+
+        bool sawInduction = false;
+        if (!finiteCycleStraightLineShape(stmt->body.get(),
+                                          counted.inductionKey,
+                                          sawInduction) || !sawInduction) {
+            return false;
+        }
+
+        Model model;
+        addModelKey(model, counted.inductionKey, counted.inductionName);
+        if (!collectBody(stmt->body.get(), model) || model.keys.size() > 12 ||
+            !model.modified.count(counted.inductionKey)) {
+            return false;
+        }
+
+        unordered_set<int> boundKeys;
+        collectExprKeys(counted.boundExpr, boundKeys);
+        for (int key : model.modified) {
+            if (boundKeys.count(key) || isGlobalKey(key)) return false;
+        }
+
+        unordered_set<int> persistent;
+        unordered_set<int> changing = model.modified;
+        for (int key : model.modified) {
+            if (!model.transient.count(key) && key != counted.inductionKey) {
+                persistent.insert(key);
+            }
+        }
+        if (persistent.empty() || persistent.size() > 8) return false;
+
+        // The induction update itself may depend only on the old induction
+        // value and invariant inputs.  In particular, it cannot hide a state
+        // dependent step that would invalidate the trip count.
+        const Stmt *inductionUpdate = nullptr;
+        function<bool(const Stmt *)> findInductionUpdate =
+            [&](const Stmt *current) -> bool {
+                if (!current || current->fastDeadStore) return true;
+                if (current->kind == Stmt::Kind::Assign &&
+                    assignKey(current) == counted.inductionKey) {
+                    inductionUpdate = current;
+                    return true;
+                }
+                if (current->kind == Stmt::Kind::Block) {
+                    for (const auto &child : current->stmts) {
+                        if (!findInductionUpdate(child.get())) return false;
+                    }
+                }
+                return true;
+            };
+        if (!findInductionUpdate(stmt->body.get()) || !inductionUpdate) {
+            return false;
+        }
+        unordered_set<int> inductionReads;
+        collectExprKeys(inductionUpdate->expr.get(), inductionReads);
+        for (int key : inductionReads) {
+            if (key != counted.inductionKey && model.modified.count(key)) {
+                return false;
+            }
+        }
+
+        unordered_map<int, uint32_t> moduli;
+        if (!collectFiniteCycleModuli(stmt->body.get(),
+                                      counted.inductionKey, persistent,
+                                      changing, env, moduli)) {
+            return false;
+        }
+
+        vector<int> stateKeys;
+        vector<uint32_t> stateModuli;
+        vector<int32_t> current;
+        stateKeys.reserve(persistent.size());
+        stateModuli.reserve(persistent.size());
+        current.reserve(persistent.size());
+        for (int key : model.keys) {
+            if (!persistent.count(key)) continue;
+            if (isGlobalKey(key) || key < 0 || key >= static_cast<int>(env.size()) ||
+                !env[static_cast<size_t>(key)]) return false;
+            auto modulus = moduli.find(key);
+            if (modulus == moduli.end()) return false;
+            int32_t value = *env[static_cast<size_t>(key)];
+            if (value < 0 || static_cast<uint64_t>(value) >= modulus->second) {
+                return false;
+            }
+            stateKeys.push_back(key);
+            stateModuli.push_back(modulus->second);
+            current.push_back(value);
+        }
+
+        map<vector<int32_t>, uint64_t> seen;
+        uint64_t cycleStart = 0;
+        uint64_t cycleLength = 0;
+        bool foundCycle = false;
+        for (uint64_t iteration = 0;
+             iteration <= kFiniteCycleStateLimit; ++iteration) {
+            auto found = seen.find(current);
+            if (found != seen.end()) {
+                cycleStart = found->second;
+                cycleLength = iteration - cycleStart;
+                foundCycle = cycleLength != 0;
+                break;
+            }
+            if (iteration == kFiniteCycleStateLimit) break;
+            seen.emplace(current, iteration);
+
+            ExactEnv values = env;
+            int64_t inductionValue = static_cast<int64_t>(counted.start) +
+                                     static_cast<int64_t>(iteration) * counted.step;
+            if (inductionValue < numeric_limits<int32_t>::min() ||
+                inductionValue > numeric_limits<int32_t>::max() ||
+                counted.inductionKey < 0 ||
+                counted.inductionKey >= static_cast<int>(values.size())) {
+                return false;
+            }
+            values[static_cast<size_t>(counted.inductionKey)] =
+                static_cast<int32_t>(inductionValue);
+            for (size_t index = 0; index < stateKeys.size(); ++index) {
+                values[static_cast<size_t>(stateKeys[index])] = current[index];
+            }
+            if (!evaluateFiniteCycleBody(stmt->body.get(), values)) return false;
+
+            auto inductionResult =
+                values[static_cast<size_t>(counted.inductionKey)];
+            int32_t expectedInduction = add32(
+                static_cast<int32_t>(inductionValue), counted.step);
+            if (!inductionResult || *inductionResult != expectedInduction) {
+                return false;
+            }
+            vector<int32_t> next;
+            next.reserve(stateKeys.size());
+            for (size_t index = 0; index < stateKeys.size(); ++index) {
+                auto value = values[static_cast<size_t>(stateKeys[index])];
+                if (!value || *value < 0 ||
+                    static_cast<uint64_t>(*value) >= stateModuli[index]) {
+                    return false;
+                }
+                next.push_back(*value);
+            }
+            current = std::move(next);
+        }
+        if (!foundCycle || counted.trips <= cycleStart) return false;
+        uint64_t residual = cycleStart +
+            (counted.trips - cycleStart) % cycleLength;
+        if (residual == counted.trips || residual == 0 ||
+            residual > kFiniteCycleRuntimeLimit) {
+            return false;
+        }
+        return rewriteFiniteCycleLoop(stmt, counted, residual, model,
+                                      modifiedLocals);
+    }
+
     bool trySummarizeModular(unique_ptr<Stmt> &stmt, const ExactEnv &env,
                              CountedLoop &counted,
                              unordered_set<int> &modifiedLocals) {
@@ -5871,6 +6282,7 @@ private:
         auto out = make_unique<Stmt>();
         out->kind = stmt->kind;
         out->name = stmt->name;
+        out->fastFiniteCycleReduced = stmt->fastFiniteCycleReduced;
         out->expr = cloneExprPlain(stmt->expr.get());
         if (stmt->decl) {
             out->decl = make_unique<Decl>();
@@ -7091,6 +7503,19 @@ private:
                 return;
             }
             case Stmt::Kind::While: {
+                if (stmt->fastFiniteCycleReduced) {
+                    // This loop was intentionally retained as the runtime
+                    // witness for a finite-state proof.  Do not summarize or
+                    // unroll it again in a later analysis round.
+                    unordered_set<int> assigned;
+                    collectAssignedLocals(stmt->body.get(), assigned);
+                    for (int slot : assigned) {
+                        if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                            env[static_cast<size_t>(slot)] = nullopt;
+                        }
+                    }
+                    return;
+                }
                 CountedLoop counted;
                 unordered_set<int> modified;
                 if (tryDropDeadLoop(stmt, env, counted, modified)) {
@@ -7124,6 +7549,21 @@ private:
                     }
                     return;
                 }
+                counted = CountedLoop{};
+                modified.clear();
+                if (trySummarizeFiniteCycle(stmt, env, counted, modified)) {
+                    for (int slot : modified) {
+                        if (slot >= 0 && slot < static_cast<int>(env.size())) {
+                            env[static_cast<size_t>(slot)] = nullopt;
+                        }
+                    }
+                    if (counted.inductionKey >= 0 && !isGlobalKey(counted.inductionKey) &&
+                        counted.inductionKey < static_cast<int>(env.size())) {
+                        env[static_cast<size_t>(counted.inductionKey)] = counted.finalValue;
+                    }
+                    return;
+                }
+                counted = CountedLoop{};
                 modified.clear();
                 if (trySummarizeDynamicUnitLoop(stmt, env, modified)) {
                     for (int slot : modified) {
@@ -7548,12 +7988,15 @@ private:
                             collectMutableSlots(stmt->body.get());
                         };
                     collectMutableSlots(body);
+                    bool sequentialSummary =
+                        function->straightLineSummary &&
+                        !directSummaryInlineSafe(function);
                     if (function->fastLocalCount >=
                             static_cast<int>(function->params.size()) &&
                         function->fastLocalCount <= 32 &&
                         loopInlineStmtShape(body, 0, function->fastLocalCount,
                                             mutableSlots, nodes, hasLoop, flow) &&
-                        hasLoop && flow == InlineReturn) {
+                        flow == InlineReturn && (hasLoop || sequentialSummary)) {
                         loopInlineableFuncs[function->name] = function;
                         vector<uint64_t> weights(
                             static_cast<size_t>(function->fastLocalCount), 0);
