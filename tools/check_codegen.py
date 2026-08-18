@@ -198,6 +198,24 @@ def main() -> int:
         return 1
     print("[OK] straight_line_summary: removed helper call and loop backedge")
 
+    dead_init_summary = compile_source(
+        "int helper(int x,int y){x=x-6;int v0=x*(-5);int v1=y*3;"
+        "int v2=v0+v1;int v3=v2+x-y+4;return v3;}"
+        "int main(){int i=0;int tr=0;int ll=0;while(i<8){int j=0;"
+        "while(j<8){int z=0;while(z<8){int v=0;v=helper(z,tr);"
+        "tr=tr+v;ll=helper(ll,i+j);z=z+1;}j=j+1;}i=i+1;}"
+        "return tr+ll+i;}"
+    )
+    dead_init_main = function_assembly(dead_init_summary, "main")
+    if "call helper" in dead_init_main or \
+            ".Lwhile_body" in dead_init_main:
+        print(
+            "[FAIL] dead_init_summary: transient loop local escaped closed-form rewrite",
+            file=sys.stderr,
+        )
+        return 1
+    print("[OK] dead_init_summary: kept dead-init local transient during loop folding")
+
     summary_spill = compile_source(
         "int helper(int x,int y){"
         "int z0=x+y;int z1=x-y;int z2=x*y;int z3=x+y*3;"

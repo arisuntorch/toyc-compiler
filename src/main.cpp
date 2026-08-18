@@ -4072,7 +4072,12 @@ private:
     }
 
     bool collectBody(const Stmt *s, Model &model) const {
-        if (!s || s->fastDeadStore) return true;
+        if (!s) return true;
+        // A dead declaration initializer does not need to participate in the
+        // recurrence, but the declaration still creates a lexical slot.  Keep
+        // it marked transient so a later assignment cannot escape its scope
+        // when the loop is rewritten in closed form.
+        if (s->fastDeadStore && s->kind != Stmt::Kind::DeclStmt) return true;
         switch (s->kind) {
             case Stmt::Kind::Block:
                 for (auto &child : s->stmts) {
@@ -4089,14 +4094,15 @@ private:
                 return true;
             }
             case Stmt::Kind::DeclStmt: {
-                if (!s->decl || s->decl->fastSlot < 0 ||
-                    !collectExprVars(s->decl->init.get(), model)) {
+                if (!s->decl || s->decl->fastSlot < 0) {
                     return false;
                 }
                 int key = s->decl->fastSlot;
                 addModelKey(model, key, s->decl->name);
                 model.modified.insert(key);
                 model.transient.insert(key);
+                if (s->fastDeadStore) return true;
+                if (!collectExprVars(s->decl->init.get(), model)) return false;
                 return true;
             }
             case Stmt::Kind::ExprStmt:
