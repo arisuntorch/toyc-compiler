@@ -9068,6 +9068,25 @@ private:
             }
             const Expr *ret = functionInlineExpr(f);
             if (!ret) return false;
+            if (f->straightLineSummary) {
+                if (scratchRegs.size() < f->params.size()) return false;
+                vector<string> paramRegs;
+                paramRegs.reserve(f->params.size());
+                for (auto &arg : e->args) {
+                    string reg = scratchRegs.front();
+                    scratchRegs.erase(scratchRegs.begin());
+                    genExprNoCall(arg.get(), reg, scratchRegs);
+                    paramRegs.push_back(std::move(reg));
+                }
+                enterScope();
+                for (size_t i = 0; i < f->params.size(); ++i) {
+                    scopes.back()[f->params[i]] =
+                        Symbol{false, 0, false, "", 0, paramRegs[i]};
+                }
+                genExprNoCall(ret, dst, std::move(scratchRegs));
+                leaveScope();
+                return true;
+            }
             auto expanded = cloneExprSubstGeneric(ret, subst);
             string resultReg = dst;
             if (exprReadsRegister(expanded.get(), dst)) {
